@@ -40,8 +40,14 @@ def _parse_size(size: tuple[int, int] | str | None, fallback: tuple[int, int]) -
 def fit_cover(image: Image.Image, size: tuple[int, int], focal: tuple[float, float] = (0.5, 0.5)) -> Image.Image:
     """Crop an image to fill a canvas without distorting the subject."""
     width, height = size
+    # Avoid an unnecessary second resample when a template already matches the
+    # requested canvas. This keeps small campaign type and logo edges crisp.
+    if image.size == size:
+        return image.copy()
     scale = max(width / image.width, height / image.height)
     resized = image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
+    if scale < 0.98:
+        resized = resized.filter(ImageFilter.UnsharpMask(radius=0.45, percent=105, threshold=3))
     left = round((resized.width - width) * min(max(focal[0], 0), 1))
     top = round((resized.height - height) * min(max(focal[1], 0), 1))
     return resized.crop((left, top, left + width, top + height))

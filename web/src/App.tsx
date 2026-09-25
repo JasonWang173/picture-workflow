@@ -209,7 +209,7 @@ function App() {
       body.append('size', size)
       body.append('outline', '0.78')
       body.append('preserve_logo_pill', String(preserveLogo))
-      body.append('quality', '95')
+      body.append('quality', '98')
       const response = await fetch(products.length > 1 ? '/api/compose-batch' : '/api/compose', { method: 'POST', body })
       if (!response.ok) {
         let message = '合成失败，请检查图片后重试'

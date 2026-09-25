@@ -76,7 +76,7 @@ async def create_composition(
     size: Annotated[str, Form()] = "1080x1920",
     outline: Annotated[float, Form()] = 0.78,
     preserve_logo_pill: Annotated[bool, Form()] = True,
-    quality: Annotated[int, Form()] = 95,
+    quality: Annotated[int, Form()] = 98,
 ) -> FileResponse:
     if mode not in {"auto", "overlay", "cutout"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay 或 cutout")
@@ -123,7 +123,7 @@ async def create_batch_composition(
     size: Annotated[str, Form()] = "1080x1920",
     outline: Annotated[float, Form()] = 0.78,
     preserve_logo_pill: Annotated[bool, Form()] = True,
-    quality: Annotated[int, Form()] = 95,
+    quality: Annotated[int, Form()] = 98,
 ) -> JSONResponse:
     """Compose a folder and keep each output available for preview and selection."""
     if mode not in {"auto", "overlay", "cutout"}:
