@@ -54,14 +54,54 @@ def fit_cover(image: Image.Image, size: tuple[int, int], focal: tuple[float, flo
 
 
 def _soft_white_alpha(image: Image.Image, threshold: float = 235.0, softness: float = 23.0) -> Image.Image:
-    """Convert a light template background to alpha while retaining anti-aliased edges."""
+    """Remove a light background without punching holes through white lettering.
+
+    A simple color threshold treats the white fill inside outlined characters as
+    background. Instead, only white pixels connected to the canvas boundary are
+    removed; enclosed white pixels remain part of the artwork. This is useful
+    for campaign type such as white coupon lettering with a colored outline.
+    """
     rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
     min_channel = rgb.min(axis=2)
     chroma = rgb.max(axis=2) - min_channel
-    neutral = chroma < 18
-    distance = (threshold - min_channel) / max(softness, 1)
-    alpha = np.where(neutral, np.clip(distance, 0, 1), 1.0)
-    return Image.fromarray(np.uint8(alpha * 255), "L").filter(ImageFilter.GaussianBlur(0.35))
+    white_like = (min_channel > threshold - softness * 0.55) & (chroma < 24)
+
+    # Find only the white regions that touch the canvas boundary. OpenCV is
+    # already an optional dependency for the cutout fallback; the small flood
+    # fill below keeps this path dependency-light when it is unavailable.
+    border_connected = np.zeros(white_like.shape, dtype=bool)
+    if cv2 is not None:
+        count, labels = cv2.connectedComponents(white_like.astype(np.uint8), 8)
+        border_labels = np.unique(np.concatenate((
+            labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1],
+        )))
+        border_connected = np.isin(labels, border_labels[border_labels != 0])
+    else:
+        height, width = white_like.shape
+        pending: list[tuple[int, int]] = []
+        def add_seed(y: int, x: int) -> None:
+            if white_like[y, x] and not border_connected[y, x]:
+                border_connected[y, x] = True
+                pending.append((y, x))
+        for x in range(width):
+            add_seed(0, x)
+            add_seed(height - 1, x)
+        for y in range(1, height - 1):
+            add_seed(y, 0)
+            add_seed(y, width - 1)
+        while pending:
+            y, x = pending.pop()
+            for py, px in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= py < height and 0 <= px < width and white_like[py, px] and not border_connected[py, px]:
+                    border_connected[py, px] = True
+                    pending.append((py, px))
+
+    # Artwork is opaque, including enclosed white type. Boundary-connected
+    # whites fade to transparent with a short anti-aliased transition.
+    alpha = np.where(border_connected, 0.0, 1.0)
+    near_white = np.clip((threshold - min_channel) / max(softness, 1), 0, 1)
+    alpha = np.where(border_connected, near_white, alpha)
+    return Image.fromarray(np.uint8(alpha * 255)).filter(ImageFilter.GaussianBlur(0.22))
 
 
 def _top_left_logo_bbox(template: Image.Image, alpha: Image.Image) -> tuple[int, int, int, int] | None:
