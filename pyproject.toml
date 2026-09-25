@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "food-compositor"
+version = "0.1.0"
+description = "科学的商品图与商家模板图片合成工具"
+requires-python = ">=3.10"
+dependencies = ["Pillow>=10.3", "numpy>=1.26", "opencv-python-headless>=4.10"]
+
+[project.scripts]
+food-compositor = "food_compositor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["food_compositor*"]

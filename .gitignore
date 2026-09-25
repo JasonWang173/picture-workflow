@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+.pytest_cache/
+.rembg/
+.DS_Store
+web/node_modules/
+web/dist/
+runtime/
+outputs/
+inputs/
+/1.jpg
+/商品1.png
