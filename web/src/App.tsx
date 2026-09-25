@@ -3,8 +3,9 @@ import { ChangeEvent, DragEvent, KeyboardEvent, useEffect, useRef, useState } fr
 type Mode = 'auto' | 'overlay' | 'cutout'
 type Asset = { file: File; url: string }
 type BatchImage = { id: string; name: string; url: string }
+type LightboxImage = { url: string; name: string }
 
-type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh'
+type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh' | 'zoom'
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true }
@@ -17,6 +18,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     close: <><path d="m6 6 12 12" /><path d="m18 6-12 12" /></>,
     check: <path d="m5 12 4 4L19 6" />,
     refresh: <><path d="M20 11a8 8 0 0 0-14.5-4L4 9" /><path d="M4 4v5h5" /><path d="M4 13a8 8 0 0 0 14.5 4L20 15" /><path d="M20 20v-5h-5" /></>,
+    zoom: <><path d="M8 3H3v5" /><path d="M16 3h5v5" /><path d="M8 21H3v-5" /><path d="M21 16v5h-5" /></>,
   }
   return <svg {...common}>{paths[name]}</svg>
 }
@@ -140,7 +142,9 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [lastMode, setLastMode] = useState<Mode | null>(null)
+  const [lastSize, setLastSize] = useState<string | null>(null)
   const [demoAvailable, setDemoAvailable] = useState(false)
+  const [lightbox, setLightbox] = useState<LightboxImage | null>(null)
   const productsRef = useRef<Asset[]>([])
   const templateRef = useRef<Asset | null>(null)
   const resultRef = useRef<string | null>(null)
@@ -148,6 +152,19 @@ function App() {
   useEffect(() => { productsRef.current = products }, [products])
   useEffect(() => { templateRef.current = template }, [template])
   useEffect(() => { resultRef.current = resultUrl }, [resultUrl])
+  useEffect(() => {
+    if (!lightbox) return
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setLightbox(null)
+    }
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [lightbox])
   useEffect(() => {
     fetch('/api/demo-available')
       .then((response) => response.ok ? response.json() : { available: false })
@@ -165,6 +182,8 @@ function App() {
     setBatchImages([])
     setSelectedBatchIds([])
     setBatchDownloadUrl(null)
+    setLightbox(null)
+    setLastSize(null)
   }
   const replaceProducts = (files: File[]) => {
     products.forEach(releaseAsset)
@@ -230,6 +249,7 @@ function App() {
         setBatchDownloadUrl(null)
       }
       setLastMode(mode)
+      setLastSize(size)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '合成失败，请重试')
     } finally {
@@ -238,6 +258,8 @@ function App() {
   }
 
   const hasBatch = batchImages.length > 0
+  const displaySize = lastSize || size
+  const isLandscape = displaySize === '1280x720'
   const allBatchSelected = hasBatch && selectedBatchIds.length === batchImages.length
   const selectedDownloadUrl = batchDownloadUrl && selectedBatchIds.length
     ? `${batchDownloadUrl}?ids=${encodeURIComponent(selectedBatchIds.join(','))}`
@@ -319,7 +341,10 @@ function App() {
           </div>
           <div className="preview-stage">
             {resultUrl ? (
-              <img className="result-image" src={resultUrl} alt="合成后的海报" />
+              <button className="result-preview-button" type="button" onClick={() => setLightbox({ url: resultUrl, name: '合成海报.jpg' })} aria-label="点击放大查看合成海报">
+                <img className="result-image" src={resultUrl} alt="合成后的海报" />
+                <span className="preview-zoom-hint"><Icon name="zoom" size={14} /> 点击放大</span>
+              </button>
             ) : hasBatch ? (
               <div className="batch-preview">
                 <div className="batch-toolbar">
@@ -329,7 +354,7 @@ function App() {
                     <button type="button" className="toolbar-button" onClick={clearBatchSelection} disabled={!selectedBatchIds.length}>取消全选</button>
                   </div>
                 </div>
-                <div className="batch-grid">
+                <div className={`batch-grid ${isLandscape ? 'is-landscape' : 'is-portrait'}`}>
                   {batchImages.map((image, index) => {
                     const selected = selectedBatchIds.includes(image.id)
                     return (
@@ -338,7 +363,10 @@ function App() {
                           <input type="checkbox" checked={selected} onChange={() => toggleBatchSelection(image.id)} />
                           <span><Icon name="check" size={12} /></span>
                         </label>
-                        <img src={image.url} alt={`${index + 1} ${image.name}`} />
+                        <button className="batch-image-button" type="button" onClick={() => setLightbox({ url: image.url, name: image.name })} aria-label={`放大查看 ${image.name}`}>
+                          <img src={image.url} alt={`${index + 1} ${image.name}`} />
+                          <span className="preview-zoom-hint"><Icon name="zoom" size={13} /></span>
+                        </button>
                         <div className="batch-card-meta">
                           <span>{String(index + 1).padStart(2, '0')}</span>
                           <span title={image.name}>{image.name}</span>
@@ -359,12 +387,12 @@ function App() {
           </div>
           {resultUrl ? (
             <div className="result-actions">
-              <div><span className="result-caption">输出尺寸</span><strong>{size.replace('x', ' × ')} px · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加' : '主体抠图'}</strong></div>
+              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加' : '主体抠图'}</strong></div>
               <a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a>
             </div>
           ) : hasBatch ? (
             <div className="result-actions">
-              <div><span className="result-caption">批量输出</span><strong>{size.replace('x', ' × ')} px · {batchImages.length} 张 JPG</strong></div>
+              <div><span className="result-caption">批量输出</span><strong>{displaySize.replace('x', ' × ')} px · {batchImages.length} 张 JPG</strong></div>
               <div className="batch-download-actions">
                 <a className={`download-button ${selectedDownloadUrl ? '' : 'is-disabled'}`} href={selectedDownloadUrl || '#'} onClick={(event) => { if (!selectedDownloadUrl) event.preventDefault() }} download="food-composites-selected.zip"><Icon name="download" size={16} /> 下载选中</a>
                 <a className="download-button download-button-secondary" href={batchDownloadUrl || '#'} onClick={(event) => { if (!batchDownloadUrl) event.preventDefault() }} download="food-composites.zip"><Icon name="download" size={16} /> 下载全部</a>
@@ -376,6 +404,17 @@ function App() {
         </section>
       </section>
       <footer className="footer"><span>FRAME/FOOD</span><span>Built for fast food campaigns · 本地图片工作流</span></footer>
+      {lightbox && (
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="合成图放大预览" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
+          <div className="lightbox-panel">
+            <div className="lightbox-bar">
+              <div><span className="section-label">DETAIL PREVIEW</span><strong>{lightbox.name}</strong></div>
+              <button className="lightbox-close" type="button" onClick={() => setLightbox(null)} aria-label="关闭放大预览"><Icon name="close" size={19} /></button>
+            </div>
+            <div className="lightbox-stage"><img src={lightbox.url} alt={`放大查看 ${lightbox.name}`} /></div>
+          </div>
+        </div>
+      )}
     </main>
   )
 }
