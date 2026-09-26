@@ -297,13 +297,13 @@ def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Ima
     return bbox, alpha_image
 
 
-def _place_green_cutout(background: Image.Image, product: Image.Image, subject: Image.Image) -> Image.Image | None:
-    """Replace a green placeholder with a sharp, proportionally fitted subject.
+def _place_green_product(background: Image.Image, product: Image.Image) -> Image.Image | None:
+    """Replace a green placeholder with the original product image.
 
-    The product image supplies a softly blurred backplate inside the green
-    region, while the extracted subject is composited above it. This keeps the
-    slot filled even when the source contains transparent or irregular edges,
-    and avoids stretching the food or leaving a green halo.
+    Green screen templates are product panels rather than scene backgrounds.
+    Keep the product pixels sharp and untouched apart from an aspect-safe
+    ``cover`` resize into the detected slot. The only softness is the 1 px
+    anti-aliased edge used to hide JPEG and template boundary noise.
     """
     detected = _green_slot(background)
     if detected is None:
@@ -314,49 +314,26 @@ def _place_green_cutout(background: Image.Image, product: Image.Image, subject: 
         return None
 
     canvas = background.convert("RGBA")
+    # ``fit_cover`` preserves the food's aspect ratio and uses LANCZOS with a
+    # mild downscale sharpen. No blur or second composited copy is introduced.
     source_plate = fit_cover(product.convert("RGB"), (slot_width, slot_height))
-    # A low-radius blur removes source backdrop detail without softening the
-    # extracted food that is placed above it.
-    source_plate = source_plate.filter(ImageFilter.GaussianBlur(max(2.0, min(slot_width, slot_height) * 0.012)))
     plate_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     plate_layer.paste(source_plate.convert("RGBA"), (x0, y0))
     slot_overlay = Image.new("L", canvas.size, 0)
     slot_overlay.paste(slot_alpha, (0, 0))
     plate_layer.putalpha(slot_overlay)
-    canvas = Image.alpha_composite(canvas, plate_layer)
-
-    subject = _trim_alpha(subject)
-    if subject.getchannel("A").getbbox() is None:
-        return canvas.convert("RGB")
-    max_width = max(1, round(slot_width * 0.92))
-    max_height = max(1, round(slot_height * 0.92))
-    scale = min(max_width / subject.width, max_height / subject.height)
-    resized = subject.resize(
-        (max(1, round(subject.width * scale)), max(1, round(subject.height * scale))),
-        Image.Resampling.LANCZOS,
-    )
-    x = x0 + (slot_width - resized.width) // 2
-    y = y0 + slot_height - resized.height - max(4, round(slot_height * 0.035))
-
-    # Contact shadow is clipped to the replacement slot so it never covers
-    # template copy or the merchant mark outside the green area.
-    shadow_alpha = resized.getchannel("A").filter(ImageFilter.GaussianBlur(max(5, round(min(slot_width, slot_height) * 0.024))))
-    shadow_alpha = ImageEnhance.Brightness(shadow_alpha).enhance(0.26)
-    shadow_layer = Image.new("L", canvas.size, 0)
-    shadow_layer.paste(shadow_alpha, (x + round(slot_width * 0.012), y + round(slot_height * 0.018)))
-    shadow_layer = ImageChops.multiply(shadow_layer, slot_overlay)
-    shadow = Image.new("RGBA", canvas.size, (10, 7, 4, 0))
-    shadow.putalpha(shadow_layer)
-    canvas = Image.alpha_composite(canvas, shadow)
-    canvas.alpha_composite(resized, (x, y))
-    return canvas.convert("RGB")
+    return Image.alpha_composite(canvas, plate_layer).convert("RGB")
 
 
-def _place_cutout(background: Image.Image, subject: Image.Image, product: Image.Image | None = None) -> Image.Image:
+def _place_cutout(background: Image.Image, subject: Image.Image | None = None, product: Image.Image | None = None) -> Image.Image:
     if product is not None:
-        green_result = _place_green_cutout(background, product, subject)
+        green_result = _place_green_product(background, product)
         if green_result is not None:
             return green_result
+    if subject is None and product is not None:
+        subject = extract_subject(product)
+    if subject is None:
+        raise ValueError("主体抠图需要商品图")
     canvas = background.convert("RGBA")
     subject = _trim_alpha(subject)
     max_width = round(canvas.width * 0.86)
@@ -393,7 +370,7 @@ def compose(
     size: tuple[int, int] | str | None = None,
     preserve_logo_pill: bool = True,
     outline_strength: float = 0.78,
-    quality: int = 95,
+    quality: int = 100,
 ) -> Path:
     """Compose one product/template pair and return the output path."""
     if mode not in {"auto", "overlay", "cutout"}:
@@ -408,7 +385,7 @@ def compose(
     if selected == "overlay":
         result = _apply_overlay(background, template, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
     else:
-        result = _place_cutout(fit_cover(template, output_size), extract_subject(product), product=product)
+        result = _place_cutout(fit_cover(template, output_size), product=product)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()
