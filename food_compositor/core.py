@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
@@ -16,11 +17,96 @@ except Exception:  # pragma: no cover - optional at import time
 LOGGER = logging.getLogger(__name__)
 Mode = Literal["auto", "overlay", "cutout"]
 _REMBG_SESSION = None
+MAX_JPEG_BYTES = 300_000
+JPEG_QUALITY_FLOOR = 60
 
 
 def _open_rgb(path: str | Path) -> Image.Image:
     with Image.open(path) as image:
         return image.convert("RGB")
+
+
+def _encode_jpeg(image: Image.Image, quality: int) -> bytes:
+    """Encode a progressive JPEG with a good size/detail balance."""
+    buffer = io.BytesIO()
+    image.convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=max(1, min(100, int(quality))),
+        optimize=True,
+        progressive=True,
+        # 4:2:2 keeps colored logo edges cleaner than 4:2:0 while saving
+        # considerably more space than 4:4:4.
+        subsampling=1,
+    )
+    return buffer.getvalue()
+
+
+def _search_jpeg_quality(image: Image.Image, low: int, high: int, limit: int) -> bytes | None:
+    """Return the highest JPEG quality that fits ``limit`` bytes."""
+    best: bytes | None = None
+    left, right = max(1, low), min(100, high)
+    while left <= right:
+        quality = (left + right) // 2
+        encoded = _encode_jpeg(image, quality)
+        if len(encoded) < limit:
+            best = encoded
+            left = quality + 1
+        else:
+            right = quality - 1
+    return best
+
+
+def _jpeg_under_limit(image: Image.Image, requested_quality: int, limit: int = MAX_JPEG_BYTES) -> tuple[Image.Image, bytes]:
+    """Keep JPEG output below the download limit without geometric distortion.
+
+    Quality is reduced first while preserving the requested canvas dimensions.
+    If a particularly detailed food photo still exceeds the limit at the
+    quality floor, the canvas is downscaled proportionally and quality is
+    searched again. This avoids the blocky artifacts caused by forcing a very
+    low JPEG quality at the original pixel dimensions.
+    """
+    requested = max(1, min(100, int(requested_quality)))
+    floor = min(JPEG_QUALITY_FLOOR, requested)
+    working = image.convert("RGB")
+
+    for _ in range(12):
+        floor_encoded = _encode_jpeg(working, floor)
+        if len(floor_encoded) < limit:
+            best = _search_jpeg_quality(working, floor, requested, limit)
+            return working, best or floor_encoded
+
+        # JPEG size roughly follows pixel area. Shrinking by the square root
+        # of the required ratio keeps the next pass close to the target while
+        # retaining the highest possible quality.
+        ratio = math.sqrt(limit / max(1, len(floor_encoded))) * 0.96
+        ratio = min(0.92, max(0.58, ratio))
+        width = max(96, round(working.width * ratio))
+        height = max(96, round(working.height * ratio))
+        if (width, height) == working.size:
+            break
+        working = working.resize((width, height), Image.Resampling.LANCZOS)
+
+    # Last-resort guard for unusually noisy images. The proportional resize
+    # above normally succeeds before this point, so this path is rare.
+    for _ in range(8):
+        encoded = _encode_jpeg(working, max(35, floor))
+        if len(encoded) < limit:
+            best = _search_jpeg_quality(working, 20, max(35, floor), limit)
+            return working, best or encoded
+        width = max(96, round(working.width * 0.78))
+        height = max(96, round(working.height * 0.78))
+        if (width, height) == working.size:
+            break
+        working = working.resize((width, height), Image.Resampling.LANCZOS)
+
+    encoded = _encode_jpeg(working, 20)
+    while len(encoded) >= limit and min(working.size) > 96:
+        width = max(96, round(working.width * 0.75))
+        height = max(96, round(working.height * 0.75))
+        working = working.resize((width, height), Image.Resampling.LANCZOS)
+        encoded = _encode_jpeg(working, 20)
+    return working, encoded
 
 
 def _parse_size(size: tuple[int, int] | str | None, fallback: tuple[int, int]) -> tuple[int, int]:
@@ -444,7 +530,8 @@ def compose(
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()
     if suffix in {".jpg", ".jpeg"}:
-        result.save(destination, format="JPEG", quality=max(1, min(100, quality)), optimize=True, subsampling=0)
+        _, encoded = _jpeg_under_limit(result, quality)
+        destination.write_bytes(encoded)
     else:
         result.save(destination, format="PNG", optimize=True)
     return destination

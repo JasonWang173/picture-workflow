@@ -174,6 +174,7 @@ select option { background: #1c1f1c; }
 .result-actions { display: flex; align-items: center; justify-content: space-between; padding-top: 3px; }
 .result-caption { display: block; color: #737970; font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 .result-actions strong { display: block; margin-top: 5px; color: #c3c5bc; font-size: 11px; font-weight: 500; }
+.size-limit { color: #b8d5a1; font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .04em; }
 .download-button { display: inline-flex; align-items: center; gap: 8px; padding: 10px 13px; border: 1px solid #5a5f56; color: #e9e5dc; background: transparent; font-size: 11px; text-decoration: none; }
 .download-button:hover { border-color: #e27b55; color: #f7bd9f; }
 .preview-footnote { color: #737971; font-size: 10px; line-height: 1.6; }
