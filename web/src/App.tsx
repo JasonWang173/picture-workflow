@@ -288,7 +288,7 @@ function App() {
           <p className="eyebrow">PRODUCT PHOTO STUDIO</p>
           <h1>把一张食物图，<br /><em>变成可以投放的海报。</em></h1>
         </div>
-        <p className="intro-copy">上传商品图与商家模板，交给合成引擎处理构图、透明度和层次。你只需要确认结果。</p>
+        <p className="intro-copy">上传商品图与商家模板，交给合成引擎处理构图、透明度和层次。主体抠图会优先识别模板绿布并等比嵌入。</p>
       </section>
 
       <section className="workspace" aria-label="图片合成工作台">
@@ -306,7 +306,7 @@ function App() {
             {([
               ['auto', '智能判断', '自动识别模板类型'],
               ['overlay', '模板叠加', '适合白底活动模板'],
-              ['cutout', '主体抠图', '适合真实场景背景'],
+              ['cutout', '主体抠图', '识别绿布并等比嵌入主体'],
             ] as [Mode, string, string][]).map(([value, label, description]) => (
               <button key={value} className={`mode-option ${mode === value ? 'is-selected' : ''}`} type="button" role="radio" aria-checked={mode === value} onClick={() => setMode(value)}>
                 <span className="radio-dot" /><span><strong>{label}</strong><small>{description}</small></span>
@@ -387,7 +387,7 @@ function App() {
           </div>
           {resultUrl ? (
             <div className="result-actions">
-              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加' : '主体抠图'}</strong></div>
+              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加' : '主体抠图 · 绿布替换'}</strong></div>
               <a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a>
             </div>
           ) : hasBatch ? (
@@ -399,7 +399,7 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="preview-footnote"><span>TIP</span> 白底活动模板会自动转为透明图层，商品图作为真实背景铺满画布。</div>
+            <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '检测到绿布时会只替换占位区域，商品主体保持比例并加上柔和接触阴影。' : '白底活动模板会自动转为透明图层，商品图作为真实背景铺满画布。'}</div>
           )}
         </section>
       </section>

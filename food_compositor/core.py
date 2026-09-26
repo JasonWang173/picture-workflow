@@ -242,7 +242,121 @@ def _trim_alpha(image: Image.Image, padding: int = 4) -> Image.Image:
     return image.crop((max(0, x0 - padding), max(0, y0 - padding), min(image.width, x1 + padding), min(image.height, y1 + padding)))
 
 
-def _place_cutout(background: Image.Image, subject: Image.Image) -> Image.Image:
+def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+    """Locate a large chroma-green placeholder in a template.
+
+    Templates use green as a deliberate replacement surface. We detect it in
+    HSV space instead of using a single RGB value so JPEG compression and
+    slightly uneven fabric lighting do not leave a green fringe around the
+    inserted product.
+    """
+    rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
+    if cv2 is not None:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        mask = (
+            (hue >= 35)
+            & (hue <= 90)
+            & (saturation >= 90)
+            & (value >= 70)
+        ).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if count <= 1:
+            return None
+        candidates = []
+        for index in range(1, count):
+            x, y, width, height, area = stats[index]
+            if area >= rgb.shape[0] * rgb.shape[1] * 0.012:
+                candidates.append((area, index, x, y, width, height))
+        if not candidates:
+            return None
+        _, index, x, y, width, height = max(candidates)
+        if width < rgb.shape[1] * 0.25 or height < rgb.shape[0] * 0.16:
+            return None
+        component = np.where(labels == index, 255, 0).astype(np.uint8)
+        # A small dilation covers anti-aliased green pixels at the edge while
+        # the blur keeps the replacement edge natural on compressed templates.
+        component = cv2.dilate(component, np.ones((3, 3), np.uint8), iterations=1)
+        alpha = cv2.GaussianBlur(component, (0, 0), 1.15)
+    else:
+        red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+        mask = ((green > 105) & (green > red * 1.22) & (green > blue * 1.22) & (green - np.maximum(red, blue) > 28)).astype(np.uint8)
+        ys, xs = np.where(mask > 0)
+        if len(xs) < rgb.shape[0] * rgb.shape[1] * 0.012:
+            return None
+        x, y, x1, y1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+        width, height = x1 - x, y1 - y
+        if width < rgb.shape[1] * 0.25 or height < rgb.shape[0] * 0.16:
+            return None
+        alpha = Image.fromarray(mask * 255, "L").filter(ImageFilter.GaussianBlur(1.15))
+
+    bbox = (int(x), int(y), int(x + width), int(y + height))
+    alpha_image = alpha if isinstance(alpha, Image.Image) else Image.fromarray(alpha, "L")
+    return bbox, alpha_image
+
+
+def _place_green_cutout(background: Image.Image, product: Image.Image, subject: Image.Image) -> Image.Image | None:
+    """Replace a green placeholder with a sharp, proportionally fitted subject.
+
+    The product image supplies a softly blurred backplate inside the green
+    region, while the extracted subject is composited above it. This keeps the
+    slot filled even when the source contains transparent or irregular edges,
+    and avoids stretching the food or leaving a green halo.
+    """
+    detected = _green_slot(background)
+    if detected is None:
+        return None
+    (x0, y0, x1, y1), slot_alpha = detected
+    slot_width, slot_height = x1 - x0, y1 - y0
+    if slot_width < 2 or slot_height < 2:
+        return None
+
+    canvas = background.convert("RGBA")
+    source_plate = fit_cover(product.convert("RGB"), (slot_width, slot_height))
+    # A low-radius blur removes source backdrop detail without softening the
+    # extracted food that is placed above it.
+    source_plate = source_plate.filter(ImageFilter.GaussianBlur(max(2.0, min(slot_width, slot_height) * 0.012)))
+    plate_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    plate_layer.paste(source_plate.convert("RGBA"), (x0, y0))
+    slot_overlay = Image.new("L", canvas.size, 0)
+    slot_overlay.paste(slot_alpha, (0, 0))
+    plate_layer.putalpha(slot_overlay)
+    canvas = Image.alpha_composite(canvas, plate_layer)
+
+    subject = _trim_alpha(subject)
+    if subject.getchannel("A").getbbox() is None:
+        return canvas.convert("RGB")
+    max_width = max(1, round(slot_width * 0.92))
+    max_height = max(1, round(slot_height * 0.92))
+    scale = min(max_width / subject.width, max_height / subject.height)
+    resized = subject.resize(
+        (max(1, round(subject.width * scale)), max(1, round(subject.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    x = x0 + (slot_width - resized.width) // 2
+    y = y0 + slot_height - resized.height - max(4, round(slot_height * 0.035))
+
+    # Contact shadow is clipped to the replacement slot so it never covers
+    # template copy or the merchant mark outside the green area.
+    shadow_alpha = resized.getchannel("A").filter(ImageFilter.GaussianBlur(max(5, round(min(slot_width, slot_height) * 0.024))))
+    shadow_alpha = ImageEnhance.Brightness(shadow_alpha).enhance(0.26)
+    shadow_layer = Image.new("L", canvas.size, 0)
+    shadow_layer.paste(shadow_alpha, (x + round(slot_width * 0.012), y + round(slot_height * 0.018)))
+    shadow_layer = ImageChops.multiply(shadow_layer, slot_overlay)
+    shadow = Image.new("RGBA", canvas.size, (10, 7, 4, 0))
+    shadow.putalpha(shadow_layer)
+    canvas = Image.alpha_composite(canvas, shadow)
+    canvas.alpha_composite(resized, (x, y))
+    return canvas.convert("RGB")
+
+
+def _place_cutout(background: Image.Image, subject: Image.Image, product: Image.Image | None = None) -> Image.Image:
+    if product is not None:
+        green_result = _place_green_cutout(background, product, subject)
+        if green_result is not None:
+            return green_result
     canvas = background.convert("RGBA")
     subject = _trim_alpha(subject)
     max_width = round(canvas.width * 0.86)
@@ -294,7 +408,7 @@ def compose(
     if selected == "overlay":
         result = _apply_overlay(background, template, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
     else:
-        result = _place_cutout(fit_cover(template, output_size), extract_subject(product))
+        result = _place_cutout(fit_cover(template, output_size), extract_subject(product), product=product)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()
