@@ -8,7 +8,7 @@ from typing import Iterable, Literal, Sequence
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
 
-try:  # OpenCV is only used by the cutout fallback.
+try:  # OpenCV powers placeholder detection and the cutout fallback.
     import cv2
 except Exception:  # pragma: no cover - optional at import time
     cv2 = None
@@ -297,15 +297,67 @@ def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Ima
     return bbox, alpha_image
 
 
-def _place_green_product(background: Image.Image, product: Image.Image) -> Image.Image | None:
-    """Replace a green placeholder with the original product image.
+def _neutral_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+    """Locate a large, light neutral panel used as a product placeholder."""
+    rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
+    if cv2 is not None:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        # White and pale-gray panels are low-chroma and bright. Requiring
+        # interior placement prevents the entire white page from becoming a
+        # product slot in ordinary overlay templates.
+        mask = ((hsv[:, :, 1] <= 42) & (hsv[:, :, 2] >= 205)).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        candidates = []
+        height, width = mask.shape
+        for index in range(1, count):
+            x, y, box_width, box_height, area = stats[index]
+            if area < width * height * 0.035:
+                continue
+            if x <= 2 or y <= 2 or x + box_width >= width - 2 or y + box_height >= height - 2:
+                continue
+            rectangularity = area / max(1, box_width * box_height)
+            if box_width < width * 0.22 or box_height < height * 0.22 or rectangularity < 0.70:
+                continue
+            candidates.append((area, index, x, y, box_width, box_height))
+        if not candidates:
+            return None
+        _, index, x, y, box_width, box_height = max(candidates)
+        component = np.where(labels == index, 255, 0).astype(np.uint8)
+        alpha = cv2.GaussianBlur(component, (0, 0), 1.0)
+    else:
+        mask = ((rgb.min(axis=2) > 205) & ((rgb.max(axis=2) - rgb.min(axis=2)) < 32)).astype(np.uint8)
+        ys, xs = np.where(mask > 0)
+        if len(xs) < rgb.shape[0] * rgb.shape[1] * 0.035:
+            return None
+        x, y, x1, y1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+        box_width, box_height = x1 - x, y1 - y
+        height, width = mask.shape
+        if x <= 2 or y <= 2 or x1 >= width - 2 or y1 >= height - 2:
+            return None
+        if box_width < width * 0.22 or box_height < height * 0.22:
+            return None
+        alpha = Image.fromarray(mask * 255, "L").filter(ImageFilter.GaussianBlur(1.0))
 
-    Green screen templates are product panels rather than scene backgrounds.
-    Keep the product pixels sharp and untouched apart from an aspect-safe
-    ``cover`` resize into the detected slot. The only softness is the 1 px
-    anti-aliased edge used to hide JPEG and template boundary noise.
+    bbox = (int(x), int(y), int(x + box_width), int(y + box_height))
+    alpha_image = alpha if isinstance(alpha, Image.Image) else Image.fromarray(alpha, "L")
+    return bbox, alpha_image
+
+
+def _product_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+    """Find a green-screen or neutral placeholder suitable for product art."""
+    return _green_slot(background) or _neutral_slot(background)
+
+
+def _place_product_slot(background: Image.Image, product: Image.Image) -> Image.Image | None:
+    """Replace a detected product slot with the original product image.
+
+    Product panels are replacement surfaces rather than scene backgrounds.
+    Keep product pixels sharp and untouched apart from an aspect-safe ``cover``
+    resize into the detected slot. The only softness is the 1 px anti-aliased
+    edge used to hide JPEG and template boundary noise.
     """
-    detected = _green_slot(background)
+    detected = _product_slot(background)
     if detected is None:
         return None
     (x0, y0, x1, y1), slot_alpha = detected
@@ -327,9 +379,9 @@ def _place_green_product(background: Image.Image, product: Image.Image) -> Image
 
 def _place_cutout(background: Image.Image, subject: Image.Image | None = None, product: Image.Image | None = None) -> Image.Image:
     if product is not None:
-        green_result = _place_green_product(background, product)
-        if green_result is not None:
-            return green_result
+        slot_result = _place_product_slot(background, product)
+        if slot_result is not None:
+            return slot_result
     if subject is None and product is not None:
         subject = extract_subject(product)
     if subject is None:
@@ -379,13 +431,15 @@ def compose(
     template = _open_rgb(template_path)
     output_size = _parse_size(size, template.size)
     background = fit_cover(product, output_size)
-    selected = "overlay" if mode == "auto" and _looks_like_flat_template(template) else mode
-    if selected == "auto":
-        selected = "cutout"
+    template_page = fit_cover(template, output_size)
+    if mode == "auto":
+        selected = "cutout" if _product_slot(template_page) is not None else "overlay" if _looks_like_flat_template(template) else "cutout"
+    else:
+        selected = mode
     if selected == "overlay":
         result = _apply_overlay(background, template, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
     else:
-        result = _place_cutout(fit_cover(template, output_size), product=product)
+        result = _place_cutout(template_page, product=product)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()

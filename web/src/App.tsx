@@ -288,7 +288,7 @@ function App() {
           <p className="eyebrow">PRODUCT PHOTO STUDIO</p>
           <h1>把一张食物图，<br /><em>变成可以投放的海报。</em></h1>
         </div>
-        <p className="intro-copy">上传商品图与商家模板，交给合成引擎识别绿布尺寸。商品原图按比例高清嵌入，模板文字与 Logo 保持清晰。</p>
+        <p className="intro-copy">上传商品图与商家模板，选择处理策略。引擎会保持商品清晰度，并保留模板里的品牌信息与活动文案。</p>
       </section>
 
       <section className="workspace" aria-label="图片合成工作台">
@@ -304,9 +304,9 @@ function App() {
           <div className="panel-heading compact"><div><span className="section-label">02 / 输出</span><h2>合成方式</h2></div></div>
           <div className="mode-list" role="radiogroup" aria-label="合成方式">
             {([
-              ['auto', '智能判断', '自动识别模板类型'],
-              ['overlay', '模板叠加', '适合白底活动模板'],
-              ['cutout', '主体抠图', '绿布区域高清嵌入商品原图'],
+              ['auto', '智能判断', '识别占位区并判断模板类型'],
+              ['overlay', '模板叠加', '提取 Logo、图案和文字叠加'],
+              ['cutout', '主体抠图', '识别绿幕或浅色区域替换商品图'],
             ] as [Mode, string, string][]).map(([value, label, description]) => (
               <button key={value} className={`mode-option ${mode === value ? 'is-selected' : ''}`} type="button" role="radio" aria-checked={mode === value} onClick={() => setMode(value)}>
                 <span className="radio-dot" /><span><strong>{label}</strong><small>{description}</small></span>
@@ -387,7 +387,7 @@ function App() {
           </div>
           {resultUrl ? (
             <div className="result-actions">
-              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加' : '主体抠图 · 高清绿布替换'}</strong></div>
+              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加 · Logo/文字' : '主体抠图 · 区域替换'}</strong></div>
               <a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a>
             </div>
           ) : hasBatch ? (
@@ -399,7 +399,7 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '检测到绿布时只替换占位区域，商品原图按比例高清嵌入，不拉伸、不额外模糊。' : '白底活动模板会自动转为透明图层，商品图作为真实背景铺满画布。'}</div>
+            <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿幕或大块浅色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加会提取 Logo、图案和文字，再叠加到商品背景上。' : '智能判断会先识别占位区域，再选择区域替换或模板叠加。'}</div>
           )}
         </section>
       </section>
