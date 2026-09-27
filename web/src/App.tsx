@@ -316,10 +316,8 @@ function App() {
           <div className="settings-row">
             <label htmlFor="canvas-size">画布尺寸</label>
             <select id="canvas-size" value={size} onChange={(event) => setSize(event.target.value)}>
+              <option value="1080x1920">1080 × 1920 · 竖版</option>
               <option value="1280x720">1280 × 720 · 横版</option>
-              <option value="1080x1920">1080 × 1920 · 竖版 · 推荐</option>
-              <option value="750x1334">750 × 1334 · 竖版</option>
-              <option value="720x1280">720 × 1280 · 竖版</option>
             </select>
           </div>
           <label className="switch-row">
