@@ -70,23 +70,28 @@ def demo_available() -> dict[str, bool]:
 @app.post("/api/compose")
 async def create_composition(
     background_tasks: BackgroundTasks,
-    product: Annotated[UploadFile, File(description="商品图")],
     template: Annotated[UploadFile, File(description="模板图")],
+    product: Annotated[UploadFile | None, File(description="商品图；模板替换模式可不上传")] = None,
     mode: Annotated[str, Form()] = "auto",
     size: Annotated[str, Form()] = "1080x1920",
     outline: Annotated[float, Form()] = 0.78,
     preserve_logo_pill: Annotated[bool, Form()] = True,
     quality: Annotated[int, Form()] = 100,
 ) -> FileResponse:
-    if mode not in {"auto", "overlay", "cutout"}:
-        raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay 或 cutout")
+    if mode not in {"auto", "overlay", "cutout", "template_replace"}:
+        raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
     temp_dir = Path(tempfile.mkdtemp(prefix="food-compositor-"))
     background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
     try:
-        product_path = temp_dir / f"product{_safe_upload_suffix(product.filename, '.png')}"
+        product_path = None
+        if product is not None:
+            product_path = temp_dir / f"product{_safe_upload_suffix(product.filename, '.png')}"
         template_path = temp_dir / f"template{_safe_upload_suffix(template.filename, '.jpg')}"
         output_path = temp_dir / f"composition-{uuid.uuid4().hex[:8]}.jpg"
-        await _write_upload(product, product_path)
+        if product_path is not None and product is not None:
+            await _write_upload(product, product_path)
+        elif mode != "template_replace":
+            raise HTTPException(status_code=400, detail="当前合成方式需要上传商品图")
         await _write_upload(template, template_path)
         if size.strip() == "":
             size = "1080x1920"
@@ -126,8 +131,10 @@ async def create_batch_composition(
     quality: Annotated[int, Form()] = 100,
 ) -> JSONResponse:
     """Compose a folder and keep each output available for preview and selection."""
-    if mode not in {"auto", "overlay", "cutout"}:
-        raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay 或 cutout")
+    if mode not in {"auto", "overlay", "cutout", "template_replace"}:
+        raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
+    if mode == "template_replace":
+        raise HTTPException(status_code=400, detail="模板替换模式只需要上传一张模板图")
     image_products = [upload for upload in products if upload.filename and Path(upload.filename).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
     if not image_products:
         raise HTTPException(status_code=400, detail="商品文件夹里没有可处理的图片")

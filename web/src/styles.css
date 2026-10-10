@@ -51,6 +51,11 @@ h1 em { color: #f5b597; font-style: normal; }
 .text-button:hover { color: #f6c9b2; }
 
 .asset-block + .asset-block { margin-top: 19px; }
+.template-only-note { display: flex; align-items: center; gap: 11px; min-height: 96px; padding: 16px; border: 1px solid #454a44; background: #1b1e1b; }
+.template-only-icon { display: grid; place-items: center; width: 34px; height: 34px; color: #f2a47f; border: 1px solid #674234; background: #26201c; font-size: 16px; }
+.template-only-note strong, .template-only-note small { display: block; }
+.template-only-note strong { color: #d2d4cc; font-size: 12px; font-weight: 600; }
+.template-only-note small { margin-top: 5px; color: #777c74; font-size: 10px; }
 .asset-heading { display: flex; gap: 11px; align-items: start; margin-bottom: 9px; }
 .asset-heading strong { display: block; color: #e7e5dc; font-size: 13px; font-weight: 700; }
 .asset-heading span:not(.step-number) { display: block; margin-top: 3px; color: var(--dim); font-size: 11px; }

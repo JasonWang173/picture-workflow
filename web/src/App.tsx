@@ -1,6 +1,6 @@
 import { ChangeEvent, DragEvent, KeyboardEvent, useEffect, useRef, useState } from 'react'
 
-type Mode = 'auto' | 'overlay' | 'cutout'
+type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
 type Asset = { file: File; url: string }
 type BatchImage = { id: string; name: string; url: string }
 type LightboxImage = { url: string; name: string }
@@ -132,7 +132,7 @@ function AssetDrop({
 function App() {
   const [products, setProducts] = useState<Asset[]>([])
   const [template, setTemplate] = useState<Asset | null>(null)
-  const [mode, setMode] = useState<Mode>('auto')
+  const [mode, setMode] = useState<Mode>('template_replace')
   const [size, setSize] = useState('1080x1920')
   const [preserveLogo, setPreserveLogo] = useState(true)
   const [resultUrl, setResultUrl] = useState<string | null>(null)
@@ -199,6 +199,11 @@ function App() {
   }
   const clearProducts = () => { products.forEach(releaseAsset); setProducts([]); resetResult() }
   const clearTemplate = () => { releaseAsset(template); setTemplate(null); resetResult() }
+  const chooseMode = (nextMode: Mode) => {
+    setMode(nextMode)
+    setError('')
+    resetResult()
+  }
 
   const loadDemo = async () => {
     setError('')
@@ -217,25 +222,27 @@ function App() {
   }
 
   const compose = async () => {
-    if (!products.length || !template) return
+    const needsProduct = mode !== 'template_replace'
+    const isBatch = needsProduct && products.length > 1
+    if (!template || (needsProduct && !products.length)) return
     setLoading(true)
     setError('')
     try {
       const body = new FormData()
-      products.forEach((asset) => body.append(products.length > 1 ? 'products' : 'product', asset.file))
+      if (needsProduct) products.forEach((asset) => body.append(isBatch ? 'products' : 'product', asset.file))
       body.append('template', template.file)
       body.append('mode', mode)
       body.append('size', size)
       body.append('outline', '0.78')
       body.append('preserve_logo_pill', String(preserveLogo))
       body.append('quality', '100')
-      const response = await fetch(products.length > 1 ? '/api/compose-batch' : '/api/compose', { method: 'POST', body })
+      const response = await fetch(isBatch ? '/api/compose-batch' : '/api/compose', { method: 'POST', body })
       if (!response.ok) {
         let message = '合成失败，请检查图片后重试'
         try { const payload = await response.json(); message = payload.detail || message } catch { /* response may not be JSON */ }
         throw new Error(message)
       }
-      if (products.length > 1) {
+      if (isBatch) {
         const payload = await response.json() as { images: BatchImage[]; download_url: string }
         setBatchImages(payload.images)
         setSelectedBatchIds(payload.images.map((image) => image.id))
@@ -259,7 +266,8 @@ function App() {
 
   const hasBatch = batchImages.length > 0
   const displaySize = lastSize || size
-  const isLandscape = displaySize === '1280x720'
+  const [displayWidth, displayHeight] = displaySize.split('x').map(Number)
+  const isLandscape = displayWidth > displayHeight
   const allBatchSelected = hasBatch && selectedBatchIds.length === batchImages.length
   const selectedDownloadUrl = batchDownloadUrl && selectedBatchIds.length
     ? `${batchDownloadUrl}?ids=${encodeURIComponent(selectedBatchIds.join(','))}`
@@ -288,27 +296,32 @@ function App() {
           <p className="eyebrow">PRODUCT PHOTO STUDIO</p>
           <h1>把一张食物图，<br /><em>变成可以投放的海报。</em></h1>
         </div>
-        <p className="intro-copy">上传商品图与商家模板，选择处理策略。引擎会保持商品清晰度，并保留模板里的品牌信息与活动文案。</p>
+        <p className="intro-copy">先用“模板替换”清理网上模板，再用“主体抠图合成”放入自己的商品图。尺寸、版式和文字都会保留。</p>
       </section>
 
       <section className="workspace" aria-label="图片合成工作台">
         <aside className="control-panel">
           <div className="panel-heading">
-            <div><span className="section-label">01 / 素材</span><h2>放入两张图</h2></div>
+            <div><span className="section-label">01 / 工作流</span><h2>{mode === 'template_replace' ? '先制作空白模板' : '合成商品海报'}</h2></div>
             {demoAvailable && <button className="text-button" type="button" onClick={loadDemo}><Icon name="spark" size={14} /> 试用示例</button>}
           </div>
-          <AssetDrop number="01" title="商品图" hint="支持多选图片或整个文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={replaceProducts} onClear={clearProducts} />
+          {mode === 'template_replace' ? (
+            <div className="template-only-note"><span className="template-only-icon">✦</span><div><strong>无需上传商品图</strong><small>只清除模板中的商品图片区，保留其他设计</small></div></div>
+          ) : (
+            <AssetDrop number="01" title="商品图" hint="支持多选图片或整个文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={replaceProducts} onClear={clearProducts} />
+          )}
           <AssetDrop number="02" title="模板图" hint="商家活动与品牌信息" assets={template ? [template] : []} accept="image/png,image/jpeg,image/webp" onChange={(files) => replaceTemplate(files[0])} onClear={clearTemplate} />
 
           <div className="settings-divider" />
           <div className="panel-heading compact"><div><span className="section-label">02 / 输出</span><h2>合成方式</h2></div></div>
           <div className="mode-list" role="radiogroup" aria-label="合成方式">
             {([
-              ['auto', '智能判断', '识别占位区并判断模板类型'],
-              ['overlay', '模板叠加', '提取 Logo、图案和文字叠加'],
-              ['cutout', '主体抠图', '识别绿幕或浅色区域替换商品图'],
+              ['template_replace', '1 · 模板替换', '自动扣掉商品图，生成绿色占位模板'],
+              ['cutout', '2 · 主体抠图合成', '上传商品图 + 空白模板，按比例嵌入'],
+              ['auto', '智能判断', '兼容旧流程，自动选择处理方式'],
+              ['overlay', '模板叠加', '保留 PNG 透明层，叠加 Logo 与文案'],
             ] as [Mode, string, string][]).map(([value, label, description]) => (
-              <button key={value} className={`mode-option ${mode === value ? 'is-selected' : ''}`} type="button" role="radio" aria-checked={mode === value} onClick={() => setMode(value)}>
+              <button key={value} className={`mode-option workflow-option ${mode === value ? 'is-selected' : ''}`} type="button" role="radio" aria-checked={mode === value} onClick={() => chooseMode(value)}>
                 <span className="radio-dot" /><span><strong>{label}</strong><small>{description}</small></span>
               </button>
             ))}
@@ -321,13 +334,13 @@ function App() {
             </select>
           </div>
           <label className="switch-row">
-            <span><strong>保留 Logo 白色胶囊</strong><small>让品牌标识在复杂背景上更清楚</small></span>
+            <span><strong>补强 Logo 白色胶囊</strong><small>透明 PNG 保留原设计；普通模板可自动补底</small></span>
             <input type="checkbox" checked={preserveLogo} onChange={(event) => setPreserveLogo(event.target.checked)} />
             <span className="switch-ui" aria-hidden="true"><i /></span>
           </label>
           {error && <div className="error-message" role="alert">{error}</div>}
-          <button className="compose-button" type="button" disabled={!products.length || !template || loading} onClick={compose}>
-            {loading ? <><span className="button-loader" /> 正在合成</> : <>{products.length > 1 ? `批量合成 ${products.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
+          <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading} onClick={compose}>
+            {loading ? <><span className="button-loader" /> 正在处理</> : <>{mode === 'template_replace' ? '生成空白模板' : products.length > 1 ? `批量合成 ${products.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
           <p className="privacy-note"><span className="lock-dot" /> 图片只在本地 Python 引擎中处理</p>
         </aside>
@@ -378,14 +391,14 @@ function App() {
             ) : (
               <div className="empty-preview">
                 <div className="empty-frame"><span className="empty-corner corner-tl" /><span className="empty-corner corner-tr" /><span className="empty-corner corner-bl" /><span className="empty-corner corner-br" /><Icon name="image" size={30} /></div>
-                <strong>等待两张图片</strong>
-                <span>上传后，预览将在这里展开</span>
+                <strong>{mode === 'template_replace' ? '等待模板图' : '等待两张图片'}</strong>
+                <span>{mode === 'template_replace' ? '无需上传商品图，处理后生成空白模板' : '上传后，预览将在这里展开'}</span>
               </div>
             )}
           </div>
           {resultUrl ? (
             <div className="result-actions">
-              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · JPG <span className="size-limit">&lt;300KB</span> · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加 · Logo/文字' : '主体抠图 · 区域替换'}</strong></div>
+              <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · JPG <span className="size-limit">&lt;300KB</span> · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加 · Logo/文字' : lastMode === 'template_replace' ? '模板替换 · 绿色占位模板' : '主体抠图 · 区域替换'}</strong></div>
               <a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a>
             </div>
           ) : hasBatch ? (
@@ -397,7 +410,7 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿幕或大块浅色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加会提取 Logo、图案和文字，再叠加到商品背景上。' : '智能判断会先识别占位区域，再选择区域替换或模板叠加。'}</div>
+            <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板，其他 Logo、文案、背景和尺寸保持不变。' : '智能判断会优先使用模板透明层，再识别商品占位区域，商品图按比例铺满。'}</div>
           )}
         </section>
       </section>
