@@ -19,16 +19,26 @@ _REMBG_SESSION = None
 MAX_JPEG_BYTES = 300_000
 JPEG_QUALITY_FLOOR = 60
 JPEG_LUMA_PRIORITY_CHROMA_SCALE_MAX = 3.0
+MAX_INPUT_PIXELS = 24_000_000
+
+
+def _validate_input_image(image: Image.Image) -> None:
+    """Reject decompression-bomb-sized inputs before forcing pixel decoding."""
+    pixels = int(image.width) * int(image.height)
+    if pixels > MAX_INPUT_PIXELS:
+        raise ValueError("输入图片像素数不能超过 2400 万")
 
 
 def _open_rgb(path: str | Path) -> Image.Image:
     with Image.open(path) as image:
+        _validate_input_image(image)
         return image.convert("RGB")
 
 
 def _open_template(path: str | Path) -> Image.Image:
     """Open a template without flattening its native PNG transparency."""
     with Image.open(path) as image:
+        _validate_input_image(image)
         return image.convert("RGBA")
 
 
@@ -855,7 +865,148 @@ def _framed_photo_slot(
     return (x0, y0, x1, y1), mask
 
 
-def _line_framed_photo_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+def _expand_dark_frame_edges(
+    rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Include a dark outer frame when a line detector lands on its inner edge.
+
+    JPEG posters frequently have a 2–5 px black rule above a white photo panel.
+    Hough lines tend to select the first high-contrast transition *inside* that
+    rule, leaving the rule visible in the generated green template.  Expand
+    only over rows/columns that are consistently dark across the panel; this
+    avoids eating into a photographic or pastel background around the slot.
+    """
+    height, width = rgb.shape[:2]
+    x0, y0, x1, y1 = bbox
+    max_pad = max(2, round(min(width, height) * 0.025))
+    margin_x = max(1, round((x1 - x0) * 0.04))
+    margin_y = max(1, round((y1 - y0) * 0.04))
+
+    def dark_ratio(values: np.ndarray) -> float:
+        if values.size == 0:
+            return 0.0
+        # Dark navy/black rules remain dark in all channels after JPEG
+        # compression; use max() so a coloured background is not mistaken for
+        # a frame merely because one channel is low.
+        return float(np.mean(np.max(values, axis=-1) <= 118))
+
+    for _ in range(max_pad):
+        if y0 <= 0:
+            break
+        sample = rgb[y0 - 1, x0 + margin_x : max(x0 + margin_x + 1, x1 - margin_x)]
+        if dark_ratio(sample) < 0.55:
+            break
+        y0 -= 1
+    for _ in range(max_pad):
+        if y1 >= height:
+            break
+        sample = rgb[y1, x0 + margin_x : max(x0 + margin_x + 1, x1 - margin_x)]
+        if dark_ratio(sample) < 0.55:
+            break
+        y1 += 1
+    for _ in range(max_pad):
+        if x0 <= 0:
+            break
+        sample = rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), x0 - 1]
+        if dark_ratio(sample) < 0.55:
+            break
+        x0 -= 1
+    for _ in range(max_pad):
+        if x1 >= width:
+            break
+        sample = rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), x1]
+        if dark_ratio(sample) < 0.55:
+            break
+        x1 += 1
+    return x0, y0, x1, y1
+
+
+def _expand_high_contrast_edges(
+    rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Recover a blended photo edge from a narrow, consistent colour jump."""
+    height, width = rgb.shape[:2]
+    x0, y0, x1, y1 = bbox
+    max_pad = max(2, round(min(width, height) * 0.018))
+    margin_x = max(2, round((x1 - x0) * 0.035))
+    margin_y = max(2, round((y1 - y0) * 0.035))
+
+    def jump(first: np.ndarray, second: np.ndarray) -> float:
+        if first.size == 0 or second.size == 0:
+            return 0.0
+        return float(np.mean(np.abs(first.astype(np.float32) - second.astype(np.float32))))
+
+    for candidate in range(x0 - 1, max(-1, x0 - max_pad - 1), -1):
+        if candidate <= 0:
+            break
+        if jump(rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), candidate], rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), candidate - 1]) >= 22.0:
+            x0 = candidate
+            break
+    for candidate in range(x1, min(width, x1 + max_pad)):
+        if candidate >= width:
+            break
+        if jump(rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), candidate], rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), candidate - 1]) >= 22.0:
+            x1 = candidate + 1
+            break
+    return x0, y0, x1, y1
+
+
+def _expand_light_frame_edges(
+    rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Include a contiguous near-white card edge around a photo slot."""
+    height, width = rgb.shape[:2]
+    x0, y0, x1, y1 = bbox
+    max_pad = max(2, round(min(width, height) * 0.04))
+    margin_x = max(2, round((x1 - x0) * 0.035))
+    margin_y = max(2, round((y1 - y0) * 0.035))
+
+    def light_ratio(values: np.ndarray) -> float:
+        if values.size == 0:
+            return 0.0
+        hsv = cv2.cvtColor(values.reshape(1, -1, 3), cv2.COLOR_RGB2HSV)[0]
+        return float(np.mean((hsv[:, 2] >= 205) & (hsv[:, 1] <= 42)))
+
+    for _ in range(max_pad):
+        if y0 <= 0:
+            break
+        sample = rgb[y0 - 1, x0 + margin_x : max(x0 + margin_x + 1, x1 - margin_x)]
+        if light_ratio(sample) < 0.65:
+            break
+        y0 -= 1
+    for _ in range(max_pad):
+        if y1 >= height:
+            break
+        sample = rgb[y1, x0 + margin_x : max(x0 + margin_x + 1, x1 - margin_x)]
+        if light_ratio(sample) < 0.65:
+            break
+        y1 += 1
+    for _ in range(max_pad):
+        if x0 <= 0:
+            break
+        sample = rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), x0 - 1]
+        if light_ratio(sample) < 0.65:
+            break
+        x0 -= 1
+    for _ in range(max_pad):
+        if x1 >= width:
+            break
+        sample = rgb[y0 + margin_y : max(y0 + margin_y + 1, y1 - margin_y), x1]
+        if light_ratio(sample) < 0.65:
+            break
+        x1 += 1
+    return x0, y0, x1, y1
+
+
+def _line_framed_photo_slot(
+    background: Image.Image,
+    *,
+    include_frame: bool = False,
+    _preview: bool = True,
+) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Find a soft rectangular photo panel when the source has no frame line.
 
     Downloaded campaign JPGs often have a product photo blended directly into
@@ -865,6 +1016,29 @@ def _line_framed_photo_slot(background: Image.Image) -> tuple[tuple[int, int, in
     """
     if cv2 is None:
         return None
+    # Hough detection is quadratic in the number of horizontal/vertical line
+    # candidates.  Large phone posters can contain thousands of texture edges,
+    # so detect on a bounded preview and map the chosen rectangle back to the
+    # native canvas.  This keeps recognition stable for 1080×1920 and 1320×2362
+    # inputs without sacrificing the original output resolution.
+    if _preview and max(background.size) > 900:
+        preview_scale = 900.0 / max(background.size)
+        preview_size = (
+            max(64, round(background.width * preview_scale)),
+            max(64, round(background.height * preview_scale)),
+        )
+        preview = background.resize(preview_size, Image.Resampling.BILINEAR)
+        detected = _line_framed_photo_slot(preview, include_frame=include_frame, _preview=False)
+        if detected is None:
+            return None
+        (px0, py0, px1, py1), _ = detected
+        x0 = max(0, min(background.width - 1, int(np.floor(px0 / preview_scale))))
+        y0 = max(0, min(background.height - 1, int(np.floor(py0 / preview_scale))))
+        x1 = max(x0 + 1, min(background.width, int(np.ceil(px1 / preview_scale))))
+        y1 = max(y0 + 1, min(background.height, int(np.ceil(py1 / preview_scale))))
+        mask = Image.new("L", background.size, 0)
+        ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+        return (x0, y0, x1, y1), mask
     rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
     height, width = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -979,8 +1153,359 @@ def _line_framed_photo_slot(background: Image.Image) -> tuple[tuple[int, int, in
             key=lambda candidate: ((candidate[1][2] - candidate[1][0]) * (candidate[1][3] - candidate[1][1]), candidate[0]),
         )
     _, (x0, y0, x1, y1), _ = best
+    envelope_used = False
+    if include_frame:
+        # Some photo cards have a strong top/bottom rule but only one visible
+        # vertical edge (the other edge blends into the background).  Recover
+        # the full panel from the shared horizontal span when it is materially
+        # wider than the four-line candidate selected above.  This is common
+        # in lifestyle templates where the photo fades into a warm backdrop.
+        envelope_candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+        for top in horizontal:
+            for bottom in horizontal:
+                ey0, ey1 = top[0], bottom[0]
+                if (
+                    ey1 - ey0 < height * 0.30
+                    or ey1 - ey0 > height * 0.82
+                    or ey0 < height * 0.12
+                    or ey1 > height * 0.98
+                ):
+                    continue
+                ex0, ex1 = max(top[1], bottom[1]), min(top[2], bottom[2])
+                if ex1 - ex0 < width * 0.35 or ex0 < width * 0.02 or ex1 > width * 0.98:
+                    continue
+                span = max(1, ex1 - ex0)
+                top_coverage = coverage(top[1], top[2], ex0, ex1)
+                bottom_coverage = coverage(bottom[1], bottom[2], ex0, ex1)
+                score = span * (ey1 - ey0) * (min(top_coverage, bottom_coverage) ** 2)
+                envelope_candidates.append((score, (ex0, ey0, ex1, ey1)))
+        if envelope_candidates:
+            envelope_score, envelope = max(envelope_candidates, key=lambda item: item[0])
+            # On tall posters a long decorative rule above the photo can make
+            # a too-tall envelope win on area alone.  If a later, well-formed
+            # panel is nearly as strong, prefer it; this keeps the headline
+            # and the empty gap above the actual product image intact.
+            if height > width:
+                lower_candidates = [
+                    item for item in envelope_candidates
+                    if item[1][1] >= height * 0.36
+                ]
+                if lower_candidates:
+                    lower_score, lower_envelope = max(lower_candidates, key=lambda item: item[0])
+                    if lower_score >= envelope_score * 0.72:
+                        envelope_score, envelope = lower_score, lower_envelope
+            envelope_area = (envelope[2] - envelope[0]) * (envelope[3] - envelope[1])
+            selected_area = max(1, (x1 - x0) * (y1 - y0))
+            if envelope_area >= selected_area * 1.12 and (envelope[2] - envelope[0]) >= (x1 - x0) * 1.06:
+                x0, y0, x1, y1 = envelope
+                envelope_used = True
+        # A real product card may have no distinct bottom rule: the photo
+        # fades into the surrounding artwork while its two vertical edges
+        # continue a little farther down.  Use those paired edges as a
+        # conservative extension signal so an internal label baseline cannot
+        # truncate the replacement area.
+        side_tolerance = max(5, round(width * 0.015))
+
+        def vertical_end_near(target_x: int) -> int | None:
+            spans = [
+                line[2]
+                for line in vertical
+                if abs(line[0] - target_x) <= side_tolerance
+                and line[1] <= y0 + max(4, round((y1 - y0) * 0.03))
+                and line[2] >= y0 + round((y1 - y0) * 0.55)
+            ]
+            return max(spans) if spans else None
+
+        left_end, right_end = vertical_end_near(x0), vertical_end_near(x1)
+        if left_end is not None and right_end is not None:
+            common_end = min(left_end, right_end)
+            extension = rgb[y1 : min(height, common_end + 1), x0:x1].astype(np.float32)
+            # Ignore long vertical edges caused by a textured background.  A
+            # genuine continuation of a product photo has materially more
+            # local colour/texture variation than the flat carpet or paper
+            # outside it; this guards the c0 template from a 27 px overrun.
+            texture = float(np.mean(np.std(extension, axis=2))) if extension.size else 0.0
+            gradient = 0.0
+            if extension.shape[0] > 1 and extension.shape[1] > 1:
+                gradient = float(
+                    np.mean(np.abs(np.diff(extension, axis=0)))
+                    + np.mean(np.abs(np.diff(extension, axis=1)))
+                )
+            if (
+                common_end > y1 + max(4, round(height * 0.01))
+                and (texture >= 32.0 or gradient >= 20.0)
+            ):
+                y1 = min(height, common_end + max(2, round(height * 0.008)))
+    if include_frame:
+        x0, y0, x1, y1 = _expand_dark_frame_edges(rgb, (x0, y0, x1, y1))
+        if envelope_used:
+            x0, y0, x1, y1 = _expand_high_contrast_edges(rgb, (x0, y0, x1, y1))
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rectangle((x0, y0, x1, y1), fill=255)
+    return (x0, y0, x1, y1), mask
+
+
+def _profile_photo_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+    """Recover a low-contrast photo card from long row/column transitions."""
+    if cv2 is None:
+        return None
+    source_width, source_height = background.size
+    scale = min(1.0, 900.0 / max(source_width, source_height))
+    if scale < 1.0:
+        preview = background.resize(
+            (max(64, round(source_width * scale)), max(64, round(source_height * scale))),
+            Image.Resampling.BILINEAR,
+        )
+    else:
+        preview = background
+    rgb = np.asarray(preview.convert("RGB"), dtype=np.uint8)
+    height, width = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    smooth = cv2.GaussianBlur(gray, (0, 0), max(1.4, min(width, height) * 0.0035))
+    column_profile = np.mean(np.abs(np.diff(smooth, axis=1)), axis=0)
+    row_profile = np.mean(np.abs(np.diff(smooth, axis=0)), axis=1)
+    profile_window = max(3, round(min(width, height) * 0.006))
+    kernel = np.ones(profile_window, dtype=np.float32) / profile_window
+    column_profile = np.convolve(column_profile, kernel, mode="same")
+    row_profile = np.convolve(row_profile, kernel, mode="same")
+
+    def peaks(profile: np.ndarray, start: int, stop: int, limit: int) -> list[int]:
+        local = cv2.dilate(profile.astype(np.float32), np.ones((1, profile_window * 2 + 1), np.float32)).ravel()
+        candidates = np.where((profile >= local - 1e-6) & (profile > 0))[0]
+        candidates = candidates[(candidates >= start) & (candidates < stop)]
+        candidates = candidates[np.argsort(profile[candidates])[::-1]]
+        selected: list[int] = []
+        for candidate in candidates:
+            position = int(candidate)
+            if all(abs(position - previous) >= profile_window for previous in selected):
+                selected.append(position)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    row_peaks = peaks(row_profile, round(height * 0.36), round(height * 0.98), 56)
+    column_peaks = peaks(column_profile, round(width * 0.03), round(width * 0.97), 72)
+    if len(row_peaks) < 2 or len(column_peaks) < 2:
+        return None
+    row_baseline = max(0.45, float(np.median(row_profile)))
+    column_baseline = max(0.45, float(np.median(column_profile)))
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    for top in row_peaks:
+        for bottom in row_peaks:
+            if bottom <= top or bottom - top < height * 0.24 or bottom - top > height * 0.78:
+                continue
+            row_strength = min(float(row_profile[top]), float(row_profile[bottom]))
+            if row_strength < max(row_baseline * 1.35, 1.7):
+                continue
+            for left in column_peaks:
+                for right in column_peaks:
+                    if right <= left or right - left < width * 0.40 or right - left > width * 0.95:
+                        continue
+                    if left < width * 0.02 or right > width * 0.98:
+                        continue
+                    column_strength = min(float(column_profile[left]), float(column_profile[right]))
+                    if column_strength < max(column_baseline * 1.18, 1.25):
+                        continue
+                    inner = gray[top + 5 : bottom - 5, left + 5 : right - 5]
+                    texture = float(np.std(inner)) if inner.size else 0.0
+                    if texture < 8.0:
+                        continue
+                    area = (right - left) * (bottom - top)
+                    score = area * (row_strength / row_baseline) ** 0.8 * (column_strength / column_baseline) ** 0.8
+                    score *= 1.0 + min(texture, 80.0) / 80.0
+                    candidates.append((score, (left, top, right, bottom)))
+    if not candidates:
+        return None
+    _, (left, top, right, bottom) = max(candidates, key=lambda item: item[0])
+    x0 = max(0, min(source_width - 1, int(np.floor(left / scale))))
+    y0 = max(0, min(source_height - 1, int(np.floor(top / scale))))
+    x1 = max(x0 + 1, min(source_width, int(np.ceil(right / scale))))
+    y1 = max(y0 + 1, min(source_height, int(np.ceil(bottom / scale))))
+    mask = Image.new("L", background.size, 0)
+    ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+    return (x0, y0, x1, y1), mask
+
+
+def _texture_photo_slot(
+    background: Image.Image,
+    *,
+    _preview: bool = True,
+) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+    """Recover a photo panel whose boundary has no usable straight edge.
+
+    Some campaign templates put a JPEG photo directly on a paper-coloured
+    page.  There is no border to find: the reliable signal is that the photo
+    has much more local texture than the surrounding flat artwork.  Use row
+    and column texture profiles only as a conservative final fallback after
+    the green, contour, and Hough detectors have failed.  This keeps headline
+    text and footer copy from becoming a replacement slot while covering
+    rounded or softly blended photo cards.
+    """
+    if cv2 is None:
+        return None
+    if _preview and max(background.size) > 900:
+        preview_scale = 900.0 / max(background.size)
+        preview_size = (
+            max(64, round(background.width * preview_scale)),
+            max(64, round(background.height * preview_scale)),
+        )
+        preview = background.resize(preview_size, Image.Resampling.BILINEAR)
+        detected = _texture_photo_slot(preview, _preview=False)
+        if detected is None:
+            return None
+        (px0, py0, px1, py1), _ = detected
+        x0 = max(0, min(background.width - 1, int(np.floor(px0 / preview_scale))))
+        y0 = max(0, min(background.height - 1, int(np.floor(py0 / preview_scale))))
+        x1 = max(x0 + 1, min(background.width, int(np.ceil(px1 / preview_scale))))
+        y1 = max(y0 + 1, min(background.height, int(np.ceil(py1 / preview_scale))))
+        mask = Image.new("L", background.size, 0)
+        ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+        return (x0, y0, x1, y1), mask
+
+    rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
+    height, width = rgb.shape[:2]
+    if width < 120 or height < 180:
+        return None
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    magnitude = cv2.magnitude(grad_x, grad_y)
+    row_profile = np.mean(magnitude, axis=1)
+    col_profile = np.mean(magnitude, axis=0)
+
+    def smooth(profile: np.ndarray) -> np.ndarray:
+        window = max(7, round(min(width, height) * 0.012))
+        if window % 2 == 0:
+            window += 1
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        return np.convolve(profile, kernel, mode="same")
+
+    row_profile, col_profile = smooth(row_profile), smooth(col_profile)
+
+    def runs(profile: np.ndarray, threshold: float, start: int, end: int) -> list[tuple[int, int, float]]:
+        active = (profile >= threshold).astype(np.uint8)
+        active[:start] = 0
+        active[end:] = 0
+        # Close tiny texture dips inside a photo while leaving separate text
+        # lines as individual components.
+        kernel_size = max(5, round(min(width, height) * 0.012))
+        kernel = np.ones((1, kernel_size), np.uint8) if profile is col_profile else np.ones((kernel_size, 1), np.uint8)
+        closed = cv2.morphologyEx(active.reshape(1, -1) if profile is col_profile else active.reshape(-1, 1), cv2.MORPH_CLOSE, kernel)
+        active = closed.ravel()
+        result: list[tuple[int, int, float]] = []
+        index = 0
+        while index < len(active):
+            if not active[index]:
+                index += 1
+                continue
+            finish = index
+            while finish < len(active) and active[finish]:
+                finish += 1
+            result.append((index, finish, float(np.mean(profile[index:finish]))))
+            index = finish
+        return result
+
+    def threshold(profile: np.ndarray) -> float:
+        q25, q75 = np.percentile(profile, (25, 75))
+        return max(4.0, float(q25 + 0.12 * (q75 - q25)))
+
+    row_runs = [
+        item
+        for item in runs(row_profile, threshold(row_profile), round(height * 0.15), round(height * 0.98))
+        if height * 0.30 <= item[1] - item[0] <= height * 0.82
+    ]
+    col_runs = [
+        item
+        for item in runs(col_profile, threshold(col_profile), round(width * 0.01), round(width * 0.99))
+        if width * 0.30 <= item[1] - item[0] <= width * 0.98
+    ]
+    if not row_runs or not col_runs:
+        return None
+
+    # Select the largest coherent lower-page texture block.  Text banners are
+    # shorter than the required panel height and therefore cannot win here.
+    best: tuple[float, tuple[int, int, int, int]] | None = None
+    row_outside = float(np.median(np.concatenate((row_profile[: max(1, round(height * 0.12))], row_profile[round(height * 0.90) :]))))
+    col_outside = float(np.median(np.concatenate((col_profile[: max(1, round(width * 0.08))], col_profile[round(width * 0.92) :]))))
+    for ry0, ry1, rmean in row_runs:
+        row_contrast = rmean / max(1.0, row_outside)
+        if row_contrast < 1.35:
+            continue
+        for cx0, cx1, cmean in col_runs:
+            col_contrast = cmean / max(1.0, col_outside)
+            if col_contrast < 1.20:
+                continue
+            area = (rx := cx1 - cx0) * (ry := ry1 - ry0)
+            score = area * min(row_contrast, 8.0) * min(col_contrast, 5.0)
+            if best is None or score > best[0]:
+                best = (score, (cx0, ry0, cx1, ry1))
+    if best is None:
+        return None
+    x0, y0, x1, y1 = best[1]
+
+    # Gradient profiles can stop early in a smooth photo corner.  Refine both
+    # axes with colour distance measured against the flat page around the
+    # candidate.  On the Meitu sample this recovers the exact x=115..965 and
+    # y=933..1700 edges even though only three sides have visible contrast.
+    def refine_axis(
+        profile: np.ndarray,
+        initial_start: int,
+        initial_end: int,
+        *,
+        horizontal: bool,
+    ) -> tuple[int, int]:
+        outside_start = max(1, round(len(profile) * (0.08 if horizontal else 0.10)))
+        outside_end = max(1, round(len(profile) * (0.92 if horizontal else 0.90)))
+        left = profile[: max(1, initial_start - outside_start)]
+        right = profile[min(len(profile), initial_end + outside_start) :]
+        outside = np.concatenate((left, right)) if left.size and right.size else profile
+        outside_level = float(np.median(outside)) if outside.size else 0.0
+        inside = profile[initial_start:initial_end]
+        inside_level = float(np.median(inside)) if inside.size else 0.0
+        if inside_level < outside_level * 1.20 + 5.0:
+            return initial_start, initial_end
+        level = max(8.0, outside_level + (inside_level - outside_level) * 0.12)
+        active = (profile >= level).astype(np.uint8)
+        kernel_size = max(5, round(len(profile) * 0.012))
+        kernel = np.ones((1, kernel_size), np.uint8) if horizontal else np.ones((kernel_size, 1), np.uint8)
+        shape = active.reshape(1, -1) if horizontal else active.reshape(-1, 1)
+        active = cv2.morphologyEx(shape, cv2.MORPH_CLOSE, kernel).ravel()
+        components: list[tuple[int, int]] = []
+        index = 0
+        while index < len(active):
+            if not active[index]:
+                index += 1
+                continue
+            finish = index
+            while finish < len(active) and active[finish]:
+                finish += 1
+            if finish - index >= len(profile) * 0.30:
+                components.append((index, finish))
+            index = finish
+        overlap = [
+            component
+            for component in components
+            if component[0] <= initial_start + (initial_end - initial_start) * 0.45
+            and component[1] >= initial_end - (initial_end - initial_start) * 0.45
+        ]
+        return max(overlap, key=lambda component: component[1] - component[0]) if overlap else (initial_start, initial_end)
+
+    top_strip = rgb[max(0, y0 - max(8, round(height * 0.08))) : y0, x0:x1]
+    bottom_strip = rgb[y1 : min(height, y1 + max(8, round(height * 0.08))), x0:x1]
+    if top_strip.size and bottom_strip.size:
+        background_colour = np.median(np.concatenate((top_strip.reshape(-1, 3), bottom_strip.reshape(-1, 3)), axis=0), axis=0)
+        row_colour_profile = np.linalg.norm(np.mean(rgb[:, x0:x1], axis=1) - background_colour, axis=1)
+        y0, y1 = refine_axis(row_colour_profile, y0, y1, horizontal=False)
+
+    left_strip = rgb[y0:y1, : max(8, round(width * 0.08))]
+    right_strip = rgb[y0:y1, min(width, x1 + max(8, round(width * 0.08))) :]
+    if left_strip.size and right_strip.size:
+        background_colour = np.median(np.concatenate((left_strip.reshape(-1, 3), right_strip.reshape(-1, 3)), axis=0), axis=0)
+        col_colour_profile = np.linalg.norm(np.mean(rgb[y0:y1], axis=0) - background_colour, axis=1)
+        x0, x1 = refine_axis(col_colour_profile, x0, x1, horizontal=True)
+
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
     return (x0, y0, x1, y1), mask
 
 
@@ -1008,11 +1533,28 @@ def _is_solid_green_panel(
     active = np.asarray(slot_alpha.convert("L"), dtype=np.uint8) >= 128
     if x1 <= x0 or y1 <= y0:
         return False
-    occupancy = float(np.mean(active[y0:y1, x0:x1]))
-    return occupancy >= 0.70
+    panel = active[y0:y1, x0:x1]
+    occupancy = float(np.mean(panel))
+    if occupancy < 0.78:
+        return False
+    # A green product package can occupy most of its bounding box while still
+    # containing irregular white labels and cut-outs.  A real chroma panel is
+    # rectangular: almost every row and column remains active.  The lower
+    # quantile rejects the photographed green package from horizontal sample
+    # templates without rejecting mildly compressed green placeholders.
+    row_fill = np.mean(panel, axis=1)
+    col_fill = np.mean(panel, axis=0)
+    return bool(
+        np.quantile(row_fill, 0.10) >= 0.58
+        and np.quantile(col_fill, 0.10) >= 0.58
+    )
 
 
-def _template_replace_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+def _template_replace_slot(
+    background: Image.Image,
+    *,
+    include_frame: bool = False,
+) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Locate the best product area for the explicit template-replace mode."""
     # A fully green panel is an explicit placeholder and has a more reliable
     # boundary than Hough lines. Prefer it when it fills a rectangular area;
@@ -1022,7 +1564,34 @@ def _template_replace_slot(background: Image.Image) -> tuple[tuple[int, int, int
         return green
     # Structural frame detection handles photographed panels and dark/white
     # placeholders while preserving their decorative border.
-    return _transparent_product_slot(background) or _framed_photo_slot(background, preserve_frame=True) or _line_framed_photo_slot(background) or green or _product_slot(background)
+    transparent = _transparent_product_slot(background)
+    framed = None if transparent is not None else _framed_photo_slot(background, preserve_frame=not include_frame)
+    detected = (
+        transparent
+        or framed
+        or _line_framed_photo_slot(background, include_frame=include_frame)
+        or _texture_photo_slot(background)
+        or _profile_photo_slot(background)
+        or green
+        or _product_slot(background)
+    )
+    # ``_open_template`` normalizes every input to RGBA, including JPGs whose
+    # alpha channel is fully opaque.  Apply the light-card expansion to those
+    # templates too; gating on the presence of an ``A`` band left the white
+    # strip above the 1f107c... product card untouched in the real compose
+    # path even though direct RGB detection looked correct.
+    alpha_is_opaque = "A" not in background.getbands() or background.getchannel("A").getextrema()[0] >= 250
+    if detected is not None and framed is not None and include_frame and alpha_is_opaque:
+        bbox, slot_alpha = detected
+        if not _mask_is_green(background, slot_alpha):
+            rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
+            expanded = _expand_light_frame_edges(rgb, bbox)
+            if expanded != bbox:
+                x0, y0, x1, y1 = expanded
+                mask = Image.new("L", background.size, 0)
+                ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+                detected = expanded, mask
+    return detected
 
 
 def _place_template_product(
@@ -1170,6 +1739,28 @@ def _looks_like_flat_template(template: Image.Image) -> bool:
     return bool(neutral_white > 0.42 or (edge_uniform > 0.82 and edge_color_area > 0.32))
 
 
+def _enhance_output_detail(
+    image: Image.Image,
+    source_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> Image.Image:
+    """Restore a small amount of edge detail after a canvas upscale.
+
+    Mobile campaign templates are often uploaded at 405×720 or 720×405 and
+    exported at the fixed 1080×1920/1280×720 presets.  Upscaling alone makes
+    Chinese type, thin rules and product edges look soft.  A single restrained
+    unsharp pass is applied only when the requested canvas is larger than the
+    source; JPEG quality and dimensions remain governed by the existing
+    300 KB encoder below.
+    """
+    scale = max(output_size[0] / max(1, source_size[0]), output_size[1] / max(1, source_size[1]))
+    if scale <= 1.02:
+        return image
+    radius = 0.46 if scale < 2.0 else 0.58
+    percent = 108 if scale < 2.0 else 115
+    return image.convert("RGB").filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=2))
+
+
 def compose(
     product_path: str | Path | None,
     template_path: str | Path,
@@ -1195,8 +1786,19 @@ def compose(
     # page when the selected output orientation differs from the source. The
     # product image itself still uses cover inside its slot, so it fills the
     # frame without being stretched.
-    template_page = fit_contain(template, output_size) if mode in {"template_replace", "cutout"} else fit_cover(template, output_size)
-    native_slot = _template_replace_slot(template)
+    # All slot-based flows preserve the complete template page when the
+    # requested output orientation differs from the source.  ``auto`` can
+    # resolve to cutout after it detects a placeholder, so it must use the
+    # same contain transform up front; otherwise the native slot mask and the
+    # rendered page would be mapped through different crops.  Overlay keeps
+    # its documented cover behavior because it intentionally fills the whole
+    # canvas with the product scene.
+    template_page = fit_contain(template, output_size) if mode in {"template_replace", "cutout", "auto"} else fit_cover(template, output_size)
+    # Template replacement deliberately includes the outer photo frame so a
+    # dark rule from the source poster cannot remain above the green panel.
+    # Other modes use the default frame-preserving detector for direct
+    # cutout/auto composition.
+    native_slot = _template_replace_slot(template, include_frame=(mode == "template_replace"))
     mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
     if mode == "template_replace":
         # Detect on the native source first, then transform the mask together
@@ -1225,6 +1827,10 @@ def compose(
             result = _apply_overlay(background, template, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
         else:
             result = _place_cutout(template_page, product=product, detected=mapped_slot)
+    # Apply the detail pass after compositing so both the preserved template
+    # typography and the inserted product benefit from the same final-scale
+    # treatment.  It is intentionally skipped for same-size exports.
+    result = _enhance_output_detail(result, template.size, output_size)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()

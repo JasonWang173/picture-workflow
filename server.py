@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -22,7 +23,9 @@ DEMO_ASSETS = {
     "product": ROOT / "商品1.png",
 }
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+MAX_BATCH_UPLOAD_BYTES = 256 * 1024 * 1024
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
+LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="商品海报合成工作台", version="0.1.0")
 app.add_middleware(
@@ -39,13 +42,45 @@ def _safe_upload_suffix(filename: str | None, default: str) -> str:
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else default
 
 
-async def _write_upload(upload: UploadFile, destination: Path) -> None:
-    content = await upload.read()
-    if not content:
+async def _write_upload(
+    upload: UploadFile,
+    destination: Path,
+    *,
+    current_total: int = 0,
+    total_limit: int | None = None,
+) -> int:
+    """Stream an upload to disk while enforcing per-file and batch limits."""
+    max_allowed = MAX_UPLOAD_BYTES
+    if total_limit is not None:
+        max_allowed = min(max_allowed, total_limit - current_total)
+    if max_allowed <= 0:
+        raise HTTPException(status_code=413, detail="批量上传总大小不能超过 256 MB")
+
+    written = 0
+    try:
+        with destination.open("wb") as handle:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_allowed:
+                    batch_exceeded = total_limit is not None and current_total + written > total_limit
+                    raise HTTPException(
+                        status_code=413,
+                        detail=("批量上传总大小不能超过 256 MB" if batch_exceeded else "单个图片不能超过 24 MB"),
+                    )
+                handle.write(chunk)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    if written == 0:
+        destination.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"文件为空：{upload.filename or '未命名文件'}")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="单个图片不能超过 24 MB")
-    destination.write_bytes(content)
+    return written
 
 
 @app.get("/api/health")
@@ -109,8 +144,9 @@ async def create_composition(
         raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"合成失败：{exc}") from exc
+    except Exception:
+        LOGGER.exception("单张合成失败")
+        raise HTTPException(status_code=500, detail="合成失败，请稍后重试") from None
     return FileResponse(
         output_path,
         media_type="image/jpeg",
@@ -149,11 +185,20 @@ async def create_batch_composition(
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         template_path = work_dir / f"template{_safe_upload_suffix(template.filename, '.jpg')}"
-        await _write_upload(template, template_path)
+        total_upload_bytes = await _write_upload(
+            template,
+            template_path,
+            total_limit=MAX_BATCH_UPLOAD_BYTES,
+        )
         output_paths: list[Path] = []
         for index, upload in enumerate(image_products, start=1):
             product_path = work_dir / f"product-{index:03d}{_safe_upload_suffix(upload.filename, '.png')}"
-            await _write_upload(upload, product_path)
+            total_upload_bytes += await _write_upload(
+                upload,
+                product_path,
+                current_total=total_upload_bytes,
+                total_limit=MAX_BATCH_UPLOAD_BYTES,
+            )
             stem = Path(upload.filename or f"product-{index:03d}").stem
             safe_stem = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in stem).strip("_") or f"product-{index:03d}"
             output_path = output_dir / f"{index:03d}_{safe_stem}.jpg"
@@ -175,9 +220,10 @@ async def create_batch_composition(
     except ValueError as exc:
         shutil.rmtree(batch_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
+    except Exception:
         shutil.rmtree(batch_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"批量合成失败：{exc}") from exc
+        LOGGER.exception("批量合成失败")
+        raise HTTPException(status_code=500, detail="批量合成失败，请稍后重试") from None
     return JSONResponse({
         "batch_id": batch_id,
         "count": len(output_paths),
