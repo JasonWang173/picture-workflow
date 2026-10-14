@@ -348,6 +348,114 @@ def _edge_background_alpha(image: Image.Image) -> Image.Image | None:
     return Image.fromarray(np.uint8(alpha * 255)).filter(ImageFilter.GaussianBlur(0.22))
 
 
+def _wand_background_alpha(image: Image.Image) -> Image.Image | None:
+    """Fallback page key for flat templates whose border is not one color.
+
+    Some campaign pages place a photo panel or a soft gradient against the
+    canvas edge, so the global border-median key refuses to run and the whole
+    template would cover the product photo.  Region-growing from the
+    page-colored part of the border (a magic wand with a small per-step
+    tolerance) still removes such pages: the fill creeps along gradients but
+    stops at hard artwork edges.  A second stage handles a flat frame ring
+    around the page: when the first fill removes almost nothing, the uniform
+    band directly inside it is treated as the real page color.
+
+    Photographic templates are rejected by a colour-tightness gate: a removed
+    campaign page stays close to its border colour, while an eaten photo
+    backdrop spans a wide vignette range.  Those templates keep the previous
+    fully-opaque overlay behavior.
+    """
+    if cv2 is None:
+        return None
+    # Templates that carry a product frame or panel belong to the cutout
+    # feature; overlay must not strip their page behind the product photo.
+    if _template_replace_slot(image) is not None:
+        return None
+    rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    height, width = rgb.shape[:2]
+    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]), axis=0)
+    median = np.median(border, axis=0)
+    near = np.max(np.abs(border.astype(np.float32) - median), axis=1) <= 24
+    if float(near.mean()) < 0.10:
+        return None
+
+    seeds: list[tuple[int, int]] = []
+
+    def pick(values: np.ndarray, make) -> None:
+        idx = np.where(values)[0]
+        if idx.size == 0:
+            return
+        step = max(1, idx.size // 12)
+        seeds.extend(make(int(value)) for value in idx[::step])
+
+    pick(near[:width], lambda x: (x, 0))
+    pick(near[width:2 * width], lambda x: (x, height - 1))
+    pick(near[2 * width:2 * width + height], lambda y: (0, y))
+    pick(near[2 * width + height:], lambda y: (width - 1, y))
+    mask = np.zeros((height + 2, width + 2), np.uint8)
+    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+    lo = (10, 10, 10)
+
+    def grow(seed_points) -> None:
+        for sx, sy in seed_points:
+            if mask[sy + 1, sx + 1]:
+                continue
+            cv2.floodFill(rgb, mask, (sx, sy), 0, lo, lo, flags)
+
+    grow(seeds)
+    flooded = mask[1:-1, 1:-1] == 255
+    clusters = [median]
+    if float(flooded.mean()) < 0.25:
+        band = (cv2.dilate(flooded.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & ~flooded
+        colors = rgb[band].astype(np.float32)
+        if colors.shape[0] > 0:
+            inner = np.median(colors, axis=0)
+            flat = np.max(np.abs(colors - inner), axis=1) <= 12
+            # A frame ring meets the page along one long uniform interface;
+            # photographic edges produce a scattered mix instead.
+            if float(flat.mean()) >= 0.5:
+                clusters.append(inner)
+                ys, xs = np.where(band & (np.max(np.abs(rgb.astype(np.float32) - inner), axis=2) <= 12))
+                if ys.size:
+                    step = max(1, ys.size // 24)
+                    grow(list(zip(xs[::step].tolist(), ys[::step].tolist())))
+                flooded = mask[1:-1, 1:-1] == 255
+    removed = float(flooded.mean())
+    if removed < 0.25 or removed > 0.985:
+        return None
+    distance = np.min(
+        np.stack([np.max(np.abs(rgb.astype(np.float32) - color), axis=2) for color in clusters]),
+        axis=0,
+    )
+    tight = distance[flooded]
+    if float(tight.mean()) > 45.0 or float(np.percentile(tight, 90)) > 80.0:
+        return None
+
+    # Anti-alias ramp against the *local* page color so glyph edges keep a
+    # smooth transition instead of a hard 1 px fringe of page color.
+    flooded_f = flooded.astype(np.float32)
+    count = cv2.boxFilter(flooded_f, -1, (5, 5), normalize=False)
+    summed = cv2.boxFilter(rgb.astype(np.float32) * flooded_f[..., None], -1, (5, 5), normalize=False)
+    page_est = np.where(count[..., None] > 0, summed / np.maximum(count, 1e-6)[..., None], median)
+    edge_distance = np.max(np.abs(rgb.astype(np.float32) - page_est), axis=2)
+    ring = cv2.dilate(flooded.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    alpha = np.where(flooded, 0.0, 1.0)
+    alpha = np.where(ring & ~flooded, np.clip((edge_distance - 10.0) / 38.0, 0.0, 1.0), alpha)
+    # Frame-ring pages can leave tiny page-colored chips wedged in the canvas
+    # corners. Drop isolated specks that hug a corner; real artwork sits away
+    # from the exact corner or is large enough to survive the area gate.
+    opaque = (alpha > 0.5).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(opaque, 8)
+    for index in range(1, count):
+        x, y, w, h, area = stats[index]
+        if area >= max(64.0, width * height * 0.001):
+            continue
+        touches = (x <= 1) + (y <= 1) + (x + w >= width - 1) + (y + h >= height - 1)
+        if touches >= 2:
+            alpha[labels == index] = 0.0
+    return Image.fromarray(np.uint8(alpha * 255)).filter(ImageFilter.GaussianBlur(0.3))
+
+
 def _soft_white_alpha(image: Image.Image, threshold: float = 235.0, softness: float = 23.0) -> Image.Image:
     """Backward-compatible white-background key used by older callers."""
     alpha = _edge_background_alpha(image)
@@ -363,38 +471,62 @@ def _soft_white_alpha(image: Image.Image, threshold: float = 235.0, softness: fl
 
 
 def _top_left_logo_bbox(template: Image.Image, alpha: Image.Image) -> tuple[int, int, int, int] | None:
-    """Find a compact logo in the top-left quarter for a readable white pill."""
+    """Find the compact merchant logo row for a readable backing pill.
+
+    The logo lockup is the first horizontal content band below the top edge;
+    the campaign headline lives in a later band separated by an empty gap.
+    The previous fixed 10%-height window clipped the headline ascenders and
+    unioned them into the logo box, so the pill grew into a slab that covered
+    the headline.  Splitting the top area into content bands and stopping at
+    the first real gap keeps the pill on the lockup only, and the pill bottom
+    is additionally clamped so it can never reach the next band.
+    """
     a = np.asarray(alpha, dtype=np.uint8)
     height, width = a.shape
-    region = np.zeros_like(a)
-    # The supplied templates place the merchant mark in the first ~10% of the
-    # canvas. Keeping this region narrow avoids treating the campaign headline
-    # below it as part of the logo pill.
-    region[: int(height * 0.10), : int(width * 0.62)] = a[: int(height * 0.10), : int(width * 0.62)]
-    mask = (region > 150).astype(np.uint8)
-    if cv2 is not None:
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-        boxes = []
-        for index in range(1, count):
-            x, y, w, h, area = stats[index]
-            if area >= max(8, width * height * 0.00002):
-                boxes.append((x, y, x + w, y + h))
-        if not boxes:
-            return None
-        x0 = min(box[0] for box in boxes)
-        y0 = min(box[1] for box in boxes)
-        x1 = max(box[2] for box in boxes)
-        y1 = max(box[3] for box in boxes)
-    else:
-        ys, xs = np.where(mask > 0)
-        if len(xs) < 8:
-            return None
-        x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
-    # Prevent the title text from being mistaken for a logo.
-    if (x1 - x0) > width * 0.58 or (y1 - y0) > height * 0.12:
+    mask = a > 150
+    scan_h = int(height * 0.30)
+    scan_w = int(width * 0.78)
+    occupancy = mask[:scan_h, :scan_w].sum(axis=1)
+    rows = np.where(occupancy > max(2, scan_w * 0.002))[0]
+    if rows.size == 0:
         return None
-    pad_x, pad_y = max(14, width // 40), max(10, height // 90)
-    return max(0, x0 - pad_x), max(0, y0 - pad_y), min(width, x1 + pad_x), min(height, y1 + pad_y)
+    split_gap = max(4, round(height * 0.004))
+    bands: list[tuple[int, int]] = []
+    start = prev = int(rows[0])
+    for y in rows[1:]:
+        y = int(y)
+        if y - prev > split_gap:
+            bands.append((start, prev))
+            start = y
+        prev = y
+    bands.append((start, prev))
+    y0, y1 = bands[0]
+    next_top: int | None = None
+    for band_start, band_end in bands[1:]:
+        # A tagline sitting directly under the mark belongs to the same
+        # lockup; the headline is separated by a clearly larger gap.
+        if band_start - y1 <= max(6, round(height * 0.006)) and band_end - y0 <= height * 0.12:
+            y1 = band_end
+        else:
+            next_top = band_start
+            break
+    cols = np.where(mask[y0:y1 + 1, :scan_w].any(axis=0))[0]
+    if cols.size == 0:
+        return None
+    x0, x1 = int(cols.min()), int(cols.max()) + 1
+    # Headlines and full-width banners are not logos: they are tall or span
+    # most of the canvas, while merchant lockups stay compact in the corner.
+    if (y1 - y0) > height * 0.10 or (x1 - x0) > width * 0.62:
+        return None
+    if (y1 - y0) < max(6, round(height * 0.004)) or (x1 - x0) < max(8, round(width * 0.02)):
+        return None
+    pad_x = max(12, round(width * 0.018))
+    pad_y = max(10, round(height * 0.010))
+    bottom = y1 + pad_y
+    if next_top is not None:
+        bottom = min(bottom, next_top - max(2, round(height * 0.002)))
+    bottom = max(bottom, y1 + max(4, round(height * 0.004)))
+    return max(0, x0 - pad_x), max(0, y0 - pad_y), min(width, x1 + pad_x), min(height, bottom)
 
 
 def _apply_overlay(
@@ -417,6 +549,8 @@ def _apply_overlay(
         # fallback preserves the original white-key behavior for unusual ones.
         alpha = _edge_background_alpha(page)
         if alpha is None:
+            alpha = _wand_background_alpha(page)
+        if alpha is None:
             alpha = _soft_white_alpha(page)
 
     # Native-alpha templates already contain the designer's exact pill and
@@ -424,13 +558,24 @@ def _apply_overlay(
     if preserve_logo_pill and not uses_native_alpha:
         bbox = _top_left_logo_bbox(page, alpha)
         if bbox is not None:
-            pill = Image.new("RGBA", size, (255, 255, 255, 0))
-            ImageDraw.Draw(pill).rounded_rectangle(
-                bbox,
-                radius=max(12, round(min(size) * 0.025)),
-                fill=(255, 255, 255, 248),
-            )
-            background = Image.alpha_composite(background.convert("RGBA"), pill)
+            x0, y0, x1, y1 = bbox
+            box_alpha = np.asarray(alpha, dtype=np.uint8)[y0:y1, x0:x1]
+            owned = float((box_alpha > 128).mean()) >= 0.8
+            # A template that ships its own badge already fills the lockup
+            # box; a second pill behind it would show as a larger slab.
+            if not owned:
+                opaque = box_alpha > 128
+                rgb_box = np.asarray(page.convert("RGB"), dtype=np.float32)[y0:y1, x0:x1]
+                luma = 0.299 * rgb_box[..., 0] + 0.587 * rgb_box[..., 1] + 0.114 * rgb_box[..., 2]
+                logo_luma = float(np.median(luma[opaque])) if opaque.any() else 0.0
+                # A white pill would swallow an all-white lockup; use a dark
+                # one only for that case so the mark keeps its contrast.
+                fill = (24, 26, 32, 236) if logo_luma > 200 else (255, 255, 255, 248)
+                pill = Image.new("RGBA", size, (255, 255, 255, 0))
+                radius = max(12, round(min(size) * 0.025))
+                radius = min(radius, max(6, (y1 - y0) // 2))
+                ImageDraw.Draw(pill).rounded_rectangle(bbox, radius=radius, fill=fill)
+                background = Image.alpha_composite(background.convert("RGBA"), pill)
 
     graphic = page.convert("RGBA")
     graphic.putalpha(alpha)
@@ -601,6 +746,16 @@ def _neutral_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], I
                 continue
             rectangularity = area / max(1, box_width * box_height)
             if box_width < width * 0.22 or box_height < height * 0.22 or rectangularity < 0.70:
+                continue
+            # A white copy card (bright page color plus dark text strokes and
+            # almost no saturation) is typography, not a product placeholder.
+            # Without this test a headline speech bubble becomes a slot and
+            # auto mode routes a pure overlay template into cutout.
+            hsv = cv2.cvtColor(rgb[y:y + box_height, x:x + box_width], cv2.COLOR_RGB2HSV)
+            bright_ratio = float(np.mean((hsv[:, :, 2] >= 205) & (hsv[:, :, 1] <= 42)))
+            chroma_ratio = float(np.mean((hsv[:, :, 1] >= 60) & (hsv[:, :, 2] >= 40)))
+            dark_ratio = float(np.mean(hsv[:, :, 2] <= 110))
+            if bright_ratio > 0.55 and chroma_ratio < 0.12 and 0.02 < dark_ratio < 0.40:
                 continue
             candidates.append((area, index, x, y, box_width, box_height))
         if not candidates:
@@ -1245,6 +1400,26 @@ def _line_framed_photo_slot(
     return (x0, y0, x1, y1), mask
 
 
+def _slot_is_text_card(rgb: np.ndarray, bbox: tuple[int, int, int, int]) -> bool:
+    """Whether a candidate slot region is really a typography card.
+
+    Fallback slot detectors key on row/column transitions, so a white speech
+    bubble with dark copy produces the same profile as a soft photo card.  A
+    product placeholder holds a photograph: saturated or dark pixels across
+    the panel.  A copy card is mostly page-bright with a share of text strokes
+    and almost no saturation.
+    """
+    x0, y0, x1, y1 = bbox
+    crop = rgb[y0:y1, x0:x1]
+    if crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    bright_ratio = float(np.mean((hsv[:, :, 2] >= 205) & (hsv[:, :, 1] <= 42)))
+    chroma_ratio = float(np.mean((hsv[:, :, 1] >= 60) & (hsv[:, :, 2] >= 40)))
+    dark_ratio = float(np.mean(hsv[:, :, 2] <= 110))
+    return bright_ratio > 0.55 and chroma_ratio < 0.12 and 0.02 < dark_ratio < 0.40
+
+
 def _profile_photo_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Recover a low-contrast photo card from long row/column transitions."""
     if cv2 is None:
@@ -1321,6 +1496,8 @@ def _profile_photo_slot(background: Image.Image) -> tuple[tuple[int, int, int, i
     y0 = max(0, min(source_height - 1, int(np.floor(top / scale))))
     x1 = max(x0 + 1, min(source_width, int(np.ceil(right / scale))))
     y1 = max(y0 + 1, min(source_height, int(np.ceil(bottom / scale))))
+    if cv2 is not None and _slot_is_text_card(np.asarray(background.convert("RGB"), dtype=np.uint8), (x0, y0, x1, y1)):
+        return None
     mask = Image.new("L", background.size, 0)
     ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
     return (x0, y0, x1, y1), mask
@@ -1504,6 +1681,8 @@ def _texture_photo_slot(
         col_colour_profile = np.linalg.norm(np.mean(rgb[y0:y1], axis=0) - background_colour, axis=1)
         x0, x1 = refine_axis(col_colour_profile, x0, x1, horizontal=True)
 
+    if _slot_is_text_card(rgb, (x0, y0, x1, y1)):
+        return None
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
     return (x0, y0, x1, y1), mask

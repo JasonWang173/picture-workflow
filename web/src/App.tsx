@@ -4,8 +4,9 @@ type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
 type Asset = { file: File; url: string }
 type BatchImage = { id: string; name: string; url: string }
 type LightboxImage = { url: string; name: string }
+type TemplateRecord = { id: string; name: string; url: string; source?: string; created_at?: string; size?: number }
 
-type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh' | 'zoom'
+type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh' | 'zoom' | 'library'
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true }
@@ -19,6 +20,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     check: <path d="m5 12 4 4L19 6" />,
     refresh: <><path d="M20 11a8 8 0 0 0-14.5-4L4 9" /><path d="M4 4v5h5" /><path d="M4 13a8 8 0 0 0 14.5 4L20 15" /><path d="M20 20v-5h-5" /></>,
     zoom: <><path d="M8 3H3v5" /><path d="M16 3h5v5" /><path d="M8 21H3v-5" /><path d="M21 16v5h-5" /></>,
+    library: <><path d="M4 5h16" /><path d="M4 12h16" /><path d="M4 19h16" /><path d="M7 5v14" /><path d="M17 5v14" /></>,
   }
   return <svg {...common}>{paths[name]}</svg>
 }
@@ -129,6 +131,60 @@ function AssetDrop({
   )
 }
 
+function TemplateLibrary({
+  templates,
+  selectedId,
+  loading,
+  busy,
+  onUpload,
+  onSelect,
+  onDelete,
+}: {
+  templates: TemplateRecord[]
+  selectedId: string | null
+  loading: boolean
+  busy: boolean
+  onUpload: (files: File[]) => void
+  onSelect: (template: TemplateRecord) => void
+  onDelete: (template: TemplateRecord) => void
+}) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const handleInput = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/'))
+    if (files.length) onUpload(files)
+    event.target.value = ''
+  }
+  return (
+    <section className="template-library" aria-label="模板库">
+      <div className="library-heading">
+        <div className="library-title"><span className="library-icon"><Icon name="library" size={15} /></span><div><strong>模板库</strong><small>{loading ? '正在读取模板…' : `${templates.length} 个模板可用`}</small></div></div>
+        <>
+          <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleInput} hidden />
+          <button className="library-upload" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><Icon name="upload" size={13} /> {busy ? '保存中' : '上传模板'}</button>
+        </>
+      </div>
+      {templates.length ? (
+        <div className="template-grid">
+          {templates.map((item) => (
+            <article className={`template-card ${selectedId === item.id ? 'is-selected' : ''}`} key={item.id}>
+              <button className="template-card-select" type="button" onClick={() => onSelect(item)} aria-label={`使用模板 ${item.name}`}>
+                <img src={item.url} alt={item.name} />
+                <span className="template-card-check"><Icon name="check" size={11} /></span>
+              </button>
+              <div className="template-card-meta"><strong title={item.name}>{item.name}</strong><small>{item.source === 'template_replace' ? '模板替换生成' : '已上传模板'}</small></div>
+              <button className="template-card-delete" type="button" onClick={() => onDelete(item)} aria-label={`删除模板 ${item.name}`}><Icon name="close" size={12} /></button>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <button className="template-library-empty" type="button" onClick={() => inputRef.current?.click()}>
+          <Icon name="upload" size={16} /><span>上传常用模板，之后可直接选择使用</span>
+        </button>
+      )}
+    </section>
+  )
+}
+
 function App() {
   const [products, setProducts] = useState<Asset[]>([])
   const [template, setTemplate] = useState<Asset | null>(null)
@@ -145,6 +201,10 @@ function App() {
   const [lastSize, setLastSize] = useState<string | null>(null)
   const [demoAvailable, setDemoAvailable] = useState(false)
   const [lightbox, setLightbox] = useState<LightboxImage | null>(null)
+  const [templates, setTemplates] = useState<TemplateRecord[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
+  const [libraryLoading, setLibraryLoading] = useState(true)
+  const [libraryBusy, setLibraryBusy] = useState(false)
   const productsRef = useRef<Asset[]>([])
   const templateRef = useRef<Asset | null>(null)
   const resultRef = useRef<string | null>(null)
@@ -152,6 +212,19 @@ function App() {
   useEffect(() => { productsRef.current = products }, [products])
   useEffect(() => { templateRef.current = template }, [template])
   useEffect(() => { resultRef.current = resultUrl }, [resultUrl])
+  const loadTemplates = async () => {
+    try {
+      const response = await fetch('/api/templates')
+      if (!response.ok) throw new Error('模板库读取失败')
+      const payload = await response.json() as { templates?: TemplateRecord[] }
+      setTemplates(payload.templates || [])
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '模板库读取失败')
+    } finally {
+      setLibraryLoading(false)
+    }
+  }
+  useEffect(() => { loadTemplates() }, [])
   useEffect(() => {
     if (!lightbox) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -194,6 +267,7 @@ function App() {
   const replaceTemplate = (file: File) => {
     releaseAsset(template)
     setTemplate(makeAsset(file))
+    setSelectedTemplateId(null)
     setError('')
     resetResult()
   }
@@ -203,6 +277,85 @@ function App() {
     setMode(nextMode)
     setError('')
     resetResult()
+  }
+
+  const uploadTemplates = async (files: File[]) => {
+    setLibraryBusy(true)
+    setError('')
+    try {
+      for (const file of files) {
+        const body = new FormData()
+        body.append('template', file)
+        body.append('name', file.name.replace(/\.[^.]+$/, '') || '未命名模板')
+        body.append('source', 'upload')
+        const response = await fetch('/api/templates', { method: 'POST', body })
+        if (!response.ok) {
+          let message = '模板保存失败'
+          try { const payload = await response.json(); message = payload.detail || message } catch { /* response may not be JSON */ }
+          throw new Error(message)
+        }
+      }
+      await loadTemplates()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '模板保存失败')
+    } finally {
+      setLibraryBusy(false)
+    }
+  }
+
+  const selectLibraryTemplate = async (item: TemplateRecord) => {
+    setLibraryBusy(true)
+    setError('')
+    try {
+      const response = await fetch(item.url)
+      if (!response.ok) throw new Error('模板读取失败')
+      const blob = await response.blob()
+      const suffix = blob.type === 'image/png' ? '.png' : blob.type === 'image/webp' ? '.webp' : '.jpg'
+      replaceTemplate(new File([blob], `${item.name}${suffix}`, { type: blob.type || 'image/jpeg' }))
+      setSelectedTemplateId(item.id)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '模板读取失败')
+    } finally {
+      setLibraryBusy(false)
+    }
+  }
+
+  const deleteLibraryTemplate = async (item: TemplateRecord) => {
+    if (!window.confirm(`确定从模板库删除“${item.name}”吗？`)) return
+    setLibraryBusy(true)
+    setError('')
+    try {
+      const response = await fetch(`/api/templates/${item.id}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error('模板删除失败')
+      if (selectedTemplateId === item.id) setSelectedTemplateId(null)
+      await loadTemplates()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '模板删除失败')
+    } finally {
+      setLibraryBusy(false)
+    }
+  }
+
+  const saveResultToLibrary = async () => {
+    if (!resultUrl) return
+    setLibraryBusy(true)
+    setError('')
+    try {
+      const blobResponse = await fetch(resultUrl)
+      const blob = await blobResponse.blob()
+      const originalName = template?.file.name.replace(/\.[^.]+$/, '') || '模板'
+      const body = new FormData()
+      body.append('template', new File([blob], `${originalName}-空白模板.jpg`, { type: 'image/jpeg' }))
+      body.append('name', `${originalName}-空白模板`)
+      body.append('source', 'template_replace')
+      const response = await fetch('/api/templates', { method: 'POST', body })
+      if (!response.ok) throw new Error('生成模板保存失败')
+      await loadTemplates()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '生成模板保存失败')
+    } finally {
+      setLibraryBusy(false)
+    }
   }
 
   const loadDemo = async () => {
@@ -305,6 +458,8 @@ function App() {
             <div><span className="section-label">01 / 工作流</span><h2>{mode === 'template_replace' ? '先制作空白模板' : '合成商品海报'}</h2></div>
             {demoAvailable && <button className="text-button" type="button" onClick={loadDemo}><Icon name="spark" size={14} /> 试用示例</button>}
           </div>
+          <TemplateLibrary templates={templates} selectedId={selectedTemplateId} loading={libraryLoading} busy={libraryBusy} onUpload={uploadTemplates} onSelect={selectLibraryTemplate} onDelete={deleteLibraryTemplate} />
+          <div className="library-divider" />
           {mode === 'template_replace' ? (
             <div className="template-only-note"><span className="template-only-icon">✦</span><div><strong>无需上传商品图</strong><small>只清除模板中的商品图片区，保留其他设计</small></div></div>
           ) : (
@@ -399,7 +554,7 @@ function App() {
           {resultUrl ? (
             <div className="result-actions">
               <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · JPG <span className="size-limit">&lt;300KB</span> · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加 · Logo/文字' : lastMode === 'template_replace' ? '模板替换 · 绿色占位模板' : '主体抠图 · 区域替换'}</strong></div>
-              <a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a>
+              <div className="result-download-actions">{lastMode === 'template_replace' && <button className="download-button save-template-button" type="button" disabled={libraryBusy} onClick={saveResultToLibrary}><Icon name="library" size={15} /> {libraryBusy ? '保存中' : '存入模板库'}</button>}<a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a></div>
             </div>
           ) : hasBatch ? (
             <div className="result-actions">

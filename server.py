@@ -5,6 +5,8 @@ import tempfile
 import uuid
 import zipfile
 import logging
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -18,6 +20,8 @@ from food_compositor import compose
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
 BATCH_ROOT = ROOT / "runtime" / "batches"
+TEMPLATE_ROOT = ROOT / "runtime" / "templates"
+TEMPLATE_INDEX = TEMPLATE_ROOT / "index.json"
 DEMO_ASSETS = {
     "template": ROOT / "1.jpg",
     "product": ROOT / "商品1.png",
@@ -25,6 +29,7 @@ DEMO_ASSETS = {
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 MAX_BATCH_UPLOAD_BYTES = 256 * 1024 * 1024
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
+TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
 LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="商品海报合成工作台", version="0.1.0")
@@ -40,6 +45,37 @@ app.add_middleware(
 def _safe_upload_suffix(filename: str | None, default: str) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else default
+
+
+def _read_template_records() -> list[dict[str, object]]:
+    if not TEMPLATE_INDEX.is_file():
+        return []
+    try:
+        payload = json.loads(TEMPLATE_INDEX.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("模板库索引读取失败，将使用空列表", exc_info=True)
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [record for record in payload if isinstance(record, dict) and isinstance(record.get("id"), str)]
+
+
+def _write_template_records(records: list[dict[str, object]]) -> None:
+    temporary = TEMPLATE_INDEX.with_suffix(".tmp")
+    temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(TEMPLATE_INDEX)
+
+
+def _template_record(template_id: str) -> dict[str, object] | None:
+    return next((record for record in _read_template_records() if record.get("id") == template_id), None)
+
+
+def _template_path(record: dict[str, object]) -> Path:
+    filename = Path(str(record.get("filename", ""))).name
+    path = (TEMPLATE_ROOT / filename).resolve()
+    if TEMPLATE_ROOT.resolve() not in path.parents:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return path
 
 
 async def _write_upload(
@@ -86,6 +122,74 @@ async def _write_upload(
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "food-compositor"}
+
+
+@app.get("/api/templates")
+def list_templates() -> dict[str, object]:
+    records = []
+    for record in sorted(_read_template_records(), key=lambda item: str(item.get("created_at", "")), reverse=True):
+        path = _template_path(record)
+        if not path.is_file():
+            continue
+        records.append({**record, "url": f"/api/templates/{record['id']}/file"})
+    return {"templates": records}
+
+
+@app.post("/api/templates")
+async def save_template(
+    template: Annotated[UploadFile, File(description="模板图片")],
+    name: Annotated[str | None, Form()] = None,
+    source: Annotated[str | None, Form()] = None,
+) -> dict[str, object]:
+    suffix = _safe_upload_suffix(template.filename, ".jpg")
+    template_id = uuid.uuid4().hex[:16]
+    filename = f"{template_id}{suffix}"
+    destination = TEMPLATE_ROOT / filename
+    try:
+        size = await _write_upload(template, destination)
+        clean_name = (name or Path(template.filename or "未命名模板").stem).strip()[:80] or "未命名模板"
+        record: dict[str, object] = {
+            "id": template_id,
+            "name": clean_name,
+            "filename": filename,
+            "url": f"/api/templates/{template_id}/file",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": (source or "upload").strip()[:40],
+            "size": size,
+        }
+        records = _read_template_records()
+        records.append(record)
+        _write_template_records(records)
+        return record
+    except HTTPException:
+        raise
+    except Exception:
+        destination.unlink(missing_ok=True)
+        LOGGER.exception("模板保存失败")
+        raise HTTPException(status_code=500, detail="模板保存失败，请稍后重试") from None
+
+
+@app.get("/api/templates/{template_id}/file")
+def get_template_file(template_id: str) -> FileResponse:
+    record = _template_record(template_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    path = _template_path(record)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="模板文件不存在")
+    media_type = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
+    return FileResponse(path, media_type=media_type, filename=str(record.get("name", path.name)) + path.suffix)
+
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: str) -> dict[str, str]:
+    records = _read_template_records()
+    record = next((item for item in records if item.get("id") == template_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    _template_path(record).unlink(missing_ok=True)
+    _write_template_records([item for item in records if item.get("id") != template_id])
+    return {"status": "deleted", "id": template_id}
 
 
 @app.get("/api/demo-assets/{kind}")
