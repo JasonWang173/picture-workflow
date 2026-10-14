@@ -470,6 +470,173 @@ def _soft_white_alpha(image: Image.Image, threshold: float = 235.0, softness: fl
     return Image.fromarray(np.uint8(alpha_array * 255)).filter(ImageFilter.GaussianBlur(0.22))
 
 
+def _with_alpha(page: Image.Image, alpha: Image.Image) -> Image.Image:
+    """Combine a template page with an alpha mask as RGBA."""
+    result = page.convert("RGBA")
+    result.putalpha(alpha)
+    return result
+
+
+def _unmultiply_page_fringe(page: Image.Image, alpha: Image.Image) -> Image.Image:
+    """Recover true edge colors and coverage from page-blended fringe pixels.
+
+    The page key derives alpha from the distance to the page color with a
+    narrow ramp, so an anti-aliased glyph edge keeps opaque pixels whose RGB
+    is still mostly the white page; composited over a dark product photo they
+    read as a 1 px bright hairline around every glyph and counter. For pixels
+    near a transparency boundary we re-estimate coverage against the local
+    ink color (``observed = c*ink + (1-c)*page``) and unmix the stored RGB,
+    which restores both the soft coverage and the real edge color. Interior
+    artwork pixels are untouched because only boundary-adjacent pixels are
+    re-estimated.
+    """
+    if cv2 is None:
+        return _with_alpha(page, alpha)
+    rgb = np.asarray(page.convert("RGB"), dtype=np.float32)
+    a = np.asarray(alpha, dtype=np.uint8)
+    transparent = a <= 8
+    if not transparent.any():
+        return _with_alpha(page, alpha)
+    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]), axis=0)
+    page_color = np.median(border, axis=0)
+    # A pixel qualifies as fringe when a transparent pixel is within 2 px;
+    # that ring is exactly where the key ramp misjudges coverage.
+    near = cv2.dilate(transparent.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    # Both the semi-transparent ramp pixels and the first opaque row inside a
+    # glyph edge still carry page-blended color; re-estimate the whole ring.
+    fringe = near & (a > 8)
+    if not fringe.any():
+        return _with_alpha(page, alpha)
+    solid = (a >= 250) & ~near
+    if not solid.any():
+        return _with_alpha(page, alpha)
+    _, labels = cv2.distanceTransformWithLabels(
+        (~solid).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    # Labels number the nearest solid pixel 1..N in raster order, not by flat
+    # index, so map them back through the solid pixel color list.
+    solid_colors = rgb.reshape(-1, 3)[solid.ravel()]
+    ink = solid_colors[np.clip(labels.ravel(), 1, solid_colors.shape[0]) - 1].reshape(rgb.shape)
+    ink_distance = np.max(np.abs(rgb - ink), axis=2)
+    page_distance = np.max(np.abs(rgb - page_color), axis=2)
+    # observed = c*ink + (1-c)*page, so c is the page distance share of the
+    # full ink-to-page distance (page_distance + ink_distance).
+    full = page_distance + ink_distance
+    coverage = np.clip(page_distance / np.maximum(full, 24.0), 0.0, 1.0)
+    # Only trust the re-estimate where the pixel really lies on the page-to-ink
+    # segment; JPEG ringing or a second ink colour nearby fails this test and
+    # keeps its original alpha.
+    on_segment = full >= 60.0
+    recovered = (rgb - (1.0 - coverage[..., None]) * page_color) / np.maximum(coverage[..., None], 0.06)
+    soften = fringe & on_segment
+    out_rgb = rgb.copy()
+    out_rgb[soften] = np.clip(recovered[soften], 0.0, 255.0)
+    out_a = a.astype(np.float32)
+    out_a[soften] = np.minimum(out_a[soften], coverage[soften] * 255.0)
+    result = Image.fromarray(np.uint8(out_rgb), "RGB")
+    result = result.convert("RGBA")
+    result.putalpha(Image.fromarray(np.uint8(out_a), "L"))
+    return result
+
+
+def _glyph_counter_alpha(page: Image.Image, alpha: Image.Image) -> Image.Image:
+    """Punch page-white counters of solid dark glyphs through to transparent.
+
+    A flattened JPG template bakes its page color into every enclosed hole, so
+    the counter of a headline digit (the inside of a "0") survives the
+    border-connected page key as an opaque white blob floating over the
+    product photo. Enclosed white fills that belong to the artwork (cartoon
+    eyes, copy cards) sit inside thin outline components, while a digit
+    counter sits inside a solid glyph body; gating on the dark component's
+    fill ratio separates the two without touching the artwork.
+    """
+    if cv2 is None:
+        return alpha
+    rgb = np.asarray(page.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    dark = gray <= 100
+    original_alpha = np.asarray(alpha, dtype=np.uint8)
+    alpha_array = original_alpha.copy()
+    height, width = alpha_array.shape
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark.astype(np.uint8), 8)
+    for index in range(1, count):
+        x, y, w, h, area = stats[index]
+        # A dark component touching the canvas border is the page itself on a
+        # black template; its enclosed whites are artwork, not counters.
+        if x <= 1 or y <= 1 or x + w >= width - 1 or y + h >= height - 1:
+            continue
+        # Solid headline glyphs fill most of their box; outlines, offset
+        # shadows and thin rules do not, and their enclosed whites are
+        # deliberate artwork fills. CJK glyphs are sparser than latin digits,
+        # so the gate stays low enough to include them.
+        if area < 500 or area < 0.25 * w * h:
+            continue
+        component = labels[y:y + h, x:x + w] == index
+        # Glyphs printed on an opaque white card or pill keep their counters
+        # (the card shows through them); only glyphs sitting directly on the
+        # keyed page have page-colored see-through counters. Sample the ring
+        # on the true outside of the glyph (border-connected area), ignoring
+        # inner holes such as white inlines.
+        inv = (~component).astype(np.uint8)
+        outside_count, outside_labels, outside_stats, _ = cv2.connectedComponentsWithStats(inv, 4)
+        touch = np.unique(np.concatenate((
+            outside_labels[0, :], outside_labels[-1, :],
+            outside_labels[:, 0], outside_labels[:, -1],
+        )))
+        outside = np.isin(outside_labels, touch[touch != 0])
+        ring = (cv2.dilate(component.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0) & outside
+        ring_alpha = original_alpha[y:y + h, x:x + w][ring]
+        if ring_alpha.size == 0:
+            continue
+        ring_rgb = rgb[y:y + h, x:x + w][ring]
+        trans = ring_alpha <= 8
+        local_page = np.median(ring_rgb[trans], axis=0) if trans.any() else np.median(ring_rgb, axis=0)
+        # Glyphs printed on an opaque white card or pill keep their counters:
+        # there the ring's opaque pixels share the counter color, while on a
+        # keyed page the opaque ring pixels are neighbour glyph inks.
+        opaque_ring = ring_alpha > 128
+        if opaque_ring.any():
+            same = np.max(np.abs(ring_rgb[opaque_ring].astype(np.float32) - local_page), axis=1) <= 32.0
+            if float(same.mean()) >= 0.5:
+                continue
+        hole_count, hole_labels, hole_stats, _ = cv2.connectedComponentsWithStats(inv, 4)
+        for j in range(1, hole_count):
+            hx, hy, hw, hh, hole_area = hole_stats[j]
+            # The outside background touches the component box; a real counter
+            # is strictly interior and large enough to read as a hole.
+            if hx <= 0 or hy <= 0 or hx + hw >= w or hy + hh >= h:
+                continue
+            if hole_area < max(300, 0.02 * w * h):
+                continue
+            hole = hole_labels[hy:hy + hh, hx:hx + hw] == j
+            hole_rgb = rgb[y + hy:y + hy + hh, x + hx:x + hx + hw].astype(np.float32)
+            like = np.max(np.abs(hole_rgb - local_page), axis=2) <= 32.0
+            # Small counters carry a relatively wide anti-aliased border, so
+            # the page-color share threshold stays permissive.
+            if float(like[hole].mean()) < 0.80:
+                continue
+            # A hole wrapping a detached dark island (cartoon eye white around
+            # its pupil) is artwork fill, not a glyph counter. JPEG/anti-alias
+            # specks form thin chains along the hole border, so only compact
+            # blob-like dark components count as islands.
+            hole_dark = dark[y + hy:y + hy + hh, x + hx:x + hx + hw][hole]
+            if hole_dark.any():
+                dn, _, dstats, _ = cv2.connectedComponentsWithStats(
+                    hole_dark.astype(np.uint8), 8,
+                )
+                island = False
+                for k in range(1, dn):
+                    _, _, dw, dh, darea = dstats[k]
+                    if darea >= max(120, 0.08 * hole_area) and darea >= 0.45 * dw * dh:
+                        island = True
+                        break
+                if island:
+                    continue
+            alpha_array[y + hy:y + hy + hh, x + hx:x + hx + hw][hole] = 0
+    return Image.fromarray(alpha_array, "L")
+
+
 def _top_left_logo_bbox(template: Image.Image, alpha: Image.Image) -> tuple[int, int, int, int] | None:
     """Find the compact merchant logo row for a readable backing pill.
 
@@ -552,6 +719,7 @@ def _apply_overlay(
             alpha = _wand_background_alpha(page)
         if alpha is None:
             alpha = _soft_white_alpha(page)
+        alpha = _glyph_counter_alpha(page, alpha)
 
     # Native-alpha templates already contain the designer's exact pill and
     # edge treatment. Do not enlarge or redraw either of them.
@@ -577,14 +745,34 @@ def _apply_overlay(
                 ImageDraw.Draw(pill).rounded_rectangle(bbox, radius=radius, fill=fill)
                 background = Image.alpha_composite(background.convert("RGBA"), pill)
 
-    graphic = page.convert("RGBA")
-    graphic.putalpha(alpha)
+    if uses_native_alpha:
+        graphic = _with_alpha(page, alpha)
+    else:
+        graphic = _unmultiply_page_fringe(page, alpha)
 
-    # A restrained white keyline keeps orange promotional type legible over food.
+    # A restrained white keyline keeps orange promotional type legible over
+    # food. Solid black type already carries its own contrast, so the keyline
+    # is masked away next to dark artwork: a white ring hugging a black
+    # headline reads as a cutout artifact instead of a design stroke.
     if outline_strength > 0.01 and not uses_native_alpha:
         expanded = alpha.filter(ImageFilter.MaxFilter(9))
         border = ImageChops.subtract(expanded, alpha)
         border = border.point(lambda value: round(value * max(0.0, min(1.0, outline_strength))))
+        # The expansion also creeps into enclosed holes (glyph counters), so
+        # keep the keyline only on the true outside of the artwork.
+        exterior = _connected_to_border(np.asarray(alpha, dtype=np.uint8) <= 8)
+        border = ImageChops.multiply(border, Image.fromarray(np.uint8(exterior) * 255, "L"))
+        rgb_array = np.asarray(page.convert("RGB"), dtype=np.float32)
+        luma = 0.299 * rgb_array[..., 0] + 0.587 * rgb_array[..., 1] + 0.114 * rgb_array[..., 2]
+        alpha_array = np.asarray(alpha, dtype=np.uint8)
+        # Only dark artwork counts: a black template page must not suppress
+        # the keyline everywhere, and keyed-out page pixels are not content.
+        dark = Image.fromarray(np.uint8((luma <= 100) & (alpha_array >= 128)) * 255, "L")
+        # The keyline ring lies just outside the glyph edge, where the page
+        # itself is light; test the dilated dark mask so a ring hugging black
+        # type is recognised as belonging to dark artwork and dropped.
+        keep = ImageChops.invert(dark.filter(ImageFilter.MaxFilter(17)))
+        border = ImageChops.multiply(border, keep)
         keyline = Image.new("RGBA", size, (255, 255, 255, 0))
         keyline.putalpha(border)
         background = Image.alpha_composite(background.convert("RGBA"), keyline)
