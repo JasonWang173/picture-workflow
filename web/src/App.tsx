@@ -5,6 +5,7 @@ type Asset = { file: File; url: string }
 type BatchImage = { id: string; name: string; url: string }
 type LightboxImage = { url: string; name: string }
 type TemplateRecord = { id: string; name: string; url: string; thumb_url?: string; source?: string; created_at?: string; size?: number }
+type SlotRect = { x: number; y: number; w: number; h: number }
 
 type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh' | 'zoom' | 'library'
 
@@ -268,6 +269,102 @@ function TemplatePickerModal({
   )
 }
 
+function SlotEditorModal({
+  imageUrl,
+  imageName,
+  initial,
+  onConfirm,
+  onClose,
+}: {
+  imageUrl: string
+  imageName: string
+  initial: SlotRect | null
+  onConfirm: (rect: SlotRect) => void
+  onClose: () => void
+}) {
+  const [rect, setRect] = useState<SlotRect | null>(initial)
+  const [dragging, setDragging] = useState(false)
+  const stageRef = useRef<HTMLDivElement>(null)
+  const startRef = useRef<{ x: number; y: number } | null>(null)
+
+  const toNorm = (event: React.PointerEvent) => {
+    const box = stageRef.current?.getBoundingClientRect()
+    if (!box || box.width === 0 || box.height === 0) return null
+    return {
+      x: Math.min(1, Math.max(0, (event.clientX - box.left) / box.width)),
+      y: Math.min(1, Math.max(0, (event.clientY - box.top) / box.height)),
+    }
+  }
+  const handleDown = (event: React.PointerEvent) => {
+    const point = toNorm(event)
+    if (!point) return
+    event.preventDefault()
+    stageRef.current?.setPointerCapture(event.pointerId)
+    startRef.current = point
+    setDragging(true)
+    setRect({ x: point.x, y: point.y, w: 0, h: 0 })
+  }
+  const handleMove = (event: React.PointerEvent) => {
+    if (!dragging || !startRef.current) return
+    const point = toNorm(event)
+    if (!point) return
+    const start = startRef.current
+    setRect({
+      x: Math.min(start.x, point.x),
+      y: Math.min(start.y, point.y),
+      w: Math.abs(point.x - start.x),
+      h: Math.abs(point.y - start.y),
+    })
+  }
+  const handleUp = () => {
+    if (!dragging) return
+    setDragging(false)
+    startRef.current = null
+    setRect((current) => (current && (current.w < 0.02 || current.h < 0.02) ? null : current))
+  }
+  const usable = rect !== null && rect.w >= 0.02 && rect.h >= 0.02
+  return (
+    <div className="lightbox slot-editor" role="dialog" aria-modal="true" aria-label="手动框选商品区域" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <div className="lightbox-panel picker-panel">
+        <div className="lightbox-bar">
+          <div>
+            <span className="section-label">MANUAL SLOT</span>
+            <strong>在模板上拖拽框选商品图片区 · {imageName}</strong>
+          </div>
+          <button className="lightbox-close" type="button" onClick={onClose} aria-label="关闭框选">
+            <Icon name="close" size={19} />
+          </button>
+        </div>
+        <div className="slot-editor-stage">
+          <div
+            ref={stageRef}
+            className="slot-stage"
+            onPointerDown={handleDown}
+            onPointerMove={handleMove}
+            onPointerUp={handleUp}
+            onPointerCancel={handleUp}
+          >
+            <img src={imageUrl} alt="模板框选预览" draggable={false} />
+            {rect && (
+              <span
+                className="slot-rect"
+                style={{ left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.w * 100}%`, height: `${rect.h * 100}%` }}
+              />
+            )}
+          </div>
+        </div>
+        <div className="slot-editor-actions">
+          <span>{usable && rect ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 模板替换将只处理该区域` : '按住拖拽画出矩形框；框太小会自动放弃'}</span>
+          <div className="picker-actions">
+            <button className="library-upload" type="button" onClick={onClose}>取消</button>
+            <button className="library-upload slot-confirm" type="button" disabled={!usable} onClick={() => rect && onConfirm(rect)}>使用此区域</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [products, setProducts] = useState<Asset[]>([])
   const [template, setTemplate] = useState<Asset | null>(null)
@@ -291,6 +388,8 @@ function App() {
   const [libraryBusy, setLibraryBusy] = useState(false)
   const [libraryNotice, setLibraryNotice] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [manualSlot, setManualSlot] = useState<SlotRect | null>(null)
+  const [slotEditorOpen, setSlotEditorOpen] = useState(false)
   const [resultSavedName, setResultSavedName] = useState<string | null>(null)
   const productsRef = useRef<Asset[]>([])
   const templateRef = useRef<Asset | null>(null)
@@ -319,11 +418,12 @@ function App() {
   }
   useEffect(() => { loadTemplates() }, [])
   useEffect(() => {
-    if (!lightbox && !pickerOpen) return
+    if (!lightbox && !pickerOpen && !slotEditorOpen) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
         setLightbox(null)
         setPickerOpen(false)
+        setSlotEditorOpen(false)
       }
     }
     const previousOverflow = document.body.style.overflow
@@ -333,7 +433,7 @@ function App() {
       document.body.style.overflow = previousOverflow
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [lightbox, pickerOpen])
+  }, [lightbox, pickerOpen, slotEditorOpen])
   useEffect(() => {
     fetch('/api/demo-available')
       .then((response) => response.ok ? response.json() : { available: false })
@@ -367,6 +467,7 @@ function App() {
     releaseAsset(template)
     setTemplate(makeAsset(file))
     setSelectedTemplateId(null)
+    setManualSlot(null)
     setError('')
     resetResult()
   }
@@ -505,6 +606,9 @@ function App() {
       body.append('outline', '0.78')
       body.append('preserve_logo_pill', String(preserveLogo))
       body.append('quality', '100')
+      if (mode === 'template_replace' && manualSlot) {
+        body.append('slot', `${manualSlot.x.toFixed(4)},${manualSlot.y.toFixed(4)},${manualSlot.w.toFixed(4)},${manualSlot.h.toFixed(4)}`)
+      }
       const response = await fetch(isBatch ? '/api/compose-batch' : '/api/compose', { method: 'POST', body })
       if (!response.ok) {
         let message = '合成失败，请检查图片后重试'
@@ -609,6 +713,21 @@ function App() {
             <div className="template-only-note"><span className="template-only-icon">✦</span><div><strong>无需上传商品图</strong><small>只清除模板中的商品图片区，保留其他设计</small></div></div>
           ) : (
             <AssetDrop number="01" title="商品图" hint="支持多选图片或整个文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={replaceProducts} onClear={clearProducts} />
+          )}
+          {mode === 'template_replace' && template && (
+            <div className="slot-row">
+              <button className="drop-choice" type="button" onClick={() => setSlotEditorOpen(true)}>
+                <Icon name="zoom" size={12} /> {manualSlot ? '重新框选商品区' : '手动框选商品区'}
+              </button>
+              {manualSlot ? (
+                <>
+                  <span className="slot-chip">已框选 {Math.round(manualSlot.w * 100)}% × {Math.round(manualSlot.h * 100)}%</span>
+                  <button className="slot-clear" type="button" onClick={() => setManualSlot(null)}>清除，恢复自动识别</button>
+                </>
+              ) : (
+                <span className="slot-hint-inline">自动识别不准时，可拖拽画框指定替换区域</span>
+              )}
+            </div>
           )}
           <AssetDrop number="02" title="模板图" hint="商家活动与品牌信息 · 可从模板库选择" assets={template ? [template] : []} accept="image/png,image/jpeg,image/webp" onPickFromLibrary={() => setPickerOpen(true)} onChange={(files) => replaceTemplate(files[0])} onClear={clearTemplate} />
 
@@ -719,7 +838,7 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板，其他 Logo、文案、背景和尺寸保持不变。' : '智能判断会优先使用模板透明层，再识别商品占位区域，商品图按比例铺满。'}</div>
+              <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板。自动识别不准时用“手动框选商品区”画框指定替换区域。' : '智能判断会优先使用模板透明层，再识别商品占位区域，商品图按比例铺满。'}</div>
           )}
         </section>
       </section>
@@ -735,6 +854,15 @@ function App() {
           onPick={pickFromLibrary}
           onUpload={uploadTemplates}
           onClose={() => setPickerOpen(false)}
+        />
+      )}
+      {slotEditorOpen && template && (
+        <SlotEditorModal
+          imageUrl={template.url}
+          imageName={template.file.name}
+          initial={manualSlot}
+          onConfirm={(next) => { setManualSlot(next); setSlotEditorOpen(false) }}
+          onClose={() => setSlotEditorOpen(false)}
         />
       )}
       {lightbox && (

@@ -1048,6 +1048,24 @@ def _slot_for_contain(
     return (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])), mapped_mask
 
 
+def _manual_slot(
+    template: Image.Image,
+    slot: tuple[float, float, float, float],
+) -> tuple[tuple[int, int, int, int], Image.Image]:
+    """Build a native-space slot from user-drawn normalized canvas ratios."""
+    width, height = template.size
+    ratio_x, ratio_y, ratio_w, ratio_h = slot
+    x0 = max(0, min(width, int(round(ratio_x * width))))
+    y0 = max(0, min(height, int(round(ratio_y * height))))
+    x1 = max(0, min(width, int(round((ratio_x + ratio_w) * width))))
+    y1 = max(0, min(height, int(round((ratio_y + ratio_h) * height))))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        raise ValueError("手动框选区域过小，请重新框选")
+    mask = Image.new("L", template.size, 0)
+    ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+    return (x0, y0, x1, y1), mask
+
+
 def _transparent_product_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Find a large interior transparent hole in a PNG template.
 
@@ -2138,6 +2156,7 @@ def compose(
     preserve_logo_pill: bool = True,
     outline_strength: float = 0.78,
     quality: int = 100,
+    manual_slot: tuple[float, float, float, float] | None = None,
 ) -> Path:
     """Compose one product/template pair and return the output path.
 
@@ -2161,11 +2180,17 @@ def compose(
     # its documented cover behavior because it intentionally fills the whole
     # canvas with the product scene.
     template_page = fit_contain(template, output_size) if mode in {"template_replace", "cutout", "auto"} else fit_cover(template, output_size)
-    # Template replacement deliberately includes the outer photo frame so a
-    # dark rule from the source poster cannot remain above the green panel.
-    # Other modes use the default frame-preserving detector for direct
-    # cutout/auto composition.
-    native_slot = _template_replace_slot(template, include_frame=(mode == "template_replace"))
+    # A user-drawn rectangle overrides automatic detection so awkward templates
+    # can still be cleaned precisely. It is expressed in native template ratios
+    # and mapped through the same contain transform as the page.
+    if mode == "template_replace" and manual_slot is not None:
+        native_slot = _manual_slot(template, manual_slot)
+    else:
+        # Template replacement deliberately includes the outer photo frame so a
+        # dark rule from the source poster cannot remain above the green panel.
+        # Other modes use the default frame-preserving detector for direct
+        # cutout/auto composition.
+        native_slot = _template_replace_slot(template, include_frame=(mode == "template_replace"))
     mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
     if mode == "template_replace":
         # Detect on the native source first, then transform the mask together

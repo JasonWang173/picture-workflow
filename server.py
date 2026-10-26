@@ -64,6 +64,19 @@ def _repair_latin1_utf8(value: str | None) -> str | None:
         return value
 
 
+def _parse_manual_slot(raw: str | None) -> tuple[float, float, float, float] | None:
+    """Parse a normalized ``x,y,w,h`` rectangle drawn on the template preview."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        x, y, w, h = (float(part) for part in raw.split(","))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="框选区域格式不正确") from None
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0.01 < w <= 1 and 0.01 < h <= 1 and x + w <= 1.001 and y + h <= 1.001):
+        raise HTTPException(status_code=400, detail="框选区域超出图片范围")
+    return (x, y, min(w, 1 - x), min(h, 1 - y))
+
+
 def _read_template_records() -> list[dict[str, object]]:
     if not TEMPLATE_INDEX.is_file():
         return []
@@ -336,9 +349,13 @@ async def create_composition(
     outline: Annotated[float, Form()] = 0.78,
     preserve_logo_pill: Annotated[bool, Form()] = True,
     quality: Annotated[int, Form()] = 100,
+    slot: Annotated[str | None, Form()] = None,
 ) -> FileResponse:
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
+    manual_slot = _parse_manual_slot(slot)
+    if manual_slot is not None and mode != "template_replace":
+        raise HTTPException(status_code=400, detail="手动框选区域仅模板替换模式可用")
     temp_dir = Path(tempfile.mkdtemp(prefix="food-compositor-"))
     background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
     try:
@@ -363,6 +380,7 @@ async def create_composition(
             preserve_logo_pill=preserve_logo_pill,
             outline_strength=max(0.0, min(1.0, float(outline))),
             quality=max(1, min(100, int(quality))),
+            manual_slot=manual_slot,
         )
     except HTTPException:
         raise
