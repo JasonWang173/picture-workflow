@@ -28,6 +28,7 @@ DEMO_ASSETS = {
 }
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 MAX_BATCH_UPLOAD_BYTES = 256 * 1024 * 1024
+THUMBNAIL_MAX_EDGE = 360
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
 TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,20 @@ app.add_middleware(
 def _safe_upload_suffix(filename: str | None, default: str) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else default
+
+
+def _repair_latin1_utf8(value: str | None) -> str | None:
+    """Undo latin-1 mojibake for UTF-8 form text and header filenames.
+
+    Some multipart parsers decode text fields as latin-1; re-encode and
+    decode as UTF-8 when that round-trip is lossless, otherwise keep as-is.
+    """
+    if not value:
+        return value
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
 
 
 def _read_template_records() -> list[dict[str, object]]:
@@ -76,6 +91,27 @@ def _template_path(record: dict[str, object]) -> Path:
     if TEMPLATE_ROOT.resolve() not in path.parents:
         raise HTTPException(status_code=404, detail="模板不存在")
     return path
+
+
+def _thumbnail_path(template_id: str) -> Path:
+    return TEMPLATE_ROOT / f"{template_id}_thumb.jpg"
+
+
+def _generate_thumbnail(source: Path, destination: Path) -> bool:
+    """Write a small JPEG preview for the library grid; failures are non-fatal."""
+    try:
+        from PIL import Image
+
+        with Image.open(source) as image:
+            image.thumbnail((THUMBNAIL_MAX_EDGE, THUMBNAIL_MAX_EDGE))
+            if image.mode not in {"RGB", "L"}:
+                image = image.convert("RGB")
+            image.save(destination, "JPEG", quality=80)
+        return True
+    except Exception:
+        LOGGER.warning("模板缩略图生成失败：%s", source.name, exc_info=True)
+        destination.unlink(missing_ok=True)
+        return False
 
 
 async def _write_upload(
@@ -131,7 +167,11 @@ def list_templates() -> dict[str, object]:
         path = _template_path(record)
         if not path.is_file():
             continue
-        records.append({**record, "url": f"/api/templates/{record['id']}/file"})
+        records.append({
+            **record,
+            "url": f"/api/templates/{record['id']}/file",
+            "thumb_url": f"/api/templates/{record['id']}/thumb",
+        })
     return {"templates": records}
 
 
@@ -147,14 +187,19 @@ async def save_template(
     destination = TEMPLATE_ROOT / filename
     try:
         size = await _write_upload(template, destination)
-        clean_name = (name or Path(template.filename or "未命名模板").stem).strip()[:80] or "未命名模板"
+        repaired_name = _repair_latin1_utf8(name)
+        repaired_filename = _repair_latin1_utf8(template.filename)
+        clean_name = (repaired_name or Path(repaired_filename or "未命名模板").stem).strip()[:80] or "未命名模板"
+        thumb_generated = _generate_thumbnail(destination, _thumbnail_path(template_id))
         record: dict[str, object] = {
             "id": template_id,
             "name": clean_name,
             "filename": filename,
             "url": f"/api/templates/{template_id}/file",
+            "thumb_url": f"/api/templates/{template_id}/thumb",
+            "has_thumb": thumb_generated,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "source": (source or "upload").strip()[:40],
+            "source": (_repair_latin1_utf8(source) or "upload").strip()[:40],
             "size": size,
         }
         records = _read_template_records()
@@ -181,6 +226,24 @@ def get_template_file(template_id: str) -> FileResponse:
     return FileResponse(path, media_type=media_type, filename=str(record.get("name", path.name)) + path.suffix)
 
 
+@app.get("/api/templates/{template_id}/thumb")
+def get_template_thumbnail(template_id: str) -> FileResponse:
+    record = _template_record(template_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    path = _template_path(record)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="模板文件不存在")
+    thumb_path = _thumbnail_path(template_id)
+    if not thumb_path.is_file():
+        # Older records predate thumbnails; backfill on first request.
+        _generate_thumbnail(path, thumb_path)
+    if thumb_path.is_file():
+        return FileResponse(thumb_path, media_type="image/jpeg")
+    media_type = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
+    return FileResponse(path, media_type=media_type)
+
+
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: str) -> dict[str, str]:
     records = _read_template_records()
@@ -188,6 +251,7 @@ def delete_template(template_id: str) -> dict[str, str]:
     if record is None:
         raise HTTPException(status_code=404, detail="模板不存在")
     _template_path(record).unlink(missing_ok=True)
+    _thumbnail_path(template_id).unlink(missing_ok=True)
     _write_template_records([item for item in records if item.get("id") != template_id])
     return {"status": "deleted", "id": template_id}
 
