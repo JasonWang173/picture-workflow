@@ -276,6 +276,7 @@ function App() {
   const [preserveLogo, setPreserveLogo] = useState(true)
   const [resultUrl, setResultUrl] = useState<string | null>(null)
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([])
   const [batchDownloadUrl, setBatchDownloadUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -349,6 +350,7 @@ function App() {
   const resetResult = () => {
     setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
     setBatchImages([])
+    setBatchProgress(null)
     setSelectedBatchIds([])
     setBatchDownloadUrl(null)
     setLightbox(null)
@@ -510,11 +512,40 @@ function App() {
         throw new Error(message)
       }
       if (isBatch) {
-        const payload = await response.json() as { images: BatchImage[]; download_url: string }
-        setBatchImages(payload.images)
-        setSelectedBatchIds(payload.images.map((image) => image.id))
-        setBatchDownloadUrl(payload.download_url)
+        const payload = await response.json() as { batch_id: string; total: number; status_url: string }
+        setBatchImages([])
+        setSelectedBatchIds([])
+        setBatchDownloadUrl(null)
         setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
+        setBatchProgress({ done: 0, total: payload.total })
+        let statusFailures = 0
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 1500))
+          const statusResponse = await fetch(payload.status_url)
+          if (!statusResponse.ok) {
+            statusFailures += 1
+            if (statusFailures > 6) throw new Error('批次状态读取失败')
+            continue
+          }
+          statusFailures = 0
+          const status = await statusResponse.json() as {
+            status: string
+            done: number
+            total: number
+            images: BatchImage[]
+            download_url: string
+            error?: string | null
+          }
+          setBatchProgress({ done: status.done, total: status.total })
+          if (status.status !== 'done' && status.status !== 'failed') continue
+          setBatchProgress(null)
+          setBatchImages(status.images || [])
+          setSelectedBatchIds((status.images || []).map((image) => image.id))
+          setBatchDownloadUrl(status.download_url || null)
+          if (status.status === 'failed') throw new Error(status.error || '批量合成失败')
+          if (!(status.images || []).length) throw new Error(status.error || '没有图片合成成功，请检查模板与商品图')
+          break
+        }
       } else {
         const blob = await response.blob()
         setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return URL.createObjectURL(blob) })
@@ -616,7 +647,7 @@ function App() {
 
         <section className={`preview-panel ${resultUrl || hasBatch ? 'has-result' : ''}`} aria-live="polite">
           <div className="preview-topline">
-            <div><span className="section-label">03 / 预览</span><h2>{resultUrl ? '合成完成' : hasBatch ? '批量合成完成' : '结果会出现在这里'}</h2></div>
+            <div><span className="section-label">03 / 预览</span><h2>{resultUrl ? '合成完成' : batchProgress ? '批量合成中' : hasBatch ? '批量合成完成' : '结果会出现在这里'}</h2></div>
             {(resultUrl || hasBatch) && <span className="result-badge"><Icon name="check" size={13} /> READY</span>}
           </div>
           <div className="preview-stage">
@@ -625,6 +656,13 @@ function App() {
                 <img className="result-image" src={resultUrl} alt="合成后的海报" />
                 <span className="preview-zoom-hint"><Icon name="zoom" size={14} /> 点击放大</span>
               </button>
+            ) : batchProgress ? (
+              <div className="batch-progress">
+                <span className="batch-progress-icon"><Icon name="refresh" size={26} /></span>
+                <strong>正在后台合成 {batchProgress.done} / {batchProgress.total} 张</strong>
+                <div className="batch-progress-bar"><i style={{ width: `${batchProgress.total ? Math.round((batchProgress.done / batchProgress.total) * 100) : 0}%` }} /></div>
+                <span>数量不再受限 · 服务器后台处理中，保持页面打开即可</span>
+              </div>
             ) : hasBatch ? (
               <div className="batch-preview">
                 <div className="batch-toolbar">

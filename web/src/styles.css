@@ -163,6 +163,12 @@ select option { background: #1c1f1c; }
 .batch-result > span { margin-top: 9px; color: #777d74; font-size: 11px; line-height: 1.7; }
 .batch-download { margin-top: 22px; }
 .batch-preview { width: 100%; align-self: stretch; padding: 16px; }
+.batch-progress { display: flex; flex-direction: column; align-items: center; gap: 15px; color: #6d736b; text-align: center; }
+.batch-progress-icon { display: grid; place-items: center; width: 66px; height: 66px; color: #f38a60; border: 1px solid #74412f; background: #261d19; animation: spin 2.4s linear infinite; }
+.batch-progress strong { color: #e9e5dc; font-size: 15px; letter-spacing: -.02em; }
+.batch-progress-bar { width: min(430px, 82%); height: 6px; overflow: hidden; background: #232723; }
+.batch-progress-bar i { display: block; height: 100%; background: var(--orange); transition: width .45s ease; }
+.batch-progress > span:last-child { color: #646a62; font-size: 11px; }
 .batch-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 0 0 14px; border-bottom: 1px solid #292d29; }
 .batch-summary { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 .batch-summary strong { color: #e9e5dc; font-size: 13px; letter-spacing: -.02em; }

@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+import time
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,8 @@ DEMO_ASSETS = {
     "product": ROOT / "商品1.png",
 }
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-MAX_BATCH_UPLOAD_BYTES = 256 * 1024 * 1024
+# Disk guard for one batch upload only; there is no per-batch image count limit.
+MAX_BATCH_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
 THUMBNAIL_MAX_EDGE = 360
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
 TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -126,7 +128,7 @@ async def _write_upload(
     if total_limit is not None:
         max_allowed = min(max_allowed, total_limit - current_total)
     if max_allowed <= 0:
-        raise HTTPException(status_code=413, detail="批量上传总大小不能超过 256 MB")
+        raise HTTPException(status_code=413, detail="批量上传总大小不能超过 8 GB")
 
     written = 0
     try:
@@ -140,7 +142,7 @@ async def _write_upload(
                     batch_exceeded = total_limit is not None and current_total + written > total_limit
                     raise HTTPException(
                         status_code=413,
-                        detail=("批量上传总大小不能超过 256 MB" if batch_exceeded else "单个图片不能超过 24 MB"),
+                        detail=("批量上传总大小不能超过 8 GB" if batch_exceeded else "单个图片不能超过 24 MB"),
                     )
                 handle.write(chunk)
     except HTTPException:
@@ -153,6 +155,60 @@ async def _write_upload(
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"文件为空：{upload.filename or '未命名文件'}")
     return written
+
+
+def _batch_status_path(batch_dir: Path) -> Path:
+    return batch_dir / "status.json"
+
+
+def _read_batch_status(batch_dir: Path) -> dict[str, object] | None:
+    path = _batch_status_path(batch_dir)
+    if not path.is_file():
+        return None
+    for attempt in range(6):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except (OSError, json.JSONDecodeError):
+            # Windows can refuse opens while another thread replaces the file.
+            if attempt == 5:
+                LOGGER.warning("批次状态读取失败：%s", path, exc_info=True)
+                return None
+            time.sleep(0.05)
+    return None
+
+
+def _write_batch_status(batch_dir: Path, status: dict[str, object]) -> None:
+    path = _batch_status_path(batch_dir)
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    temporary.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+    for attempt in range(10):
+        try:
+            temporary.replace(path)
+            return
+        except OSError:
+            if attempt == 9:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05)
+
+
+def _fail_interrupted_batches() -> None:
+    """Mark batches that were still running when the service last stopped."""
+    if not BATCH_ROOT.is_dir():
+        return
+    for status_path in BATCH_ROOT.glob("*/status.json"):
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("status") in {"queued", "processing"}:
+            payload["status"] = "failed"
+            payload["error"] = "服务重启导致该批次中断，请重新上传合成"
+            _write_batch_status(status_path.parent, payload)
+
+
+_fail_interrupted_batches()
 
 
 @app.get("/api/health")
@@ -326,6 +382,7 @@ async def create_composition(
 
 @app.post("/api/compose-batch")
 async def create_batch_composition(
+    background_tasks: BackgroundTasks,
     products: Annotated[list[UploadFile], File(description="商品图片文件夹或多选图片")],
     template: Annotated[UploadFile, File(description="商家模板图")],
     mode: Annotated[str, Form()] = "auto",
@@ -334,7 +391,7 @@ async def create_batch_composition(
     preserve_logo_pill: Annotated[bool, Form()] = True,
     quality: Annotated[int, Form()] = 100,
 ) -> JSONResponse:
-    """Compose a folder and keep each output available for preview and selection."""
+    """Accept a batch upload and compose it in the background; poll /status for progress."""
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
     if mode == "template_replace":
@@ -342,8 +399,6 @@ async def create_batch_composition(
     image_products = [upload for upload in products if upload.filename and Path(upload.filename).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
     if not image_products:
         raise HTTPException(status_code=400, detail="商品文件夹里没有可处理的图片")
-    if len(image_products) > 100:
-        raise HTTPException(status_code=400, detail="一次最多处理 100 张商品图")
 
     batch_id = uuid.uuid4().hex[:12]
     batch_dir = BATCH_ROOT / batch_id
@@ -351,6 +406,7 @@ async def create_batch_composition(
     output_dir = batch_dir / "outputs"
     work_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_items: list[dict[str, object]] = []
     try:
         template_path = work_dir / f"template{_safe_upload_suffix(template.filename, '.jpg')}"
         total_upload_bytes = await _write_upload(
@@ -358,7 +414,6 @@ async def create_batch_composition(
             template_path,
             total_limit=MAX_BATCH_UPLOAD_BYTES,
         )
-        output_paths: list[Path] = []
         for index, upload in enumerate(image_products, start=1):
             product_path = work_dir / f"product-{index:03d}{_safe_upload_suffix(upload.filename, '.png')}"
             total_upload_bytes += await _write_upload(
@@ -369,42 +424,110 @@ async def create_batch_composition(
             )
             stem = Path(upload.filename or f"product-{index:03d}").stem
             safe_stem = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in stem).strip("_") or f"product-{index:03d}"
-            output_path = output_dir / f"{index:03d}_{safe_stem}.jpg"
-            compose(
-                product_path,
-                template_path,
-                output_path,
-                mode=mode,  # type: ignore[arg-type]
-                size=size.strip() or "1080x1920",
-                preserve_logo_pill=preserve_logo_pill,
-                outline_strength=max(0.0, min(1.0, float(outline))),
-                quality=max(1, min(100, int(quality))),
-            )
-            output_paths.append(output_path)
-        shutil.rmtree(work_dir, ignore_errors=True)
+            manifest_items.append({"index": index, "work": product_path.name, "stem": safe_stem})
+        (work_dir / "manifest.json").write_text(
+            json.dumps({"template": template_path.name, "items": manifest_items}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _write_batch_status(batch_dir, {
+            "status": "queued",
+            "total": len(manifest_items),
+            "done": 0,
+            "skipped": [],
+            "error": None,
+            "images": [],
+            "download_url": f"/api/batches/{batch_id}/download",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
     except HTTPException:
         shutil.rmtree(batch_dir, ignore_errors=True)
         raise
-    except ValueError as exc:
-        shutil.rmtree(batch_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
         shutil.rmtree(batch_dir, ignore_errors=True)
-        LOGGER.exception("批量合成失败")
-        raise HTTPException(status_code=500, detail="批量合成失败，请稍后重试") from None
+        LOGGER.exception("批量上传失败")
+        raise HTTPException(status_code=500, detail="批量上传失败，请稍后重试") from None
+    background_tasks.add_task(
+        _run_batch_composition,
+        batch_id,
+        mode,
+        size.strip() or "1080x1920",
+        max(0.0, min(1.0, float(outline))),
+        preserve_logo_pill,
+        max(1, min(100, int(quality))),
+    )
     return JSONResponse({
         "batch_id": batch_id,
-        "count": len(output_paths),
-        "images": [
-            {
-                "id": output_path.stem.split("_", 1)[0],
+        "total": len(manifest_items),
+        "status_url": f"/api/batches/{batch_id}/status",
+    })
+
+
+def _run_batch_composition(
+    batch_id: str,
+    mode: str,
+    size: str,
+    outline_strength: float,
+    preserve_logo_pill: bool,
+    quality: int,
+) -> None:
+    batch_dir = BATCH_ROOT / batch_id
+    work_dir = batch_dir / "work"
+    output_dir = batch_dir / "outputs"
+    status = _read_batch_status(batch_dir) or {
+        "status": "queued",
+        "total": 0,
+        "done": 0,
+        "skipped": [],
+        "error": None,
+        "images": [],
+        "download_url": f"/api/batches/{batch_id}/download",
+    }
+    status["status"] = "processing"
+    _write_batch_status(batch_dir, status)
+    try:
+        manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+        template_path = work_dir / str(manifest["template"])
+        items = manifest["items"]
+        status["total"] = len(items)
+        for entry in items:
+            index = int(entry["index"])
+            output_path = output_dir / f"{index:03d}_{entry['stem']}.jpg"
+            try:
+                compose(
+                    work_dir / str(entry["work"]),
+                    template_path,
+                    output_path,
+                    mode=mode,  # type: ignore[arg-type]
+                    size=size,
+                    preserve_logo_pill=preserve_logo_pill,
+                    outline_strength=outline_strength,
+                    quality=quality,
+                )
+            except Exception as exc:
+                # One unusable image must not abort a large batch.
+                LOGGER.warning("批次 %s 第 %s 张合成失败，已跳过：%s", batch_id, index, exc)
+                status["skipped"].append({"index": index, "error": str(exc)})  # type: ignore[union-attr]
+                _write_batch_status(batch_dir, status)
+                continue
+            status["done"] = int(status.get("done", 0)) + 1
+            status["images"].append({  # type: ignore[union-attr]
+                "id": f"{index:03d}",
                 "name": output_path.name,
                 "url": f"/api/batches/{batch_id}/{output_path.name}",
-            }
-            for output_path in output_paths
-        ],
-        "download_url": f"/api/batches/{batch_id}/download",
-    })
+            })
+            _write_batch_status(batch_dir, status)
+        if not status["images"]:
+            status["status"] = "failed"
+            status["error"] = status.get("error") or "没有图片合成成功，请检查模板与商品图"
+        else:
+            status["status"] = "done"
+    except Exception as exc:
+        LOGGER.exception("批量合成失败")
+        status["status"] = "failed"
+        status["error"] = str(exc) or "批量合成失败"
+    finally:
+        _write_batch_status(batch_dir, status)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _batch_directory(batch_id: str) -> Path:
@@ -414,6 +537,15 @@ def _batch_directory(batch_id: str) -> Path:
     if BATCH_ROOT.resolve() not in directory.parents or not directory.is_dir():
         raise HTTPException(status_code=404, detail="批次不存在")
     return directory
+
+
+@app.get("/api/batches/{batch_id}/status")
+def get_batch_status(batch_id: str) -> JSONResponse:
+    batch_dir = _batch_directory(batch_id)
+    status = _read_batch_status(batch_dir)
+    if status is None:
+        raise HTTPException(status_code=404, detail="批次状态不存在")
+    return JSONResponse(status)
 
 
 @app.get("/api/batches/{batch_id}/download")
