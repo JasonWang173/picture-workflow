@@ -269,6 +269,21 @@ function TemplatePickerModal({
   )
 }
 
+type SlotDragMode = 'new' | 'move' | 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+
+const SLOT_HANDLES: { id: SlotDragMode; left: string; top: string; cursor: string }[] = [
+  { id: 'nw', left: '0%', top: '0%', cursor: 'nwse-resize' },
+  { id: 'n', left: '50%', top: '0%', cursor: 'ns-resize' },
+  { id: 'ne', left: '100%', top: '0%', cursor: 'nesw-resize' },
+  { id: 'e', left: '100%', top: '50%', cursor: 'ew-resize' },
+  { id: 'se', left: '100%', top: '100%', cursor: 'nwse-resize' },
+  { id: 's', left: '50%', top: '100%', cursor: 'ns-resize' },
+  { id: 'sw', left: '0%', top: '100%', cursor: 'nesw-resize' },
+  { id: 'w', left: '0%', top: '50%', cursor: 'ew-resize' },
+]
+
+const clamp01 = (value: number) => Math.min(1, Math.max(0, value))
+
 function SlotEditorModal({
   imageUrl,
   imageName,
@@ -283,45 +298,86 @@ function SlotEditorModal({
   onClose: () => void
 }) {
   const [rect, setRect] = useState<SlotRect | null>(initial)
-  const [dragging, setDragging] = useState(false)
   const stageRef = useRef<HTMLDivElement>(null)
-  const startRef = useRef<{ x: number; y: number } | null>(null)
+  const dragRef = useRef<{ mode: SlotDragMode; start: { x: number; y: number }; origin: SlotRect } | null>(null)
 
   const toNorm = (event: React.PointerEvent) => {
     const box = stageRef.current?.getBoundingClientRect()
     if (!box || box.width === 0 || box.height === 0) return null
     return {
-      x: Math.min(1, Math.max(0, (event.clientX - box.left) / box.width)),
-      y: Math.min(1, Math.max(0, (event.clientY - box.top) / box.height)),
+      x: clamp01((event.clientX - box.left) / box.width),
+      y: clamp01((event.clientY - box.top) / box.height),
     }
   }
-  const handleDown = (event: React.PointerEvent) => {
+  const beginDrag = (mode: SlotDragMode, event: React.PointerEvent) => {
     const point = toNorm(event)
     if (!point) return
     event.preventDefault()
     stageRef.current?.setPointerCapture(event.pointerId)
-    startRef.current = point
-    setDragging(true)
-    setRect({ x: point.x, y: point.y, w: 0, h: 0 })
+    dragRef.current = { mode, start: point, origin: rect ?? { x: point.x, y: point.y, w: 0, h: 0 } }
+    if (mode === 'new') setRect({ x: point.x, y: point.y, w: 0, h: 0 })
   }
-  const handleMove = (event: React.PointerEvent) => {
-    if (!dragging || !startRef.current) return
+  const handleDown = (event: React.PointerEvent) => {
     const point = toNorm(event)
     if (!point) return
-    const start = startRef.current
-    setRect({
-      x: Math.min(start.x, point.x),
-      y: Math.min(start.y, point.y),
-      w: Math.abs(point.x - start.x),
-      h: Math.abs(point.y - start.y),
-    })
+    const inside = rect !== null && point.x >= rect.x && point.x <= rect.x + rect.w && point.y >= rect.y && point.y <= rect.y + rect.h
+    beginDrag(inside ? 'move' : 'new', event)
+  }
+  const handleMove = (event: React.PointerEvent) => {
+    const drag = dragRef.current
+    if (!drag) return
+    const point = toNorm(event)
+    if (!point) return
+    const { mode, start, origin } = drag
+    if (mode === 'new') {
+      setRect({ x: Math.min(start.x, point.x), y: Math.min(start.y, point.y), w: Math.abs(point.x - start.x), h: Math.abs(point.y - start.y) })
+      return
+    }
+    if (mode === 'move') {
+      const w = Math.min(origin.w, 1)
+      const h = Math.min(origin.h, 1)
+      setRect({ x: clamp01(Math.min(origin.x + point.x - start.x, 1 - w)), y: clamp01(Math.min(origin.y + point.y - start.y, 1 - h)), w, h })
+      return
+    }
+    let x0 = origin.x
+    let y0 = origin.y
+    let x1 = origin.x + origin.w
+    let y1 = origin.y + origin.h
+    if (mode.includes('w')) x0 = point.x
+    if (mode.includes('e')) x1 = point.x
+    if (mode.includes('n')) y0 = point.y
+    if (mode.includes('s')) y1 = point.y
+    if (x1 - x0 < 0.02) { if (mode.includes('w')) x0 = x1 - 0.02; else x1 = x0 + 0.02 }
+    if (y1 - y0 < 0.02) { if (mode.includes('n')) y0 = y1 - 0.02; else y1 = y0 + 0.02 }
+    x0 = clamp01(x0); x1 = clamp01(x1); y0 = clamp01(y0); y1 = clamp01(y1)
+    if (x1 - x0 < 0.02) x1 = Math.min(1, x0 + 0.02)
+    if (y1 - y0 < 0.02) y1 = Math.min(1, y0 + 0.02)
+    setRect({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
   }
   const handleUp = () => {
-    if (!dragging) return
-    setDragging(false)
-    startRef.current = null
-    setRect((current) => (current && (current.w < 0.02 || current.h < 0.02) ? null : current))
+    const drag = dragRef.current
+    dragRef.current = null
+    if (drag?.mode === 'new') setRect((current) => (current && (current.w < 0.02 || current.h < 0.02) ? null : current))
   }
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+      event.preventDefault()
+      const step = event.shiftKey ? 0.002 : 0.01
+      setRect((current) => {
+        if (!current) return current
+        const { w, h } = current
+        let { x, y } = current
+        if (event.key === 'ArrowLeft') x = clamp01(Math.min(x - step, 1 - w))
+        if (event.key === 'ArrowRight') x = clamp01(Math.min(x + step, 1 - w))
+        if (event.key === 'ArrowUp') y = clamp01(Math.min(y - step, 1 - h))
+        if (event.key === 'ArrowDown') y = clamp01(Math.min(y + step, 1 - h))
+        return { x, y, w, h }
+      })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   const usable = rect !== null && rect.w >= 0.02 && rect.h >= 0.02
   return (
     <div className="lightbox slot-editor" role="dialog" aria-modal="true" aria-label="手动框选商品区域" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
@@ -329,7 +385,7 @@ function SlotEditorModal({
         <div className="lightbox-bar">
           <div>
             <span className="section-label">MANUAL SLOT</span>
-            <strong>在模板上拖拽框选商品图片区 · {imageName}</strong>
+            <strong>框选商品图片区 · {imageName}</strong>
           </div>
           <button className="lightbox-close" type="button" onClick={onClose} aria-label="关闭框选">
             <Icon name="close" size={19} />
@@ -349,12 +405,24 @@ function SlotEditorModal({
               <span
                 className="slot-rect"
                 style={{ left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.w * 100}%`, height: `${rect.h * 100}%` }}
-              />
+                onPointerDown={(event) => { event.stopPropagation(); beginDrag('move', event) }}
+              >
+                {SLOT_HANDLES.map((handle) => (
+                  <span
+                    key={handle.id}
+                    className="slot-handle"
+                    style={{ left: handle.left, top: handle.top, cursor: handle.cursor }}
+                    onPointerDown={(event) => { event.stopPropagation(); beginDrag(handle.id, event) }}
+                  />
+                ))}
+              </span>
             )}
           </div>
         </div>
         <div className="slot-editor-actions">
-          <span>{usable && rect ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 模板替换将只处理该区域` : '按住拖拽画出矩形框；框太小会自动放弃'}</span>
+          <span>{usable && rect
+            ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 框内拖动移动 · 拖手柄缩放 · 方向键微调（Shift 更细）`
+            : '在空白处拖拽画框；画好后可拖动框内移动、拖角点/边手柄缩放'}</span>
           <div className="picker-actions">
             <button className="library-upload" type="button" onClick={onClose}>取消</button>
             <button className="library-upload slot-confirm" type="button" disabled={!usable} onClick={() => rect && onConfirm(rect)}>使用此区域</button>
