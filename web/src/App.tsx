@@ -421,7 +421,7 @@ function SlotEditorModal({
         </div>
         <div className="slot-editor-actions">
           <span>{usable && rect
-            ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 框内拖动移动 · 拖手柄缩放 · 方向键微调 · 后台将在框内精修边界`
+            ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 框内拖动移动 · 拖手柄缩放 · 方向键微调 · 后台将自动补全到框所在的完整商品区`
             : '在空白处拖拽画框；画好后可拖动框内移动、拖角点/边手柄缩放'}</span>
           <div className="picker-actions">
             <button className="library-upload" type="button" onClick={onClose}>取消</button>
@@ -793,7 +793,7 @@ function App() {
                   <button className="slot-clear" type="button" onClick={() => setManualSlot(null)}>清除，恢复自动识别</button>
                 </>
               ) : (
-                <span className="slot-hint-inline">自动识别不准时，可拖拽画框指定大致区域，后台会在框内精修真边界</span>
+                <span className="slot-hint-inline">自动识别不准时，可拖拽画个大致范围，后台自动补全到完整商品区并精修边界</span>
               )}
             </div>
           )}
@@ -906,7 +906,7 @@ function App() {
               </div>
             </div>
           ) : (
-              <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板。自动识别不准时用“手动框选商品区”画个大致范围，后台会在框内精修真边界。' : '智能判断会优先使用模板透明层，再识别商品占位区域，商品图按比例铺满。'}</div>
+              <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板。自动识别不准时用“手动框选商品区”画个大致范围，后台会自动补全到完整商品区并精修边界。' : '智能判断会优先使用模板透明层，再识别商品占位区域，商品图按比例铺满。'}</div>
           )}
         </section>
       </section>
