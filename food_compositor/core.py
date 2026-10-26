@@ -1066,6 +1066,42 @@ def _manual_slot(
     return (x0, y0, x1, y1), mask
 
 
+def _refine_manual_slot(
+    template: Image.Image,
+    slot: tuple[float, float, float, float],
+) -> tuple[tuple[int, int, int, int], Image.Image]:
+    """Treat the drawn rectangle as a coarse ROI and snap to the real panel.
+
+    Detection runs on a slightly expanded crop of the drawn area so imprecise
+    framing still lands on true product boundaries (rounded corners included).
+    Results that disagree with the drawing fall back to the exact rectangle.
+    """
+    width, height = template.size
+    (x0, y0, x1, y1), _ = _manual_slot(template, slot)
+    margin_x = max(6, int(round(width * 0.02)))
+    margin_y = max(6, int(round(height * 0.02)))
+    cx0 = max(0, x0 - margin_x)
+    cy0 = max(0, y0 - margin_y)
+    cx1 = min(width, x1 + margin_x)
+    cy1 = min(height, y1 + margin_y)
+    drawn_area = max(1, (x1 - x0) * (y1 - y0))
+    try:
+        detected = _template_replace_slot(template.crop((cx0, cy0, cx1, cy1)), include_frame=True)
+    except Exception:
+        LOGGER.warning("框选区域内精修识别失败，使用原始框", exc_info=True)
+        detected = None
+    if detected is not None:
+        (dx0, dy0, dx1, dy1), crop_mask = detected
+        fx0, fy0, fx1, fy1 = cx0 + dx0, cy0 + dy0, cx0 + dx1, cy0 + dy1
+        overlap = max(0, min(fx1, x1) - max(fx0, x0)) * max(0, min(fy1, y1) - max(fy0, y0))
+        refined_area = max(1, (fx1 - fx0) * (fy1 - fy0))
+        if overlap / drawn_area >= 0.5 and 0.25 * drawn_area <= refined_area <= 1.35 * drawn_area:
+            mask = Image.new("L", template.size, 0)
+            mask.paste(crop_mask.convert("L"), (cx0, cy0))
+            return (fx0, fy0, fx1, fy1), mask
+    return _manual_slot(template, slot)
+
+
 def _transparent_product_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Find a large interior transparent hole in a PNG template.
 
@@ -2182,9 +2218,10 @@ def compose(
     template_page = fit_contain(template, output_size) if mode in {"template_replace", "cutout", "auto"} else fit_cover(template, output_size)
     # A user-drawn rectangle overrides automatic detection so awkward templates
     # can still be cleaned precisely. It is expressed in native template ratios
-    # and mapped through the same contain transform as the page.
+    # and mapped through the same contain transform as the page; detection is
+    # re-run inside the drawn area so imprecise framing snaps to true edges.
     if mode == "template_replace" and manual_slot is not None:
-        native_slot = _manual_slot(template, manual_slot)
+        native_slot = _refine_manual_slot(template, manual_slot)
     else:
         # Template replacement deliberately includes the outer photo frame so a
         # dark rule from the source poster cannot remain above the green panel.
