@@ -116,6 +116,12 @@ function AssetDrop({
                   <Icon name="library" size={11} /> 换模板 · 从模板库选择
                 </button>
               )}
+              {allowFolder && (
+                <span className="asset-meta-add">
+                  <button type="button" onClick={(event) => { event.stopPropagation(); choose() }}>继续加图片</button>
+                  <button type="button" onClick={(event) => { event.stopPropagation(); chooseFolder() }}>继续加文件夹</button>
+                </span>
+              )}
             </div>
             <button className="icon-button asset-remove" type="button" onClick={(event) => { event.stopPropagation(); onClear() }} aria-label={`移除${title}`}>
               <Icon name="close" size={15} />
@@ -126,7 +132,7 @@ function AssetDrop({
             <span className="upload-mark"><Icon name="upload" size={20} /></span>
             <div>
               <strong>{allowFolder ? '拖入图片，或选择图片 / 文件夹' : '拖入图片，或点击选择'}</strong>
-              <span>{allowFolder ? '支持多选或整文件夹 · 合成后下载 ZIP' : 'PNG / JPG / WEBP · 最大 24 MB'}</span>
+              <span>{allowFolder ? '可多次累加选择图片 / 文件夹 · 合成后下载 ZIP' : 'PNG / JPG / WEBP · 最大 24 MB'}</span>
               {(allowFolder || onPickFromLibrary) && <div className="drop-actions">
                 {allowFolder && <>
                   <button type="button" className="drop-choice" onClick={(event) => { event.stopPropagation(); choose() }}>选择图片</button>
@@ -531,6 +537,14 @@ function App() {
     setError('')
     resetResult()
   }
+  const appendProducts = (files: File[]) => {
+    setError('')
+    const seen = new Set(products.map((asset) => `${asset.file.name}:${asset.file.size}`))
+    const fresh = files.filter((file) => !seen.has(`${file.name}:${file.size}`))
+    if (!fresh.length) return
+    setProducts([...products, ...fresh.map(makeAsset)])
+    resetResult()
+  }
   const replaceTemplate = (file: File) => {
     releaseAsset(template)
     setTemplate(makeAsset(file))
@@ -780,7 +794,7 @@ function App() {
           {mode === 'template_replace' ? (
             <div className="template-only-note"><span className="template-only-icon">✦</span><div><strong>无需上传商品图</strong><small>只清除模板中的商品图片区，保留其他设计</small></div></div>
           ) : (
-            <AssetDrop number="01" title="商品图" hint="支持多选图片或整个文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={replaceProducts} onClear={clearProducts} />
+            <AssetDrop number="01" title="商品图" hint="可多次选择累加 · 支持多选与文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
           )}
           {mode === 'template_replace' && template && (
             <div className="slot-row">

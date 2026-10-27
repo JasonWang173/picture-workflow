@@ -109,6 +109,9 @@ h1 em { color: #f5b597; font-style: normal; }
 .asset-name { overflow: hidden; display: block; margin-top: 4px; color: #e9e7de; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .asset-meta-pick { display: inline-flex; align-items: center; gap: 4px; margin-top: 7px; padding: 3px 7px; color: #d9d2c5; border: 1px solid rgba(214,217,207,.38); background: rgba(10,12,10,.6); font-family: 'DM Mono', monospace; font-size: 8px; letter-spacing: .04em; }
 .asset-meta-pick:hover { color: #f6b494; border-color: #b15c3d; }
+.asset-meta-add { display: flex; gap: 5px; margin-top: 7px; }
+.asset-meta-add button { padding: 3px 7px; color: #d9d2c5; border: 1px solid rgba(214,217,207,.38); background: rgba(10,12,10,.6); font-family: 'DM Mono', monospace; font-size: 8px; letter-spacing: .04em; }
+.asset-meta-add button:hover { color: #f6b494; border-color: #b15c3d; }
 .icon-button { display: grid; place-items: center; border: 0; background: transparent; }
 .asset-remove { position: absolute; z-index: 2; top: 9px; right: 9px; width: 25px; height: 25px; color: #e7e4da; background: rgba(10,12,10,.72); }
 .asset-remove:hover { color: #ffb096; }
