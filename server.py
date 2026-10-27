@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -9,11 +11,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 import time
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from food_compositor import compose
@@ -21,8 +24,12 @@ from food_compositor import compose
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
 BATCH_ROOT = ROOT / "runtime" / "batches"
-TEMPLATE_ROOT = ROOT / "runtime" / "templates"
-TEMPLATE_INDEX = TEMPLATE_ROOT / "index.json"
+# The template library lives in OSS so every user shares one library. Each
+# template is a set of self-describing objects (image, thumb, meta json), so
+# concurrent uploads never fight over a shared mutable index.
+OSS_PREFIX = os.environ.get("OSS_TEMPLATE_PREFIX", "picture-workflow/templates/")
+_OSS_BUCKET = None
+_TEMPLATE_ID_RE = re.compile(r"[0-9a-f]{16}")
 DEMO_ASSETS = {
     "template": ROOT / "1.jpg",
     "product": ROOT / "商品1.png",
@@ -32,7 +39,6 @@ MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 MAX_BATCH_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
 THUMBNAIL_MAX_EDGE = 360
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
-TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
 LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="商品海报合成工作台", version="0.1.0")
@@ -77,39 +83,51 @@ def _parse_manual_slot(raw: str | None) -> tuple[float, float, float, float] | N
     return (x, y, min(w, 1 - x), min(h, 1 - y))
 
 
-def _read_template_records() -> list[dict[str, object]]:
-    if not TEMPLATE_INDEX.is_file():
-        return []
+def _oss_bucket():
+    """Lazily build the OSS bucket client from the service environment."""
+    global _OSS_BUCKET
+    if _OSS_BUCKET is not None:
+        return _OSS_BUCKET
+    missing = [
+        key
+        for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "OSS_ENDPOINT", "OSS_BUCKET")
+        if not os.environ.get(key)
+    ]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"模板库 OSS 未配置，缺少环境变量：{', '.join(missing)}")
     try:
-        payload = json.loads(TEMPLATE_INDEX.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        LOGGER.warning("模板库索引读取失败，将使用空列表", exc_info=True)
-        return []
-    if not isinstance(payload, list):
-        return []
-    return [record for record in payload if isinstance(record, dict) and isinstance(record.get("id"), str)]
+        import oss2
+    except ImportError:
+        raise HTTPException(status_code=503, detail="服务器缺少 oss2 依赖") from None
+    auth = oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
+    _OSS_BUCKET = oss2.Bucket(
+        auth,
+        os.environ["OSS_ENDPOINT"],
+        os.environ["OSS_BUCKET"],
+        connect_timeout=15,
+    )
+    return _OSS_BUCKET
 
 
-def _write_template_records(records: list[dict[str, object]]) -> None:
-    temporary = TEMPLATE_INDEX.with_suffix(".tmp")
-    temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(TEMPLATE_INDEX)
+def _validated_template_id(template_id: str) -> str:
+    if not _TEMPLATE_ID_RE.fullmatch(template_id or ""):
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return template_id
 
 
 def _template_record(template_id: str) -> dict[str, object] | None:
-    return next((record for record in _read_template_records() if record.get("id") == template_id), None)
+    import oss2
 
-
-def _template_path(record: dict[str, object]) -> Path:
-    filename = Path(str(record.get("filename", ""))).name
-    path = (TEMPLATE_ROOT / filename).resolve()
-    if TEMPLATE_ROOT.resolve() not in path.parents:
-        raise HTTPException(status_code=404, detail="模板不存在")
-    return path
-
-
-def _thumbnail_path(template_id: str) -> Path:
-    return TEMPLATE_ROOT / f"{template_id}_thumb.jpg"
+    template_id = _validated_template_id(template_id)
+    bucket = _oss_bucket()
+    try:
+        payload = json.loads(bucket.get_object(f"{OSS_PREFIX}{template_id}.json").read())
+    except oss2.exceptions.NoSuchKey:
+        return None
+    except oss2.exceptions.OssError as exc:
+        LOGGER.warning("模板元数据读取失败：%s", template_id, exc_info=True)
+        raise HTTPException(status_code=503, detail="模板库暂时不可用，请稍后重试") from exc
+    return payload if isinstance(payload, dict) else None
 
 
 def _generate_thumbnail(source: Path, destination: Path) -> bool:
@@ -231,97 +249,155 @@ def health() -> dict[str, str]:
 
 @app.get("/api/templates")
 def list_templates() -> dict[str, object]:
-    records = []
-    for record in sorted(_read_template_records(), key=lambda item: str(item.get("created_at", "")), reverse=True):
-        path = _template_path(record)
-        if not path.is_file():
-            continue
-        records.append({
-            **record,
-            "url": f"/api/templates/{record['id']}/file",
-            "thumb_url": f"/api/templates/{record['id']}/thumb",
-        })
+    import oss2
+
+    bucket = _oss_bucket()
+    records: list[dict[str, object]] = []
+    try:
+        for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_PREFIX):
+            if not obj.key.endswith(".json"):
+                continue
+            try:
+                meta = json.loads(bucket.get_object(obj.key).read())
+            except (OSError, json.JSONDecodeError, oss2.exceptions.OssError):
+                LOGGER.warning("模板元数据解析失败：%s", obj.key, exc_info=True)
+                continue
+            if isinstance(meta, dict) and isinstance(meta.get("id"), str):
+                records.append({
+                    **meta,
+                    "url": f"/api/templates/{meta['id']}/file",
+                    "thumb_url": f"/api/templates/{meta['id']}/thumb",
+                })
+    except oss2.exceptions.OssError as exc:
+        LOGGER.exception("模板库列表读取失败")
+        raise HTTPException(status_code=503, detail="模板库暂时不可用，请稍后重试") from exc
+    records.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
     return {"templates": records}
 
 
 @app.post("/api/templates")
 async def save_template(
+    background_tasks: BackgroundTasks,
     template: Annotated[UploadFile, File(description="模板图片")],
     name: Annotated[str | None, Form()] = None,
     source: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
     suffix = _safe_upload_suffix(template.filename, ".jpg")
     template_id = uuid.uuid4().hex[:16]
-    filename = f"{template_id}{suffix}"
-    destination = TEMPLATE_ROOT / filename
+    temp_dir = Path(tempfile.mkdtemp(prefix="template-upload-"))
+    background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
+    destination = temp_dir / f"{template_id}{suffix}"
+    thumb_path = temp_dir / f"{template_id}_thumb.jpg"
     try:
         size = await _write_upload(template, destination)
         repaired_name = _repair_latin1_utf8(name)
         repaired_filename = _repair_latin1_utf8(template.filename)
         clean_name = (repaired_name or Path(repaired_filename or "未命名模板").stem).strip()[:80] or "未命名模板"
-        thumb_generated = _generate_thumbnail(destination, _thumbnail_path(template_id))
+        has_thumb = _generate_thumbnail(destination, thumb_path)
+        object_key = f"{OSS_PREFIX}{template_id}{suffix}"
+        thumb_key = f"{OSS_PREFIX}{template_id}_thumb.jpg"
         record: dict[str, object] = {
             "id": template_id,
             "name": clean_name,
-            "filename": filename,
+            "filename": f"{template_id}{suffix}",
+            "object_key": object_key,
+            "thumb_key": thumb_key,
             "url": f"/api/templates/{template_id}/file",
             "thumb_url": f"/api/templates/{template_id}/thumb",
-            "has_thumb": thumb_generated,
+            "has_thumb": has_thumb,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": (_repair_latin1_utf8(source) or "upload").strip()[:40],
             "size": size,
         }
-        records = _read_template_records()
-        records.append(record)
-        _write_template_records(records)
+        bucket = _oss_bucket()
+        bucket.put_object_from_file(object_key, str(destination))
+        if has_thumb:
+            bucket.put_object_from_file(thumb_key, str(thumb_path))
+        # Meta last: a template becomes visible only once its record exists.
+        bucket.put_object(f"{OSS_PREFIX}{template_id}.json", json.dumps(record, ensure_ascii=False))
         return record
     except HTTPException:
         raise
     except Exception:
-        destination.unlink(missing_ok=True)
         LOGGER.exception("模板保存失败")
         raise HTTPException(status_code=500, detail="模板保存失败，请稍后重试") from None
 
 
 @app.get("/api/templates/{template_id}/file")
-def get_template_file(template_id: str) -> FileResponse:
+def get_template_file(template_id: str) -> StreamingResponse:
+    import oss2
+
     record = _template_record(template_id)
     if record is None:
         raise HTTPException(status_code=404, detail="模板不存在")
-    path = _template_path(record)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="模板文件不存在")
-    media_type = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
-    return FileResponse(path, media_type=media_type, filename=str(record.get("name", path.name)) + path.suffix)
+    bucket = _oss_bucket()
+    key = str(record.get("object_key") or f"{OSS_PREFIX}{template_id}{Path(str(record.get('filename', '.jpg'))).suffix}")
+    try:
+        obj = bucket.get_object(key)
+    except oss2.exceptions.NoSuchKey:
+        raise HTTPException(status_code=404, detail="模板文件不存在") from None
+    except oss2.exceptions.OssError as exc:
+        LOGGER.warning("模板文件读取失败：%s", key, exc_info=True)
+        raise HTTPException(status_code=503, detail="模板库暂时不可用，请稍后重试") from exc
+    suffix = Path(key).suffix.lower()
+    media_type = {".png": "image/png", ".webp": "image/webp"}.get(suffix, "image/jpeg")
+    filename = str(record.get("name", Path(key).name)) + suffix
+    return StreamingResponse(
+        obj,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 @app.get("/api/templates/{template_id}/thumb")
-def get_template_thumbnail(template_id: str) -> FileResponse:
+def get_template_thumbnail(background_tasks: BackgroundTasks, template_id: str) -> Response:
+    import oss2
+
     record = _template_record(template_id)
     if record is None:
         raise HTTPException(status_code=404, detail="模板不存在")
-    path = _template_path(record)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="模板文件不存在")
-    thumb_path = _thumbnail_path(template_id)
-    if not thumb_path.is_file():
-        # Older records predate thumbnails; backfill on first request.
-        _generate_thumbnail(path, thumb_path)
-    if thumb_path.is_file():
-        return FileResponse(thumb_path, media_type="image/jpeg")
-    media_type = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
-    return FileResponse(path, media_type=media_type)
+    bucket = _oss_bucket()
+    thumb_key = str(record.get("thumb_key") or f"{OSS_PREFIX}{template_id}_thumb.jpg")
+    try:
+        return StreamingResponse(bucket.get_object(thumb_key), media_type="image/jpeg")
+    except oss2.exceptions.NoSuchKey:
+        pass  # older records predate thumbnails; backfill below
+    except oss2.exceptions.OssError as exc:
+        LOGGER.warning("模板缩略图读取失败：%s", thumb_key, exc_info=True)
+        raise HTTPException(status_code=503, detail="模板库暂时不可用，请稍后重试") from exc
+    object_key = str(record.get("object_key") or f"{OSS_PREFIX}{template_id}.jpg")
+    temp_dir = Path(tempfile.mkdtemp(prefix="template-thumb-"))
+    background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
+    source_path = temp_dir / Path(object_key).name
+    thumb_path = temp_dir / f"{template_id}_thumb.jpg"
+    try:
+        bucket.get_object_to_file(object_key, str(source_path))
+        if _generate_thumbnail(source_path, thumb_path):
+            bucket.put_object_from_file(thumb_key, str(thumb_path))
+            return FileResponse(thumb_path, media_type="image/jpeg")
+    except oss2.exceptions.OssError:
+        LOGGER.warning("模板缩略图回填失败：%s", template_id, exc_info=True)
+    except Exception:
+        LOGGER.warning("模板缩略图生成失败：%s", template_id, exc_info=True)
+    return StreamingResponse(bucket.get_object(object_key), media_type="image/jpeg")
 
 
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: str) -> dict[str, str]:
-    records = _read_template_records()
-    record = next((item for item in records if item.get("id") == template_id), None)
+    record = _template_record(template_id)
     if record is None:
         raise HTTPException(status_code=404, detail="模板不存在")
-    _template_path(record).unlink(missing_ok=True)
-    _thumbnail_path(template_id).unlink(missing_ok=True)
-    _write_template_records([item for item in records if item.get("id") != template_id])
+    bucket = _oss_bucket()
+    suffix = Path(str(record.get("object_key") or ".jpg")).suffix or ".jpg"
+    object_key = str(record.get("object_key") or f"{OSS_PREFIX}{template_id}{suffix}")
+    thumb_key = str(record.get("thumb_key") or f"{OSS_PREFIX}{template_id}_thumb.jpg")
+    try:
+        bucket.delete_object(object_key)
+        bucket.delete_object(thumb_key)
+        bucket.delete_object(f"{OSS_PREFIX}{template_id}.json")
+    except Exception as exc:
+        LOGGER.exception("模板删除失败：%s", template_id)
+        raise HTTPException(status_code=500, detail="模板删除失败，请稍后重试") from exc
     return {"status": "deleted", "id": template_id}
 
 
