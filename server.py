@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -556,6 +557,56 @@ async def create_batch_composition(
     })
 
 
+def _init_batch_worker() -> None:
+    """Keep imaging libs single-threaded inside workers.
+
+    numpy/OpenCV/onnxruntime spawn their own thread pools, so a lone compose
+    already spreads across cores. Without this cap, N worker processes times
+    internal threads oversubscribes the box and parallel batches barely beat
+    sequential ones; parallelism must come from the process count instead.
+    """
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    try:
+        import cv2 as _cv2
+
+        _cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+
+def _compose_one(
+    item: dict,
+    template_path: str,
+    batch_id: str,
+    mode: str,
+    size: str,
+    outline_strength: float,
+    preserve_logo_pill: bool,
+    quality: int,
+    work_dir: str,
+    output_dir: str,
+) -> dict:
+    """Compose a single batch item; runs in a worker process."""
+    index = int(item["index"])
+    output_path = Path(output_dir) / f"{index:03d}_{item['stem']}.jpg"
+    try:
+        compose(
+            Path(work_dir) / str(item["work"]),
+            Path(template_path),
+            output_path,
+            mode=mode,  # type: ignore[arg-type]
+            size=size,
+            preserve_logo_pill=preserve_logo_pill,
+            outline_strength=outline_strength,
+            quality=quality,
+        )
+    except Exception as exc:
+        return {"index": index, "error": str(exc)}
+    return {"index": index, "name": output_path.name, "url": f"/api/batches/{batch_id}/{output_path.name}"}
+
+
 def _run_batch_composition(
     batch_id: str,
     mode: str,
@@ -583,33 +634,42 @@ def _run_batch_composition(
         template_path = work_dir / str(manifest["template"])
         items = manifest["items"]
         status["total"] = len(items)
-        for entry in items:
-            index = int(entry["index"])
-            output_path = output_dir / f"{index:03d}_{entry['stem']}.jpg"
-            try:
-                compose(
-                    work_dir / str(entry["work"]),
-                    template_path,
-                    output_path,
-                    mode=mode,  # type: ignore[arg-type]
-                    size=size,
-                    preserve_logo_pill=preserve_logo_pill,
-                    outline_strength=outline_strength,
-                    quality=quality,
+        # Composition is CPU-bound; fan out across cores (forked workers inherit
+        # the already-imported imaging stack). Capped so a many-core box cannot
+        # exhaust memory with one heavy worker per core.
+        workers = int(os.environ.get("BATCH_WORKERS", "") or 0) or max(1, min(os.cpu_count() or 2, 4))
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_batch_worker) as pool:
+            futures = [
+                pool.submit(
+                    _compose_one,
+                    entry,
+                    str(template_path),
+                    batch_id,
+                    mode,
+                    size,
+                    outline_strength,
+                    preserve_logo_pill,
+                    quality,
+                    str(work_dir),
+                    str(output_dir),
                 )
-            except Exception as exc:
-                # One unusable image must not abort a large batch.
-                LOGGER.warning("批次 %s 第 %s 张合成失败，已跳过：%s", batch_id, index, exc)
-                status["skipped"].append({"index": index, "error": str(exc)})  # type: ignore[union-attr]
+                for entry in items
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result.get("error"):
+                    # One unusable image must not abort a large batch.
+                    LOGGER.warning("批次 %s 第 %s 张合成失败，已跳过：%s", batch_id, result["index"], result["error"])
+                    status["skipped"].append({"index": result["index"], "error": result["error"]})  # type: ignore[union-attr]
+                else:
+                    status["images"].append({  # type: ignore[union-attr]
+                        "id": f"{result['index']:03d}",
+                        "name": result["name"],
+                        "url": result["url"],
+                    })
+                status["done"] = int(status.get("done", 0)) + 1
                 _write_batch_status(batch_dir, status)
-                continue
-            status["done"] = int(status.get("done", 0)) + 1
-            status["images"].append({  # type: ignore[union-attr]
-                "id": f"{index:03d}",
-                "name": output_path.name,
-                "url": f"/api/batches/{batch_id}/{output_path.name}",
-            })
-            _write_batch_status(batch_dir, status)
+        status["images"].sort(key=lambda image: str(image["id"]))  # type: ignore[union-attr]
         if not status["images"]:
             status["status"] = "failed"
             status["error"] = status.get("error") or "没有图片合成成功，请检查模板与商品图"
