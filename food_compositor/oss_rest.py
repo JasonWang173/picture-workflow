@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import mimetypes
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,16 +62,28 @@ class Bucket:
         if params:
             url += '?' + urllib.parse.urlencode(params)
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            return urllib.request.urlopen(request, timeout=self.timeout)
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-            exc.close()
-            if code == 404:
-                raise NoSuchKey('OSS 文件不存在') from None
-            raise OssError(f'OSS 请求失败（HTTP {code}）') from None
-        except (urllib.error.URLError, OSError) as exc:
-            raise OssError(f'OSS 连接失败（{type(exc).__name__}）') from None
+        # Reads are safe to retry after transient network failures. Mutating
+        # operations are not retried automatically because their outcome may
+        # be unknown if the connection drops after the server accepts them.
+        attempts = 3 if method == 'GET' else 1
+        for attempt in range(attempts):
+            try:
+                return urllib.request.urlopen(request, timeout=self.timeout)
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                exc.close()
+                if code == 404:
+                    raise NoSuchKey('OSS 文件不存在') from None
+                if code >= 500 and attempt + 1 < attempts:
+                    time.sleep(0.3 * (attempt + 1))
+                    continue
+                raise OssError(f'OSS 请求失败（HTTP {code}）') from None
+            except (urllib.error.URLError, OSError) as exc:
+                if attempt + 1 < attempts:
+                    time.sleep(0.3 * (attempt + 1))
+                    continue
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                raise OssError(f'OSS 连接失败（{type(reason).__name__}）') from None
 
     def get_object(self, key: str):
         return self._request('GET', key)

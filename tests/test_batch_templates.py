@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -141,6 +142,18 @@ class BatchCompositionTest(unittest.TestCase):
 
 
 class TemplateLibraryErrorsTest(unittest.TestCase):
+    def test_incomplete_template_list_returns_error(self):
+        class Failure(Exception):
+            pass
+        class BrokenBucket:
+            def get_object(self, key):
+                raise Failure('network error')
+        sdk = SimpleNamespace(exceptions=SimpleNamespace(OssError=Failure), ObjectIteratorV2=lambda bucket, prefix: [SimpleNamespace(key='broken.json')])
+        with patch.object(server, '_oss_bucket', return_value=BrokenBucket()), patch.object(server, '_oss_sdk', return_value=sdk):
+            response = TestClient(server.app).get('/api/templates')
+        self.assertEqual(response.status_code, 503)
+        self.assertIn('不完整', response.json()['detail'])
+
     def test_unconfigured_library_returns_useful_error(self):
         with patch.dict('os.environ', {}, clear=True), patch.object(server, '_OSS_BUCKET', None):
             response = TestClient(server.app).get('/api/templates')

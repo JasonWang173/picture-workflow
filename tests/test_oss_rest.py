@@ -4,7 +4,7 @@ import hmac
 import io
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 
 from food_compositor import oss_rest
@@ -46,6 +46,16 @@ class OssRestTest(unittest.TestCase):
         self.assertEqual([request.method for request in self.requests], ['PUT', 'DELETE'])
         self.assertEqual(self.requests[0].data, b'{"ok":true}')
         self.assertEqual(self.requests[0].get_header('Content-type'), 'application/json')
+
+    def test_transient_read_failure_is_retried_but_writes_are_not(self):
+        with patch('urllib.request.urlopen', side_effect=[URLError('temporary'), Response(b'ok')]) as call, patch('food_compositor.oss_rest.time.sleep'):
+            with self.bucket.get_object('prefix/test') as result:
+                self.assertEqual(result.read(), b'ok')
+            self.assertEqual(call.call_count, 2)
+        with patch('urllib.request.urlopen', side_effect=URLError('temporary')) as call, patch('food_compositor.oss_rest.time.sleep'):
+            with self.assertRaises(oss_rest.OssError):
+                self.bucket.put_object('prefix/test', b'data')
+            self.assertEqual(call.call_count, 1)
 
     def test_missing_key_and_invalid_endpoint(self):
         error = HTTPError('https://example.com', 404, 'not found', {}, io.BytesIO())

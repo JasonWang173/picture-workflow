@@ -267,6 +267,9 @@ def health() -> dict[str, str]:
 def list_templates() -> dict[str, object]:
     bucket = _oss_bucket()
     oss2 = _oss_sdk()
+    class TemplateReadError(Exception):
+        pass
+
     def read_record(key: str) -> dict[str, object] | None:
         try:
             response = bucket.get_object(key)
@@ -275,21 +278,21 @@ def list_templates() -> dict[str, object]:
             finally:
                 if callable(getattr(response, "close", None)):
                     response.close()
-        except (OSError, ValueError, oss2.exceptions.OssError):
+        except (OSError, ValueError, oss2.exceptions.OssError) as exc:
             LOGGER.warning("模板元数据读取失败：%s", key, exc_info=True)
-            return None
+            raise TemplateReadError("模板库读取不完整，请稍后重试") from exc
         if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
             return None
         return {**meta, "url": f"/api/templates/{meta['id']}/file", "thumb_url": f"/api/templates/{meta['id']}/thumb"}
 
     try:
         keys = [obj.key for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_PREFIX) if obj.key.endswith(".json")]
-        workers = min(8, max(1, len(keys))) if os.environ.get("OSS_TRANSPORT", "sdk").lower() == "rest" else 1
+        workers = min(4, max(1, len(keys))) if os.environ.get("OSS_TRANSPORT", "sdk").lower() == "rest" else 1
         with ThreadPoolExecutor(max_workers=workers) as executor:
             records = [record for record in executor.map(read_record, keys) if record is not None]
-    except oss2.exceptions.OssError as exc:
+    except (TemplateReadError, oss2.exceptions.OssError) as exc:
         LOGGER.exception("模板库列表读取失败")
-        raise HTTPException(status_code=503, detail="模板库暂时不可用，请稍后重试") from exc
+        raise HTTPException(status_code=503, detail="模板库读取失败或不完整，请稍后重试") from exc
     records.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
     return {"templates": records}
 
