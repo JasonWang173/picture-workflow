@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
@@ -696,14 +697,14 @@ def _top_left_logo_bbox(template: Image.Image, alpha: Image.Image) -> tuple[int,
     return max(0, x0 - pad_x), max(0, y0 - pad_y), min(width, x1 + pad_x), min(height, bottom)
 
 
-def _apply_overlay(
-    background: Image.Image,
+def _build_overlay_layers(
     template: Image.Image,
+    size: tuple[int, int],
     *,
     preserve_logo_pill: bool = True,
     outline_strength: float = 0.78,
-) -> Image.Image:
-    size = background.size
+) -> tuple[Image.Image, ...]:
+    layers = []
     page = fit_cover(template, size)
     # A PNG template's alpha channel is authoritative. The RGB values behind
     # transparent pixels are often black (or a checkerboard preview), so
@@ -743,7 +744,7 @@ def _apply_overlay(
                 radius = max(12, round(min(size) * 0.025))
                 radius = min(radius, max(6, (y1 - y0) // 2))
                 ImageDraw.Draw(pill).rounded_rectangle(bbox, radius=radius, fill=fill)
-                background = Image.alpha_composite(background.convert("RGBA"), pill)
+                layers.append(pill)
 
     if uses_native_alpha:
         graphic = _with_alpha(page, alpha)
@@ -775,9 +776,17 @@ def _apply_overlay(
         border = ImageChops.multiply(border, keep)
         keyline = Image.new("RGBA", size, (255, 255, 255, 0))
         keyline.putalpha(border)
-        background = Image.alpha_composite(background.convert("RGBA"), keyline)
+        layers.append(keyline)
 
-    return Image.alpha_composite(background.convert("RGBA"), graphic).convert("RGB")
+    # Keep layers separate: pre-flattening changes alpha rounding at edges.
+    return tuple(layers + [graphic])
+
+
+def _apply_overlay(background, template, *, preserve_logo_pill=True, outline_strength=0.78, _layers=None):
+    layers = _layers if _layers is not None else _build_overlay_layers(template, background.size, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
+    for layer in layers:
+        background = Image.alpha_composite(background.convert("RGBA"), layer)
+    return background.convert("RGB")
 
 
 def _rembg_cutout(image: Image.Image) -> Image.Image | None:
@@ -2096,7 +2105,7 @@ def _place_product_slot(
     edge used to hide JPEG and template boundary noise.
     """
     explicit_detected = detected is not None
-    green_detected = _green_slot(background)
+    green_detected = None if explicit_detected else _green_slot(background)
     detected = detected or green_detected or _neutral_slot(background) or _template_replace_slot(background)
     if detected is None:
         return None
@@ -2193,6 +2202,45 @@ def _enhance_output_detail(
     return image.convert("RGB").filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=2))
 
 
+@lru_cache(maxsize=1)
+def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength, manual_slot):
+    """Reuse only the latest template in each worker; all cached images are read-only.
+
+    Identity includes the resolved path and file metadata, so replacing a file,
+    changing a setting, or moving to the next uploaded template invalidates it.
+    """
+    template = _open_template(identity[0])
+    output_size = _parse_size(size, template.size)
+    page = None
+    mapped_slot = None
+    selected = mode
+    if mode != "overlay":
+        page = fit_contain(template, output_size)
+        native_slot = (_refine_manual_slot(template, manual_slot)
+                       if mode == "template_replace" and manual_slot is not None
+                       else _template_replace_slot(template, include_frame=(mode == "template_replace")))
+        mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
+        if mode == "auto":
+            if _has_transparency(page):
+                selected = "overlay"
+            elif mapped_slot is not None or _product_slot(page) is not None:
+                selected = "cutout"
+            else:
+                selected = "overlay" if _looks_like_flat_template(template) else "cutout"
+    layers = None
+    if selected == "overlay":
+        layers = _build_overlay_layers(template, output_size, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
+        page = None
+        mapped_slot = None
+    return template.size, output_size, page, mapped_slot, selected, layers
+
+
+def _template_identity(path):
+    path = Path(path).resolve()
+    info = path.stat()
+    return str(path), info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino
+
+
 def compose(
     product_path: str | Path | None,
     template_path: str | Path,
@@ -2213,64 +2261,23 @@ def compose(
     """
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise ValueError("mode 必须是 auto、overlay、cutout 或 template_replace")
-    template = _open_template(template_path)
-    output_size = _parse_size(size, template.size)
-    # Template replacement and green-slot composition preserve the complete
-    # page when the selected output orientation differs from the source. The
-    # product image itself still uses cover inside its slot, so it fills the
-    # frame without being stretched.
-    # All slot-based flows preserve the complete template page when the
-    # requested output orientation differs from the source.  ``auto`` can
-    # resolve to cutout after it detects a placeholder, so it must use the
-    # same contain transform up front; otherwise the native slot mask and the
-    # rendered page would be mapped through different crops.  Overlay keeps
-    # its documented cover behavior because it intentionally fills the whole
-    # canvas with the product scene.
-    template_page = fit_contain(template, output_size) if mode in {"template_replace", "cutout", "auto"} else fit_cover(template, output_size)
-    # A user-drawn rectangle overrides automatic detection so awkward templates
-    # can still be cleaned precisely. It is expressed in native template ratios
-    # and mapped through the same contain transform as the page; detection is
-    # re-run inside the drawn area so imprecise framing snaps to true edges.
-    if mode == "template_replace" and manual_slot is not None:
-        native_slot = _refine_manual_slot(template, manual_slot)
-    else:
-        # Template replacement deliberately includes the outer photo frame so a
-        # dark rule from the source poster cannot remain above the green panel.
-        # Other modes use the default frame-preserving detector for direct
-        # cutout/auto composition.
-        native_slot = _template_replace_slot(template, include_frame=(mode == "template_replace"))
-    mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
+    source_size, output_size, template_page, mapped_slot, selected, layers = _prepare_template(
+        _template_identity(template_path), size, mode, preserve_logo_pill, outline_strength, manual_slot)
     if mode == "template_replace":
-        # Detect on the native source first, then transform the mask together
-        # with the page. This keeps detection stable at both 405x720 and
-        # 1080x1920/720x1280 output sizes instead of re-detecting a resized,
-        # compressed-looking edge.
         result = _remove_template_product(template_page, detected=mapped_slot)
     else:
         if product_path is None:
             raise ValueError("该合成方式需要商品图")
         product = _open_rgb(product_path)
-        background = fit_cover(product, output_size)
-        if mode == "auto":
-            # A native alpha channel is an explicit instruction from the template
-            # designer: transparent pixels are the replacement for a background
-            # slot, not a green/white panel to be detected heuristically.
-            if _has_transparency(template_page):
-                selected = "overlay"
-            elif mapped_slot is not None or _product_slot(template_page) is not None:
-                selected = "cutout"
-            else:
-                selected = "overlay" if _looks_like_flat_template(template) else "cutout"
-        else:
-            selected = mode
         if selected == "overlay":
-            result = _apply_overlay(background, template, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
+            background = fit_cover(product, output_size)
+            result = _apply_overlay(background, None, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength, _layers=layers)
         else:
             result = _place_cutout(template_page, product=product, detected=mapped_slot)
     # Apply the detail pass after compositing so both the preserved template
     # typography and the inserted product benefit from the same final-scale
     # treatment.  It is intentionally skipped for same-size exports.
-    result = _enhance_output_detail(result, template.size, output_size)
+    result = _enhance_output_detail(result, source_size, output_size)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()

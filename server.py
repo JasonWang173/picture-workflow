@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+# Set before numpy/OpenCV are imported, including in spawned worker processes.
+for _thread_setting in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_thread_setting, "1")
 import re
 import shutil
 import tempfile
@@ -12,15 +15,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import quote
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import asynccontextmanager
 import time
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from food_compositor import compose
+from food_compositor.execution import submit_composition, worker_count, estimate_memory, shutdown_executor
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
@@ -52,7 +58,16 @@ THUMBNAIL_MAX_EDGE = 360
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
 LOGGER = logging.getLogger(__name__)
 
-app = FastAPI(title="商品海报合成工作台", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app):
+    _fail_interrupted_batches()
+    try:
+        yield
+    finally:
+        await run_in_threadpool(shutdown_executor)
+
+
+app = FastAPI(title="商品海报合成工作台", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173", "http://127.0.0.1:4173"],
@@ -255,7 +270,6 @@ def _fail_interrupted_batches() -> None:
             _write_batch_status(status_path.parent, payload)
 
 
-_fail_interrupted_batches()
 
 
 @app.get("/api/health")
@@ -435,6 +449,12 @@ def demo_available() -> dict[str, bool]:
     return {"available": all(path.is_file() for path in DEMO_ASSETS.values())}
 
 
+def _compose_single(product_path, template_path, output_path, **settings):
+    return submit_composition(compose, product_path, template_path, output_path,
+                              estimated_bytes=estimate_memory(product_path, template_path, settings.get("size")),
+                              **settings).result()
+
+
 @app.post("/api/compose")
 async def create_composition(
     background_tasks: BackgroundTasks,
@@ -467,7 +487,8 @@ async def create_composition(
         await _write_upload(template, template_path)
         if size.strip() == "":
             size = "1080x1920"
-        compose(
+        await run_in_threadpool(
+            _compose_single,
             product_path,
             template_path,
             output_path,
@@ -596,25 +617,6 @@ async def create_batch_composition(
     })
 
 
-def _init_batch_worker() -> None:
-    """Keep imaging libs single-threaded inside workers.
-
-    numpy/OpenCV/onnxruntime spawn their own thread pools, so a lone compose
-    already spreads across cores. Without this cap, N worker processes times
-    internal threads oversubscribes the box and parallel batches barely beat
-    sequential ones; parallelism must come from the process count instead.
-    """
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    try:
-        import cv2 as _cv2
-
-        _cv2.setNumThreads(1)
-    except Exception:
-        pass
-
-
 def _compose_one(
     item: dict,
     template_path: str,
@@ -668,44 +670,67 @@ def _run_batch_composition(
     }
     status["status"] = "processing"
     _write_batch_status(batch_dir, status)
+    futures = {}
     try:
         manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
         items = manifest["items"]
         template_items = manifest.get("templates") or [{"index": 1, "work": manifest.get("template"), "name": "模板"}]
         status["total"] = len(items) * len(template_items)
         status["template_count"] = len(template_items)
-        workers = int(os.environ.get("BATCH_WORKERS", "") or 0) or max(1, min(os.cpu_count() or 2, 4))
-        with ProcessPoolExecutor(max_workers=workers, initializer=_init_batch_worker) as pool:
-            # Finish all products for one template before starting the next.
-            for template_item in template_items:
-                template_index = int(template_item["index"])
-                status["current_template_index"] = template_index
-                status["current_template_name"] = template_item["name"]
-                status["current_template_mode"] = template_item.get("mode", mode)
+        workers = worker_count()
+        status["workers"] = workers
+        last_status_write = 0.0
+        def flush_status(force=False):
+            nonlocal last_status_write
+            now = time.monotonic()
+            if force or now - last_status_write >= 0.25:
+                status["images"].sort(key=lambda image: int(image["id"]))
+                status["skipped"].sort(key=lambda item: item["index"])
                 _write_batch_status(batch_dir, status)
-                template_path = work_dir / str(template_item["work"])
-                entries = [dict(item, index=(template_index - 1) * len(items) + int(item["index"]),
-                                template_index=template_index, template_name=template_item["name"],
-                                product_index=int(item["index"])) for item in items]
-                futures = {pool.submit(_compose_one, entry, str(template_path), batch_id, template_item.get("mode", mode), size,
-                                       outline_strength, preserve_logo_pill, quality, str(work_dir), str(output_dir)): entry
-                           for entry in entries}
-                for future in as_completed(futures):
-                    entry = futures[future]
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        result = {**entry, "product_name": entry.get("name", entry["stem"]), "error": str(exc) or "处理进程异常"}
-                    metadata = {key: result[key] for key in ("template_index", "template_name", "product_index", "product_name")}
-                    if result.get("error"):
-                        LOGGER.warning("批次 %s 模板 %s 商品 %s 合成失败：%s", batch_id, result["template_index"], result["product_index"], result["error"])
-                        status["skipped"].append({"index": result["index"], **metadata, "error": result["error"]})
-                        status["skipped"].sort(key=lambda item: item["index"])
-                    else:
-                        status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": result["name"], "url": result["url"]})
-                        status["images"].sort(key=lambda image: int(image["id"]))
-                    status["done"] = int(status.get("done", 0)) + 1
-                    _write_batch_status(batch_dir, status)
+                last_status_write = now
+        # One shared pool bounds CPU/memory across batches and single requests.
+        # Finish all products for one template before starting the next.
+        for template_item in template_items:
+            template_index = int(template_item["index"])
+            status["current_template_index"] = template_index
+            status["current_template_name"] = template_item["name"]
+            status["current_template_mode"] = template_item.get("mode", mode)
+            _write_batch_status(batch_dir, status)
+            template_path = work_dir / str(template_item["work"])
+            entries = [dict(item, index=(template_index - 1) * len(items) + int(item["index"]),
+                            template_index=template_index, template_name=template_item["name"],
+                            product_index=int(item["index"])) for item in items]
+            pending_entries = iter(entries)
+            futures = {}
+            def submit_next():
+                entry = next(pending_entries, None)
+                if entry is None:
+                    return
+                product_path = work_dir / str(entry["work"]) if entry["work"] is not None else None
+                future = submit_composition(_compose_one, entry, str(template_path), batch_id, template_item.get("mode", mode), size,
+                                            outline_strength, preserve_logo_pill, quality, str(work_dir), str(output_dir),
+                                            estimated_bytes=estimate_memory(product_path, template_path, size))
+                futures[future] = entry
+            for _ in range(min(workers, len(entries))):
+                submit_next()
+            while futures:
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                future = next(iter(completed))
+                entry = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {**entry, "product_name": entry.get("name", entry["stem"]), "error": str(exc) or "处理进程异常"}
+                metadata = {key: result[key] for key in ("template_index", "template_name", "product_index", "product_name")}
+                if result.get("error"):
+                    LOGGER.warning("批次 %s 模板 %s 商品 %s 合成失败：%s", batch_id, result["template_index"], result["product_index"], result["error"])
+                    status["skipped"].append({"index": result["index"], **metadata, "error": result["error"]})
+                else:
+                    status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": result["name"], "url": result["url"]})
+                status["done"] = int(status.get("done", 0)) + 1
+                flush_status()
+                submit_next()
+            flush_status(force=True)
         if not status["images"]:
             status["status"] = "failed"
             status["error"] = status.get("error") or "没有图片合成成功，请检查模板与商品图"
@@ -716,6 +741,9 @@ def _run_batch_composition(
         status["status"] = "failed"
         status["error"] = str(exc) or "批量合成失败"
     finally:
+        # A failed submit/status write must not remove inputs while workers use them.
+        if futures:
+            wait(futures)
         _write_batch_status(batch_dir, status)
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -751,7 +779,7 @@ def download_batch(batch_id: str, background_tasks: BackgroundTasks, ids: Option
     if not selected:
         raise HTTPException(status_code=404, detail="没有可下载的合成图")
     archive_path = batch_dir / f"selected-{uuid.uuid4().hex[:8]}.zip"
-    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for image_path in selected:
             archive.write(image_path, arcname=image_path.name)
     background_tasks.add_task(archive_path.unlink, missing_ok=True)

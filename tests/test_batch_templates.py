@@ -28,7 +28,12 @@ class BatchCompositionTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root_patch = patch.object(server, 'BATCH_ROOT', Path(self.directory.name))
-        self.pool_patch = patch.object(server, 'ProcessPoolExecutor', ThreadPoolExecutor)
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        def submit(function, *args, estimated_bytes=None, **kwargs):
+            return self.executor.submit(function, *args, **kwargs)
+        self.pool_patch = patch.object(server, 'submit_composition', side_effect=submit)
+        self.worker_patch = patch.object(server, 'worker_count', return_value=2)
+        self.worker_patch.start()
         self.root_patch.start()
         self.pool_patch.start()
         self.client = TestClient(server.app)
@@ -39,6 +44,8 @@ class BatchCompositionTest(unittest.TestCase):
     def tearDown(self):
         self.compose_patch.stop()
         self.pool_patch.stop()
+        self.worker_patch.stop()
+        self.executor.shutdown(wait=True)
         self.root_patch.stop()
         self.directory.cleanup()
 
