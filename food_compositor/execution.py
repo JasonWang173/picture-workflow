@@ -105,7 +105,7 @@ def submit_composition(function, *args, estimated_bytes=1024 * MIB, **kwargs):
         with _lock:
             if _pool is None:
                 _pool = ProcessPoolExecutor(max_workers=_workers, mp_context=multiprocessing.get_context('spawn'), initializer=_init_worker)
-                logging.getLogger(__name__).info('合成进程池启动：workers=%s，内存预算=%s MiB', _workers, _budget // MIB)
+                logging.getLogger('uvicorn.error').info('合成进程池启动：workers=%s，内存预算=%s MiB', _workers, _budget // MIB)
             try:
                 future = _pool.submit(function, *args, **kwargs)
             except BrokenProcessPool:
