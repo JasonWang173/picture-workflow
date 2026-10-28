@@ -10,7 +10,7 @@ import logging
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 from urllib.parse import quote
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import time
@@ -298,8 +298,8 @@ def list_templates() -> dict[str, object]:
 async def save_template(
     background_tasks: BackgroundTasks,
     template: Annotated[UploadFile, File(description="模板图片")],
-    name: Annotated[str | None, Form()] = None,
-    source: Annotated[str | None, Form()] = None,
+    name: Annotated[Optional[str], Form()] = None,
+    source: Annotated[Optional[str], Form()] = None,
 ) -> dict[str, object]:
     suffix = _safe_upload_suffix(template.filename, ".jpg")
     template_id = uuid.uuid4().hex[:16]
@@ -436,13 +436,13 @@ def demo_available() -> dict[str, bool]:
 async def create_composition(
     background_tasks: BackgroundTasks,
     template: Annotated[UploadFile, File(description="模板图")],
-    product: Annotated[UploadFile | None, File(description="商品图；模板替换模式可不上传")] = None,
+    product: Annotated[Optional[UploadFile], File(description="商品图；模板替换模式可不上传")] = None,
     mode: Annotated[str, Form()] = "auto",
     size: Annotated[str, Form()] = "1080x1920",
     outline: Annotated[float, Form()] = 0.78,
     preserve_logo_pill: Annotated[bool, Form()] = True,
     quality: Annotated[int, Form()] = 100,
-    slot: Annotated[str | None, Form()] = None,
+    slot: Annotated[Optional[str], Form()] = None,
 ) -> FileResponse:
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
@@ -494,10 +494,10 @@ async def create_composition(
 @app.post("/api/compose-batch")
 async def create_batch_composition(
     background_tasks: BackgroundTasks,
-    products: Annotated[list[UploadFile] | None, File(description="商品图片文件夹或多选图片")] = None,
-    template: Annotated[UploadFile | None, File(description="兼容单张模板")] = None,
-    templates: Annotated[list[UploadFile] | None, File(description="按顺序处理的模板图")] = None,
-    template_modes: Annotated[str | None, Form(description="每张模板的合成方式 JSON 数组")] = None,
+    products: Annotated[Optional[list[UploadFile]], File(description="商品图片文件夹或多选图片")] = None,
+    template: Annotated[Optional[UploadFile], File(description="兼容单张模板")] = None,
+    templates: Annotated[Optional[list[UploadFile]], File(description="按顺序处理的模板图")] = None,
+    template_modes: Annotated[Optional[str], Form(description="每张模板的合成方式 JSON 数组")] = None,
     mode: Annotated[str, Form()] = "auto",
     size: Annotated[str, Form()] = "1080x1920",
     outline: Annotated[float, Form()] = 0.78,
@@ -736,7 +736,7 @@ def get_batch_status(batch_id: str) -> JSONResponse:
 
 
 @app.get("/api/batches/{batch_id}/download")
-def download_batch(batch_id: str, background_tasks: BackgroundTasks, ids: str | None = None) -> FileResponse:
+def download_batch(batch_id: str, background_tasks: BackgroundTasks, ids: Optional[str] = None) -> FileResponse:
     batch_dir = _batch_directory(batch_id)
     output_dir = (batch_dir / "outputs").resolve()
     available = sorted(output_dir.glob("*.jpg"))
