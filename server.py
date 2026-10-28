@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import time
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -25,6 +25,16 @@ from food_compositor import compose
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
 BATCH_ROOT = ROOT / "runtime" / "batches"
+# Optional machine-specific settings contain no credentials and are never committed.
+_local_oss_settings = ROOT / "runtime" / "local-oss.json"
+if _local_oss_settings.is_file():
+    try:
+        _settings = json.loads(_local_oss_settings.read_text(encoding="utf-8"))
+        for _name in ("OSS_BUCKET", "OSS_ENDPOINT", "OSS_TEMPLATE_PREFIX", "OSS_TRANSPORT"):
+            if isinstance(_settings.get(_name), str):
+                os.environ.setdefault(_name, _settings[_name])
+    except (OSError, ValueError, AttributeError):
+        logging.getLogger(__name__).warning("本地 OSS 配置无法读取，请检查 runtime/local-oss.json")
 # The template library lives in OSS so every user shares one library. Each
 # template is a set of self-describing objects (image, thumb, meta json), so
 # concurrent uploads never fight over a shared mutable index.
@@ -84,29 +94,35 @@ def _parse_manual_slot(raw: str | None) -> tuple[float, float, float, float] | N
     return (x, y, min(w, 1 - x), min(h, 1 - y))
 
 
+def _oss_sdk():
+    """Select the standard SDK or the native-extension-free HTTPS transport."""
+    transport = os.environ.get("OSS_TRANSPORT", "sdk").lower()
+    if transport == "rest":
+        from food_compositor import oss_rest
+        return oss_rest
+    if transport != "sdk":
+        raise HTTPException(status_code=503, detail="OSS_TRANSPORT 配置无效")
+    try:
+        import oss2
+        return oss2
+    except ImportError:
+        raise HTTPException(status_code=503, detail="模板库依赖加载失败，请检查 oss2 和 pycryptodome 安装及 Windows 应用控制策略") from None
+    except OSError:
+        LOGGER.exception("模板库依赖的原生组件加载失败")
+        raise HTTPException(status_code=503, detail="模板库依赖的原生组件无法加载，请检查 Windows 应用控制策略和 pycryptodome 安装") from None
+
+
 def _oss_bucket():
     """Lazily build the OSS bucket client from the service environment."""
     global _OSS_BUCKET
     if _OSS_BUCKET is not None:
         return _OSS_BUCKET
-    missing = [
-        key
-        for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "OSS_ENDPOINT", "OSS_BUCKET")
-        if not os.environ.get(key)
-    ]
+    missing = [key for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "OSS_ENDPOINT", "OSS_BUCKET") if not os.environ.get(key)]
     if missing:
         raise HTTPException(status_code=503, detail=f"模板库 OSS 未配置，缺少环境变量：{', '.join(missing)}")
-    try:
-        import oss2
-    except ImportError:
-        raise HTTPException(status_code=503, detail="服务器缺少 oss2 依赖") from None
+    oss2 = _oss_sdk()
     auth = oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
-    _OSS_BUCKET = oss2.Bucket(
-        auth,
-        os.environ["OSS_ENDPOINT"],
-        os.environ["OSS_BUCKET"],
-        connect_timeout=15,
-    )
+    _OSS_BUCKET = oss2.Bucket(auth, os.environ["OSS_ENDPOINT"], os.environ["OSS_BUCKET"], connect_timeout=15)
     return _OSS_BUCKET
 
 
@@ -117,10 +133,9 @@ def _validated_template_id(template_id: str) -> str:
 
 
 def _template_record(template_id: str) -> dict[str, object] | None:
-    import oss2
-
     template_id = _validated_template_id(template_id)
     bucket = _oss_bucket()
+    oss2 = _oss_sdk()
     try:
         payload = json.loads(bucket.get_object(f"{OSS_PREFIX}{template_id}.json").read())
     except oss2.exceptions.NoSuchKey:
@@ -250,25 +265,28 @@ def health() -> dict[str, str]:
 
 @app.get("/api/templates")
 def list_templates() -> dict[str, object]:
-    import oss2
-
     bucket = _oss_bucket()
-    records: list[dict[str, object]] = []
-    try:
-        for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_PREFIX):
-            if not obj.key.endswith(".json"):
-                continue
+    oss2 = _oss_sdk()
+    def read_record(key: str) -> dict[str, object] | None:
+        try:
+            response = bucket.get_object(key)
             try:
-                meta = json.loads(bucket.get_object(obj.key).read())
-            except (OSError, json.JSONDecodeError, oss2.exceptions.OssError):
-                LOGGER.warning("模板元数据解析失败：%s", obj.key, exc_info=True)
-                continue
-            if isinstance(meta, dict) and isinstance(meta.get("id"), str):
-                records.append({
-                    **meta,
-                    "url": f"/api/templates/{meta['id']}/file",
-                    "thumb_url": f"/api/templates/{meta['id']}/thumb",
-                })
+                meta = json.loads(response.read())
+            finally:
+                if callable(getattr(response, "close", None)):
+                    response.close()
+        except (OSError, ValueError, oss2.exceptions.OssError):
+            LOGGER.warning("模板元数据读取失败：%s", key, exc_info=True)
+            return None
+        if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
+            return None
+        return {**meta, "url": f"/api/templates/{meta['id']}/file", "thumb_url": f"/api/templates/{meta['id']}/thumb"}
+
+    try:
+        keys = [obj.key for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_PREFIX) if obj.key.endswith(".json")]
+        workers = min(8, max(1, len(keys))) if os.environ.get("OSS_TRANSPORT", "sdk").lower() == "rest" else 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            records = [record for record in executor.map(read_record, keys) if record is not None]
     except oss2.exceptions.OssError as exc:
         LOGGER.exception("模板库列表读取失败")
         raise HTTPException(status_code=503, detail="模板库暂时不可用，请稍后重试") from exc
@@ -326,12 +344,11 @@ async def save_template(
 
 @app.get("/api/templates/{template_id}/file")
 def get_template_file(template_id: str) -> StreamingResponse:
-    import oss2
-
     record = _template_record(template_id)
     if record is None:
         raise HTTPException(status_code=404, detail="模板不存在")
     bucket = _oss_bucket()
+    oss2 = _oss_sdk()
     key = str(record.get("object_key") or f"{OSS_PREFIX}{template_id}{Path(str(record.get('filename', '.jpg'))).suffix}")
     try:
         obj = bucket.get_object(key)
@@ -352,12 +369,11 @@ def get_template_file(template_id: str) -> StreamingResponse:
 
 @app.get("/api/templates/{template_id}/thumb")
 def get_template_thumbnail(background_tasks: BackgroundTasks, template_id: str) -> Response:
-    import oss2
-
     record = _template_record(template_id)
     if record is None:
         raise HTTPException(status_code=404, detail="模板不存在")
     bucket = _oss_bucket()
+    oss2 = _oss_sdk()
     thumb_key = str(record.get("thumb_key") or f"{OSS_PREFIX}{template_id}_thumb.jpg")
     try:
         return StreamingResponse(bucket.get_object(thumb_key), media_type="image/jpeg")
@@ -478,8 +494,10 @@ async def create_composition(
 @app.post("/api/compose-batch")
 async def create_batch_composition(
     background_tasks: BackgroundTasks,
-    products: Annotated[list[UploadFile], File(description="商品图片文件夹或多选图片")],
-    template: Annotated[UploadFile, File(description="商家模板图")],
+    products: Annotated[list[UploadFile] | None, File(description="商品图片文件夹或多选图片")] = None,
+    template: Annotated[UploadFile | None, File(description="兼容单张模板")] = None,
+    templates: Annotated[list[UploadFile] | None, File(description="按顺序处理的模板图")] = None,
+    template_modes: Annotated[str | None, Form(description="每张模板的合成方式 JSON 数组")] = None,
     mode: Annotated[str, Form()] = "auto",
     size: Annotated[str, Form()] = "1080x1920",
     outline: Annotated[float, Form()] = 0.78,
@@ -489,11 +507,25 @@ async def create_batch_composition(
     """Accept a batch upload and compose it in the background; poll /status for progress."""
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
-    if mode == "template_replace":
-        raise HTTPException(status_code=400, detail="模板替换模式只需要上传一张模板图")
-    image_products = [upload for upload in products if upload.filename and Path(upload.filename).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
-    if not image_products:
+    image_products = [upload for upload in (products or []) if upload.filename and Path(upload.filename).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+    if mode != "template_replace" and not image_products:
         raise HTTPException(status_code=400, detail="商品文件夹里没有可处理的图片")
+    if mode == "template_replace":
+        image_products = []
+
+    image_templates = list(templates or []) + ([template] if template is not None else [])
+    if not image_templates or any(not upload.filename or Path(upload.filename).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"} for upload in image_templates):
+        raise HTTPException(status_code=400, detail="请上传有效的模板图片")
+
+    requested_modes = [mode] * len(image_templates)
+    if template_modes is not None:
+        try:
+            parsed_modes = json.loads(template_modes)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="模板合成方式格式不正确") from exc
+        if mode != "auto" or not isinstance(parsed_modes, list) or len(parsed_modes) != len(image_templates) or any(item not in ("auto", "cutout", "overlay") for item in parsed_modes):
+            raise HTTPException(status_code=400, detail="请为每张模板提供有效的合成方式，且批次方式须为智能判断")
+        requested_modes = parsed_modes
 
     batch_id = uuid.uuid4().hex[:12]
     batch_dir = BATCH_ROOT / batch_id
@@ -503,12 +535,13 @@ async def create_batch_composition(
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_items: list[dict[str, object]] = []
     try:
-        template_path = work_dir / f"template{_safe_upload_suffix(template.filename, '.jpg')}"
-        total_upload_bytes = await _write_upload(
-            template,
-            template_path,
-            total_limit=MAX_BATCH_UPLOAD_BYTES,
-        )
+        total_upload_bytes = 0
+        manifest_templates = []
+        for index, upload in enumerate(image_templates, start=1):
+            template_path = work_dir / f"template-{index:04d}{_safe_upload_suffix(upload.filename, '.jpg')}"
+            total_upload_bytes += await _write_upload(upload, template_path, current_total=total_upload_bytes, total_limit=MAX_BATCH_UPLOAD_BYTES)
+            name = Path(_repair_latin1_utf8(upload.filename) or f"模板{index}").stem
+            manifest_templates.append({"index": index, "work": template_path.name, "name": name, "mode": requested_modes[index - 1]})
         for index, upload in enumerate(image_products, start=1):
             product_path = work_dir / f"product-{index:03d}{_safe_upload_suffix(upload.filename, '.png')}"
             total_upload_bytes += await _write_upload(
@@ -517,16 +550,19 @@ async def create_batch_composition(
                 current_total=total_upload_bytes,
                 total_limit=MAX_BATCH_UPLOAD_BYTES,
             )
-            stem = Path(upload.filename or f"product-{index:03d}").stem
+            stem = Path(_repair_latin1_utf8(upload.filename) or f"product-{index:03d}").stem
             safe_stem = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in stem).strip("_") or f"product-{index:03d}"
-            manifest_items.append({"index": index, "work": product_path.name, "stem": safe_stem})
+            manifest_items.append({"index": index, "work": product_path.name, "stem": safe_stem, "name": stem})
+        if mode == "template_replace":
+            # This mode removes the existing product area; it does not use product uploads.
+            manifest_items.append({"index": 1, "work": None, "stem": "blank", "name": "空白模板"})
         (work_dir / "manifest.json").write_text(
-            json.dumps({"template": template_path.name, "items": manifest_items}, ensure_ascii=False),
+            json.dumps({"templates": manifest_templates, "items": manifest_items}, ensure_ascii=False),
             encoding="utf-8",
         )
         _write_batch_status(batch_dir, {
             "status": "queued",
-            "total": len(manifest_items),
+            "total": len(manifest_items) * len(manifest_templates),
             "done": 0,
             "skipped": [],
             "error": None,
@@ -552,7 +588,7 @@ async def create_batch_composition(
     )
     return JSONResponse({
         "batch_id": batch_id,
-        "total": len(manifest_items),
+        "total": len(manifest_items) * len(manifest_templates),
         "status_url": f"/api/batches/{batch_id}/status",
     })
 
@@ -590,10 +626,10 @@ def _compose_one(
 ) -> dict:
     """Compose a single batch item; runs in a worker process."""
     index = int(item["index"])
-    output_path = Path(output_dir) / f"{index:03d}_{item['stem']}.jpg"
+    output_path = Path(output_dir) / f"{index:09d}_T{item['template_index']:04d}_P{item['product_index']:04d}_{item['stem']}.jpg"
     try:
         compose(
-            Path(work_dir) / str(item["work"]),
+            Path(work_dir) / str(item["work"]) if item["work"] is not None else None,
             Path(template_path),
             output_path,
             mode=mode,  # type: ignore[arg-type]
@@ -603,8 +639,8 @@ def _compose_one(
             quality=quality,
         )
     except Exception as exc:
-        return {"index": index, "error": str(exc)}
-    return {"index": index, "name": output_path.name, "url": f"/api/batches/{batch_id}/{output_path.name}"}
+        return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "error": str(exc)}
+    return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "name": output_path.name, "url": f"/api/batches/{batch_id}/{quote(output_path.name)}"}
 
 
 def _run_batch_composition(
@@ -631,45 +667,42 @@ def _run_batch_composition(
     _write_batch_status(batch_dir, status)
     try:
         manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-        template_path = work_dir / str(manifest["template"])
         items = manifest["items"]
-        status["total"] = len(items)
-        # Composition is CPU-bound; fan out across cores (forked workers inherit
-        # the already-imported imaging stack). Capped so a many-core box cannot
-        # exhaust memory with one heavy worker per core.
+        template_items = manifest.get("templates") or [{"index": 1, "work": manifest.get("template"), "name": "模板"}]
+        status["total"] = len(items) * len(template_items)
+        status["template_count"] = len(template_items)
         workers = int(os.environ.get("BATCH_WORKERS", "") or 0) or max(1, min(os.cpu_count() or 2, 4))
         with ProcessPoolExecutor(max_workers=workers, initializer=_init_batch_worker) as pool:
-            futures = [
-                pool.submit(
-                    _compose_one,
-                    entry,
-                    str(template_path),
-                    batch_id,
-                    mode,
-                    size,
-                    outline_strength,
-                    preserve_logo_pill,
-                    quality,
-                    str(work_dir),
-                    str(output_dir),
-                )
-                for entry in items
-            ]
-            for future in as_completed(futures):
-                result = future.result()
-                if result.get("error"):
-                    # One unusable image must not abort a large batch.
-                    LOGGER.warning("批次 %s 第 %s 张合成失败，已跳过：%s", batch_id, result["index"], result["error"])
-                    status["skipped"].append({"index": result["index"], "error": result["error"]})  # type: ignore[union-attr]
-                else:
-                    status["images"].append({  # type: ignore[union-attr]
-                        "id": f"{result['index']:03d}",
-                        "name": result["name"],
-                        "url": result["url"],
-                    })
-                status["done"] = int(status.get("done", 0)) + 1
+            # Finish all products for one template before starting the next.
+            for template_item in template_items:
+                template_index = int(template_item["index"])
+                status["current_template_index"] = template_index
+                status["current_template_name"] = template_item["name"]
+                status["current_template_mode"] = template_item.get("mode", mode)
                 _write_batch_status(batch_dir, status)
-        status["images"].sort(key=lambda image: str(image["id"]))  # type: ignore[union-attr]
+                template_path = work_dir / str(template_item["work"])
+                entries = [dict(item, index=(template_index - 1) * len(items) + int(item["index"]),
+                                template_index=template_index, template_name=template_item["name"],
+                                product_index=int(item["index"])) for item in items]
+                futures = {pool.submit(_compose_one, entry, str(template_path), batch_id, template_item.get("mode", mode), size,
+                                       outline_strength, preserve_logo_pill, quality, str(work_dir), str(output_dir)): entry
+                           for entry in entries}
+                for future in as_completed(futures):
+                    entry = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = {**entry, "product_name": entry.get("name", entry["stem"]), "error": str(exc) or "处理进程异常"}
+                    metadata = {key: result[key] for key in ("template_index", "template_name", "product_index", "product_name")}
+                    if result.get("error"):
+                        LOGGER.warning("批次 %s 模板 %s 商品 %s 合成失败：%s", batch_id, result["template_index"], result["product_index"], result["error"])
+                        status["skipped"].append({"index": result["index"], **metadata, "error": result["error"]})
+                        status["skipped"].sort(key=lambda item: item["index"])
+                    else:
+                        status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": result["name"], "url": result["url"]})
+                        status["images"].sort(key=lambda image: int(image["id"]))
+                    status["done"] = int(status.get("done", 0)) + 1
+                    _write_batch_status(batch_dir, status)
         if not status["images"]:
             status["status"] = "failed"
             status["error"] = status.get("error") or "没有图片合成成功，请检查模板与商品图"

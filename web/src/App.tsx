@@ -1,8 +1,10 @@
-import { ChangeEvent, DragEvent, KeyboardEvent, useEffect, useRef, useState } from 'react'
+import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useRef, useState } from 'react'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
-type Asset = { file: File; url: string }
-type BatchImage = { id: string; name: string; url: string }
+type TemplateMode = 'auto' | 'overlay' | 'cutout'
+type Asset = { file: File; url: string; templateMode?: TemplateMode; libraryId?: string }
+type BatchImage = { id: string; name: string; url: string; template_index: number; template_name: string; product_index: number; product_name: string }
+type BatchSkipped = { template_index: number; template_name: string; product_index: number; product_name: string; error: string }
 type LightboxImage = { url: string; name: string }
 type TemplateRecord = { id: string; name: string; url: string; thumb_url?: string; source?: string; created_at?: string; size?: number }
 type SlotRect = { x: number; y: number; w: number; h: number }
@@ -41,6 +43,7 @@ function AssetDrop({
   assets,
   accept,
   allowFolder = false,
+  multiple = false,
   onPickFromLibrary,
   onChange,
   onClear,
@@ -51,6 +54,7 @@ function AssetDrop({
   assets: Asset[]
   accept: string
   allowFolder?: boolean
+  multiple?: boolean
   onPickFromLibrary?: () => void
   onChange: (files: File[]) => void
   onClear: () => void
@@ -64,14 +68,14 @@ function AssetDrop({
   const chooseFolder = () => folderInputRef.current?.click()
   const handleInput = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/'))
-    if (files.length) onChange(allowFolder ? files : [files[0]])
+    if (files.length) onChange(allowFolder || multiple ? files : [files[0]])
     event.target.value = ''
   }
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     setDragging(false)
     const files = Array.from(event.dataTransfer.files || []).filter((file) => file.type.startsWith('image/'))
-    if (files.length) onChange(allowFolder ? files : [files[0]])
+    if (files.length) onChange(allowFolder || multiple ? files : [files[0]])
   }
   const handleKey = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === 'Enter' || event.key === ' ') {
@@ -100,7 +104,7 @@ function AssetDrop({
         role={hasAssets ? undefined : 'button'}
         tabIndex={hasAssets ? -1 : 0}
       >
-        <input ref={inputRef} type="file" accept={accept} multiple={allowFolder} onChange={handleInput} hidden />
+        <input ref={inputRef} type="file" accept={accept} multiple={allowFolder || multiple} onChange={handleInput} hidden />
         {allowFolder && <input ref={folderInputRef} type="file" accept={accept} multiple {...{ webkitdirectory: '', directory: '' }} onChange={handleInput} hidden />}
         {hasAssets ? (
           <>
@@ -109,17 +113,17 @@ function AssetDrop({
               {assets.length > 6 && <span className="asset-overflow">+{assets.length - 6}</span>}
             </div>
             <div className="asset-meta">
-              <span className="asset-status"><Icon name="check" size={13} /> {allowFolder ? `${assets.length} 张图片已载入` : '已载入'}</span>
-              <span className="asset-name" title={assets[0].file.name}>{allowFolder ? '批量素材 · 可批量合成' : assets[0].file.name}</span>
+              <span className="asset-status"><Icon name="check" size={13} /> {allowFolder || multiple ? `${assets.length} 张图片已载入` : '已载入'}</span>
+              <span className="asset-name" title={assets[0].file.name}>{allowFolder || multiple ? '按添加顺序处理' : assets[0].file.name}</span>
               {onPickFromLibrary && (
                 <button type="button" className="asset-meta-pick" onClick={(event) => { event.stopPropagation(); onPickFromLibrary() }}>
-                  <Icon name="library" size={11} /> 换模板 · 从模板库选择
+                  <Icon name="library" size={11} /> {multiple ? '添加模板 · 从模板库选择' : '换模板 · 从模板库选择'}
                 </button>
               )}
-              {allowFolder && (
+              {(allowFolder || multiple) && (
                 <span className="asset-meta-add">
                   <button type="button" onClick={(event) => { event.stopPropagation(); choose() }}>继续加图片</button>
-                  <button type="button" onClick={(event) => { event.stopPropagation(); chooseFolder() }}>继续加文件夹</button>
+                  {allowFolder && <button type="button" onClick={(event) => { event.stopPropagation(); chooseFolder() }}>继续加文件夹</button>}
                 </span>
               )}
             </div>
@@ -154,7 +158,7 @@ function AssetDrop({
 
 function TemplateLibrary({
   templates,
-  selectedId,
+  selectedIds,
   loading,
   busy,
   notice,
@@ -163,7 +167,7 @@ function TemplateLibrary({
   onDelete,
 }: {
   templates: TemplateRecord[]
-  selectedId: string | null
+  selectedIds: string[]
   loading: boolean
   busy: boolean
   notice: string
@@ -190,7 +194,7 @@ function TemplateLibrary({
       {templates.length ? (
         <div className="template-grid">
           {templates.map((item) => (
-            <article className={`template-card ${selectedId === item.id ? 'is-selected' : ''}`} key={item.id}>
+            <article className={`template-card ${selectedIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
               <button className="template-card-select" type="button" onClick={() => onSelect(item)} aria-label={`使用模板 ${item.name}`}>
                 <img src={item.thumb_url || item.url} alt={item.name} loading="lazy" />
                 <span className="template-card-check"><Icon name="check" size={11} /></span>
@@ -211,7 +215,7 @@ function TemplateLibrary({
 
 function TemplatePickerModal({
   templates,
-  selectedId,
+  selectedIds,
   loading,
   busy,
   notice,
@@ -221,16 +225,22 @@ function TemplatePickerModal({
   onClose,
 }: {
   templates: TemplateRecord[]
-  selectedId: string | null
+  selectedIds: string[]
   loading: boolean
   busy: boolean
   notice: string
   error: string
-  onPick: (template: TemplateRecord) => void
+  onPick: (templates: TemplateRecord[]) => Promise<boolean>
   onUpload: (files: File[]) => void
   onClose: () => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const [pendingIds, setPendingIds] = useState<string[]>([])
+  const togglePick = (id: string) => setPendingIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
+  const addSelected = async () => {
+    const records = pendingIds.map((id) => templates.find((item) => item.id === id)).filter((item): item is TemplateRecord => Boolean(item))
+    if (records.length && await onPick(records)) onClose()
+  }
   const handleInput = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/'))
     if (files.length) onUpload(files)
@@ -242,7 +252,7 @@ function TemplatePickerModal({
         <div className="lightbox-bar">
           <div>
             <span className="section-label">TEMPLATE LIBRARY</span>
-            <strong>{loading ? '正在读取模板…' : `选择一个模板用于当前合成 · 共 ${templates.length} 个`}</strong>
+            <strong>{loading ? '正在读取模板…' : `多选模板，按点击顺序添加 · 共 ${templates.length} 个`}</strong>
           </div>
           <div className="picker-actions">
             <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleInput} hidden />
@@ -255,12 +265,12 @@ function TemplatePickerModal({
           {templates.length ? (
             <div className="picker-grid">
               {templates.map((item) => (
-                <article className={`template-card ${selectedId === item.id ? 'is-selected' : ''}`} key={item.id}>
-                  <button className="template-card-select" type="button" disabled={busy} onClick={() => onPick(item)} aria-label={`使用模板 ${item.name}`}>
+                <article className={`template-card ${selectedIds.includes(item.id) || pendingIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
+                  <button className="template-card-select" type="button" disabled={busy || selectedIds.includes(item.id)} onClick={() => togglePick(item.id)} aria-pressed={pendingIds.includes(item.id)} aria-label={`${pendingIds.includes(item.id) ? '取消选择' : '选择'}模板 ${item.name}`}>
                     <img src={item.thumb_url || item.url} alt={item.name} loading="lazy" />
                     <span className="template-card-check"><Icon name="check" size={11} /></span>
                   </button>
-                  <div className="template-card-meta"><strong title={item.name}>{item.name}</strong><small>{item.source === 'template_replace' ? '模板替换生成' : '已上传模板'}</small></div>
+                  <div className="template-card-meta"><strong title={item.name}>{item.name}</strong><small>{selectedIds.includes(item.id) ? '已在队列中' : pendingIds.includes(item.id) ? `已选 · 第 ${pendingIds.indexOf(item.id) + 1} 个` : item.source === 'template_replace' ? '模板替换生成' : '已上传模板'}</small></div>
                 </article>
               ))}
             </div>
@@ -270,6 +280,7 @@ function TemplatePickerModal({
             </button>
           )}
         </div>
+        <div className="picker-footer"><span>已选择 {pendingIds.length} 个模板</span><button className="drop-choice slot-confirm" type="button" disabled={busy || !pendingIds.length} onClick={addSelected}>{busy ? '正在添加…' : '添加所选模板'}</button></div>
       </div>
     </div>
   )
@@ -441,13 +452,15 @@ function SlotEditorModal({
 
 function App() {
   const [products, setProducts] = useState<Asset[]>([])
-  const [template, setTemplate] = useState<Asset | null>(null)
-  const [mode, setMode] = useState<Mode>('template_replace')
+  const [templateAssets, setTemplateAssets] = useState<Asset[]>([])
+  const template = templateAssets[0] || null
+  const [mode, setMode] = useState<Mode>('auto')
   const [size, setSize] = useState('1080x1920')
   const [preserveLogo, setPreserveLogo] = useState(true)
   const [resultUrl, setResultUrl] = useState<string | null>(null)
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
-  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
+  const [batchSkipped, setBatchSkipped] = useState<BatchSkipped[]>([])
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number; templateIndex?: number; templateCount?: number; templateName?: string } | null>(null)
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([])
   const [batchDownloadUrl, setBatchDownloadUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -457,7 +470,6 @@ function App() {
   const [demoAvailable, setDemoAvailable] = useState(false)
   const [lightbox, setLightbox] = useState<LightboxImage | null>(null)
   const [templates, setTemplates] = useState<TemplateRecord[]>([])
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
   const [libraryLoading, setLibraryLoading] = useState(true)
   const [libraryBusy, setLibraryBusy] = useState(false)
   const [libraryNotice, setLibraryNotice] = useState('')
@@ -466,12 +478,12 @@ function App() {
   const [slotEditorOpen, setSlotEditorOpen] = useState(false)
   const [resultSavedName, setResultSavedName] = useState<string | null>(null)
   const productsRef = useRef<Asset[]>([])
-  const templateRef = useRef<Asset | null>(null)
+  const templateRef = useRef<Asset[]>([])
   const resultRef = useRef<string | null>(null)
   const noticeTimerRef = useRef<number | null>(null)
 
   useEffect(() => { productsRef.current = products }, [products])
-  useEffect(() => { templateRef.current = template }, [template])
+  useEffect(() => { templateRef.current = templateAssets }, [templateAssets])
   useEffect(() => { resultRef.current = resultUrl }, [resultUrl])
   const flashNotice = (message: string) => {
     setLibraryNotice(message)
@@ -481,7 +493,11 @@ function App() {
   const loadTemplates = async () => {
     try {
       const response = await fetch('/api/templates')
-      if (!response.ok) throw new Error('模板库读取失败')
+      if (!response.ok) {
+        let message = '模板库读取失败'
+        try { const payload = await response.json(); message = payload.detail || message } catch { /* response may not be JSON */ }
+        throw new Error(message)
+      }
       const payload = await response.json() as { templates?: TemplateRecord[] }
       setTemplates(payload.templates || [])
     } catch (cause) {
@@ -516,7 +532,7 @@ function App() {
   }, [])
   useEffect(() => () => {
     productsRef.current.forEach(releaseAsset)
-    releaseAsset(templateRef.current)
+    templateRef.current.forEach(releaseAsset)
     if (resultRef.current) URL.revokeObjectURL(resultRef.current)
     if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
   }, [])
@@ -524,6 +540,7 @@ function App() {
   const resetResult = () => {
     setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
     setBatchImages([])
+    setBatchSkipped([])
     setBatchProgress(null)
     setSelectedBatchIds([])
     setBatchDownloadUrl(null)
@@ -546,15 +563,30 @@ function App() {
     resetResult()
   }
   const replaceTemplate = (file: File) => {
-    releaseAsset(template)
-    setTemplate(makeAsset(file))
-    setSelectedTemplateId(null)
+    templateAssets.forEach(releaseAsset)
+    setTemplateAssets([makeAsset(file)])
     setManualSlot(null)
     setError('')
     resetResult()
   }
+  const appendTemplates = (files: File[]) => {
+    setTemplateAssets((current) => [...current, ...files.map(makeAsset)])
+    setManualSlot(null)
+    setError('')
+    resetResult()
+  }
+  const removeTemplate = (index: number) => {
+    releaseAsset(templateAssets[index])
+    setTemplateAssets(templateAssets.filter((_, i) => i !== index))
+    setManualSlot(null)
+    resetResult()
+  }
+  const setTemplateMode = (url: string, templateMode: TemplateMode) => {
+    setTemplateAssets((current) => current.map((asset) => asset.url === url ? { ...asset, templateMode } : asset))
+    resetResult()
+  }
   const clearProducts = () => { products.forEach(releaseAsset); setProducts([]); resetResult() }
-  const clearTemplate = () => { releaseAsset(template); setTemplate(null); resetResult() }
+  const clearTemplate = () => { templateAssets.forEach(releaseAsset); setTemplateAssets([]); setManualSlot(null); resetResult() }
   const chooseMode = (nextMode: Mode) => {
     setMode(nextMode)
     setError('')
@@ -586,17 +618,24 @@ function App() {
     }
   }
 
-  const selectLibraryTemplate = async (item: TemplateRecord): Promise<boolean> => {
+  const pickFromLibrary = async (items: TemplateRecord[]): Promise<boolean> => {
+    const existing = new Set(templateAssets.map((asset) => asset.libraryId).filter(Boolean))
+    const fresh = items.filter((item) => !existing.has(item.id))
+    if (!fresh.length) return true
     setLibraryBusy(true)
     setError('')
     try {
-      const response = await fetch(item.url)
-      if (!response.ok) throw new Error('模板读取失败')
-      const blob = await response.blob()
-      const suffix = blob.type === 'image/png' ? '.png' : blob.type === 'image/webp' ? '.webp' : '.jpg'
-      replaceTemplate(new File([blob], `${item.name}${suffix}`, { type: blob.type || 'image/jpeg' }))
-      setSelectedTemplateId(item.id)
-      flashNotice(`已选用模板“${item.name}”`)
+      const files = await Promise.all(fresh.map(async (item) => {
+        const response = await fetch(item.url)
+        if (!response.ok) throw new Error(`模板“${item.name}”读取失败`)
+        const blob = await response.blob()
+        const suffix = blob.type === 'image/png' ? '.png' : blob.type === 'image/webp' ? '.webp' : '.jpg'
+        return new File([blob], `${item.name}${suffix}`, { type: blob.type || 'image/jpeg' })
+      }))
+      setTemplateAssets((current) => [...current, ...files.map((file, index) => ({ ...makeAsset(file), libraryId: fresh[index].id }))])
+      setManualSlot(null)
+      resetResult()
+      flashNotice(`已按选择顺序添加 ${fresh.length} 个模板`)
       return true
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '模板读取失败')
@@ -606,11 +645,6 @@ function App() {
     }
   }
 
-  const pickFromLibrary = async (item: TemplateRecord) => {
-    const picked = await selectLibraryTemplate(item)
-    if (picked) setPickerOpen(false)
-  }
-
   const deleteLibraryTemplate = async (item: TemplateRecord) => {
     if (!window.confirm(`确定从模板库删除“${item.name}”吗？`)) return
     setLibraryBusy(true)
@@ -618,7 +652,6 @@ function App() {
     try {
       const response = await fetch(`/api/templates/${item.id}`, { method: 'DELETE' })
       if (!response.ok) throw new Error('模板删除失败')
-      if (selectedTemplateId === item.id) setSelectedTemplateId(null)
       await loadTemplates()
       flashNotice(`已删除“${item.name}”`)
     } catch (cause) {
@@ -674,7 +707,7 @@ function App() {
 
   const compose = async () => {
     const needsProduct = mode !== 'template_replace'
-    const isBatch = needsProduct && products.length > 1
+    const isBatch = templateAssets.length > 1 || (needsProduct && products.length > 1)
     if (!template || (needsProduct && !products.length)) return
     setLoading(true)
     setError('')
@@ -682,8 +715,10 @@ function App() {
     try {
       const body = new FormData()
       if (needsProduct) products.forEach((asset) => body.append(isBatch ? 'products' : 'product', asset.file))
-      body.append('template', template.file)
-      body.append('mode', mode)
+      if (isBatch) templateAssets.forEach((asset) => body.append('templates', asset.file))
+      else body.append('template', template.file)
+      if (isBatch && mode === 'auto') body.append('template_modes', JSON.stringify(templateAssets.map((asset) => asset.templateMode || 'auto')))
+      body.append('mode', mode === 'auto' && !isBatch ? template.templateMode || 'auto' : mode)
       body.append('size', size)
       body.append('outline', '0.78')
       body.append('preserve_logo_pill', String(preserveLogo))
@@ -719,16 +754,21 @@ function App() {
             done: number
             total: number
             images: BatchImage[]
+            skipped?: BatchSkipped[]
+            current_template_index?: number
+            template_count?: number
+            current_template_name?: string
             download_url: string
             error?: string | null
           }
-          setBatchProgress({ done: status.done, total: status.total })
+          setBatchProgress({ done: status.done, total: status.total, templateIndex: status.current_template_index, templateCount: status.template_count, templateName: status.current_template_name })
           if (status.status !== 'done' && status.status !== 'failed') continue
           setBatchProgress(null)
           setBatchImages(status.images || [])
+          setBatchSkipped(status.skipped || [])
           setSelectedBatchIds((status.images || []).map((image) => image.id))
           setBatchDownloadUrl(status.download_url || null)
-          if (status.status === 'failed') throw new Error(status.error || '批量合成失败')
+          if (status.status === 'failed') throw new Error((status.skipped || []).map((item) => `模板 ${item.template_index}「${item.template_name}」 · 商品 ${item.product_index}「${item.product_name}」：${item.error}`).join('；') || status.error || '批量合成失败')
           if (!(status.images || []).length) throw new Error(status.error || '没有图片合成成功，请检查模板与商品图')
           break
         }
@@ -744,6 +784,7 @@ function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '合成失败，请重试')
     } finally {
+      setBatchProgress(null)
       setLoading(false)
     }
   }
@@ -780,23 +821,20 @@ function App() {
           <p className="eyebrow">PRODUCT PHOTO STUDIO</p>
           <h1>把一张食物图，<br /><em>变成可以投放的海报。</em></h1>
         </div>
-        <p className="intro-copy">先用“模板替换”清理网上模板，再用“主体抠图合成”放入自己的商品图。尺寸、版式和文字都会保留。</p>
+        <p className="intro-copy">上传一批商品图和多个模板，智能判断每张模板的合成方式，按顺序生成海报。</p>
       </section>
 
       <section className="workspace" aria-label="图片合成工作台">
-        <aside className="control-panel">
+        <aside className="control-panel"><fieldset className="control-fields" disabled={loading || libraryBusy}>
           <div className="panel-heading">
             <div><span className="section-label">01 / 工作流</span><h2>{mode === 'template_replace' ? '先制作空白模板' : '合成商品海报'}</h2></div>
             {demoAvailable && <button className="text-button" type="button" onClick={loadDemo}><Icon name="spark" size={14} /> 试用示例</button>}
           </div>
-          <TemplateLibrary templates={templates} selectedId={selectedTemplateId} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={selectLibraryTemplate} onDelete={deleteLibraryTemplate} />
+          <TemplateLibrary templates={templates} selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={(item) => { void pickFromLibrary([item]) }} onDelete={deleteLibraryTemplate} />
           <div className="library-divider" />
-          {mode === 'template_replace' ? (
-            <div className="template-only-note"><span className="template-only-icon">✦</span><div><strong>无需上传商品图</strong><small>只清除模板中的商品图片区，保留其他设计</small></div></div>
-          ) : (
-            <AssetDrop number="01" title="商品图" hint="可多次选择累加 · 支持多选与文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
-          )}
-          {mode === 'template_replace' && template && (
+          <AssetDrop number="01" title="商品图" hint="可多次选择累加 · 支持多选与文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
+          {mode === 'template_replace' && <p className="template-mode-note">模板替换只清除每张模板原有的商品区，已上传的商品图会保留供其他合成模式使用。</p>}
+          {mode === 'template_replace' && template && templateAssets.length === 1 && (
             <div className="slot-row">
               <button className="drop-choice" type="button" onClick={() => setSlotEditorOpen(true)}>
                 <Icon name="zoom" size={12} /> {manualSlot ? '重新框选商品区' : '手动框选商品区'}
@@ -811,7 +849,9 @@ function App() {
               )}
             </div>
           )}
-          <AssetDrop number="02" title="模板图" hint="商家活动与品牌信息 · 可从模板库选择" assets={template ? [template] : []} accept="image/png,image/jpeg,image/webp" onPickFromLibrary={() => setPickerOpen(true)} onChange={(files) => replaceTemplate(files[0])} onClear={clearTemplate} />
+          <AssetDrop number="02" title="模板图" hint="可多次添加 · 按添加顺序处理" assets={templateAssets} multiple accept="image/png,image/jpeg,image/webp" onPickFromLibrary={() => setPickerOpen(true)} onChange={appendTemplates} onClear={clearTemplate} />
+          {templateAssets.length > 0 && <ol className={`template-order ${mode === 'auto' ? 'has-mode-select' : ''}`} aria-label="模板处理顺序">{templateAssets.map((asset, index) => <li key={asset.url}><span>{index + 1}</span><strong title={asset.file.name}>{asset.file.name}</strong>{mode === 'auto' && <select className="template-mode-select" aria-label={`模板 ${index + 1} 的合成方式`} value={asset.templateMode || 'auto'} onChange={(event) => setTemplateMode(asset.url, event.target.value as TemplateMode)}><option value="auto">智能判断</option><option value="cutout">主体抠图</option><option value="overlay">模板叠加</option></select>}<button type="button" onClick={() => removeTemplate(index)} aria-label={`移除模板 ${asset.file.name}`}><Icon name="close" size={13} /></button></li>)}</ol>}
+          {mode === 'template_replace' && templateAssets.length > 1 && <p className="template-mode-note">多张模板将依次自动识别商品区并各生成一张空白模板；手动框选适用于单张模板。</p>}
 
           <div className="settings-divider" />
           <div className="panel-heading compact"><div><span className="section-label">02 / 输出</span><h2>合成方式</h2></div></div>
@@ -819,7 +859,7 @@ function App() {
             {([
               ['template_replace', '1 · 模板替换', '自动扣掉商品图，生成绿色占位模板'],
               ['cutout', '2 · 主体抠图合成', '上传商品图 + 空白模板，按比例嵌入'],
-              ['auto', '智能判断', '兼容旧流程，自动选择处理方式'],
+              ['auto', '智能判断 · 推荐', '逐个识别模板；也可为每张模板指定方式'],
               ['overlay', '模板叠加', '保留 PNG 透明层，叠加 Logo 与文案'],
             ] as [Mode, string, string][]).map(([value, label, description]) => (
               <button key={value} className={`mode-option workflow-option ${mode === value ? 'is-selected' : ''}`} type="button" role="radio" aria-checked={mode === value} onClick={() => chooseMode(value)}>
@@ -841,10 +881,10 @@ function App() {
           </label>
           {error && <div className="error-message" role="alert">{error}</div>}
           <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading} onClick={compose}>
-            {loading ? <><span className="button-loader" /> 正在处理</> : <>{mode === 'template_replace' ? '生成空白模板' : products.length > 1 ? `批量合成 ${products.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
+            {loading ? <><span className="button-loader" /> 正在处理</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
           <p className="privacy-note"><span className="lock-dot" /> 图片只在本地 Python 引擎中处理</p>
-        </aside>
+        </fieldset></aside>
 
         <section className={`preview-panel ${resultUrl || hasBatch ? 'has-result' : ''}`} aria-live="polite">
           <div className="preview-topline">
@@ -862,7 +902,8 @@ function App() {
                 <span className="batch-progress-icon"><Icon name="refresh" size={26} /></span>
                 <strong>正在后台合成 {batchProgress.done} / {batchProgress.total} 张</strong>
                 <div className="batch-progress-bar"><i style={{ width: `${batchProgress.total ? Math.round((batchProgress.done / batchProgress.total) * 100) : 0}%` }} /></div>
-                <span>数量不再受限 · 服务器后台处理中，保持页面打开即可</span>
+                {batchProgress.templateIndex && <span>正在处理第 {batchProgress.templateIndex} / {batchProgress.templateCount} 个模板：{batchProgress.templateName}</span>}
+                <span>{mode === 'template_replace' ? '按模板顺序生成空白模板' : '每张模板处理完全部商品后，再开始下一张模板'}</span>
               </div>
             ) : hasBatch ? (
               <div className="batch-preview">
@@ -873,11 +914,14 @@ function App() {
                     <button type="button" className="toolbar-button" onClick={clearBatchSelection} disabled={!selectedBatchIds.length}>取消全选</button>
                   </div>
                 </div>
+                {batchSkipped.length > 0 && <div className="batch-skipped" role="alert"><strong>{batchSkipped.length} 张合成失败，其他图片已保留：</strong>{batchSkipped.map((item) => <div key={`${item.template_index}-${item.product_index}`}>模板 {item.template_index}「{item.template_name}」{lastMode === 'template_replace' ? '' : ` · 商品 ${item.product_index}「${item.product_name}」`}：{item.error}</div>)}</div>}
                 <div className={`batch-grid ${isLandscape ? 'is-landscape' : 'is-portrait'}`}>
                   {batchImages.map((image, index) => {
                     const selected = selectedBatchIds.includes(image.id)
                     return (
-                      <article className={`batch-card ${selected ? 'is-selected' : ''}`} key={image.id}>
+                      <Fragment key={image.id}>
+                      {(index === 0 || batchImages[index - 1].template_index !== image.template_index) && <div className="batch-group-title">模板 {image.template_index} · {image.template_name}</div>}
+                      <article className={`batch-card ${selected ? 'is-selected' : ''}`}>
                         <label className="batch-check" aria-label={`${selected ? '取消选择' : '选择'} ${image.name}`}>
                           <input type="checkbox" checked={selected} onChange={() => toggleBatchSelection(image.id)} />
                           <span><Icon name="check" size={12} /></span>
@@ -888,10 +932,11 @@ function App() {
                         </button>
                         <div className="batch-card-meta">
                           <span>{String(index + 1).padStart(2, '0')}</span>
-                          <span title={image.name}>{image.name}</span>
+                          <span title={`模板 ${image.template_index}：${image.template_name} · 商品 ${image.product_index}：${image.product_name}`}>模板 {image.template_index} · {image.template_name}<br />{lastMode === 'template_replace' ? '空白模板' : `商品 ${image.product_index} · ${image.product_name}`}</span>
                           <a href={image.url} download={image.name} aria-label={`下载 ${image.name}`}><Icon name="download" size={14} /></a>
                         </div>
                       </article>
+                      </Fragment>
                     )
                   })}
                 </div>
@@ -920,7 +965,7 @@ function App() {
               </div>
             </div>
           ) : (
-              <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板。自动识别不准时用“手动框选商品区”画个大致范围，后台会自动补全到完整商品区并精修边界。' : '智能判断会优先使用模板透明层，再识别商品占位区域，商品图按比例铺满。'}</div>
+              <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板。自动识别不准时用“手动框选商品区”画个大致范围，后台会自动补全到完整商品区并精修边界。' : '智能判断会分别识别每张模板，自动选择主体抠图或模板叠加；识别不理想时可在模板列表中指定方式。'}</div>
           )}
         </section>
       </section>
@@ -928,7 +973,7 @@ function App() {
       {pickerOpen && (
         <TemplatePickerModal
           templates={templates}
-          selectedId={selectedTemplateId}
+          selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])}
           loading={libraryLoading}
           busy={libraryBusy}
           notice={libraryNotice}
