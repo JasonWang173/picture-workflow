@@ -48,7 +48,7 @@ class OssRestTest(unittest.TestCase):
         self.assertEqual(self.requests[0].get_header('Content-type'), 'application/json')
 
     def test_missing_key_and_invalid_endpoint(self):
-        error = HTTPError('https://example.com', 404, 'not found', {}, None)
+        error = HTTPError('https://example.com', 404, 'not found', {}, io.BytesIO())
         with patch('urllib.request.urlopen', side_effect=error):
             with self.assertRaises(oss_rest.NoSuchKey):
                 self.bucket.get_object('missing')
