@@ -140,6 +140,17 @@ class BatchCompositionTest(unittest.TestCase):
         self.assertEqual([item['template_index'] for item in status['images']], [1, 2, 3])
         self.assertTrue(all(event[3] == 'template_replace' for event in self.events if event[0] == 'start'))
 
+    def test_single_manual_template_uses_async_task_and_preserves_slot(self):
+        files = [('templates', ('one.png', picture((255, 0, 0)), 'image/png'))]
+        with patch.object(server, 'compose', side_effect=self.fake_compose) as composer:
+            response = self.client.post('/api/compose-batch', files=files, data={'mode': 'template_replace', 'slot': '.1,.2,.7,.6'})
+            self.assertEqual(response.status_code, 200, response.text)
+            status = self.client.get(response.json()['status_url']).json()
+            self.assertEqual((status['status'], status['total'], status['done']), ('done', 1, 1))
+            self.assertEqual(composer.call_args.kwargs['manual_slot'], (.1, .2, .7, .6))
+        response = self.client.post('/api/compose-batch', files=files*2, data={'mode': 'template_replace', 'slot': '.1,.2,.7,.6'})
+        self.assertEqual(response.status_code, 400)
+
     def test_legacy_single_template(self):
         files = [('template', ('one.png', picture((255, 0, 0)), 'image/png')),
                  ('products', ('one.png', picture((0, 255, 0)), 'image/png'))]

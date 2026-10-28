@@ -308,3 +308,17 @@ select option { background: #1c1f1c; }
 
 .picker-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 19px; border-top: 1px solid #2c302d; color: #bfc5b9; font-size: 11px; }
 .picker-grid .template-card-select:disabled { cursor: default; }
+
+.processing-steps { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px 16px; margin: 0 0 8px; padding: 0; list-style: none; font-size: 11px; }
+.processing-steps li { display: flex; align-items: center; gap: 6px; color: #697063; }
+.processing-steps li > span { display: grid; place-items: center; width: 22px; height: 22px; border: 1px solid #454b40; border-radius: 50%; font-size: 10px; }
+.processing-steps .is-current { color: #f3b08b; }
+.processing-steps .is-current > span { border-color: #e7835e; background: #30221a; }
+.processing-steps .is-complete { color: #b8d5a1; }
+.processing-steps .is-complete > span { border-color: #657e52; }
+.batch-progress { width: 100%; padding: 20px 12px; }
+.batch-progress-icon { font-size: 32px; }
+.batch-progress-bar.is-indeterminate i { width: 32%; animation: progress-sweep 1.4s ease-in-out infinite; }
+.upload-byte-count { color: #b6bcaf; font-family: 'DM Mono', monospace; font-size: 11px; }
+@keyframes progress-sweep { from { transform: translateX(-110%); } to { transform: translateX(420%); } }
+@media (prefers-reduced-motion: reduce) { .batch-progress-icon, .batch-progress-bar.is-indeterminate i { animation: none; } }

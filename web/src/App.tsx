@@ -1,4 +1,6 @@
 import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useRef, useState } from 'react'
+import { submitComposition, type SubmissionProgress } from './compositionRequest'
+import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
 type TemplateMode = 'auto' | 'overlay' | 'cutout'
@@ -460,7 +462,8 @@ function App() {
   const [resultUrl, setResultUrl] = useState<string | null>(null)
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
   const [batchSkipped, setBatchSkipped] = useState<BatchSkipped[]>([])
-  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number; templateIndex?: number; templateCount?: number; templateName?: string } | null>(null)
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null)
+  const [submissionProgress, setSubmissionProgress] = useState<SubmissionProgress | null>(null)
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([])
   const [batchDownloadUrl, setBatchDownloadUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -555,6 +558,7 @@ function App() {
     resetResult()
   }
   const appendProducts = (files: File[]) => {
+    if (loading) return
     setError('')
     const seen = new Set(products.map((asset) => `${asset.file.name}:${asset.file.size}`))
     const fresh = files.filter((file) => !seen.has(`${file.name}:${file.size}`))
@@ -570,6 +574,7 @@ function App() {
     resetResult()
   }
   const appendTemplates = (files: File[]) => {
+    if (loading) return
     setTemplateAssets((current) => [...current, ...files.map(makeAsset)])
     setManualSlot(null)
     setError('')
@@ -708,82 +713,79 @@ function App() {
   const compose = async () => {
     const needsProduct = mode !== 'template_replace'
     const isBatch = templateAssets.length > 1 || (needsProduct && products.length > 1)
-    if (!template || (needsProduct && !products.length)) return
+    if (loading || !template || (needsProduct && !products.length)) return
+    resetResult()
     setLoading(true)
     setError('')
-    setResultSavedName(null)
+    setSubmissionProgress({ stage: 'uploading', loaded: 0, total: null })
     try {
       const body = new FormData()
-      if (needsProduct) products.forEach((asset) => body.append(isBatch ? 'products' : 'product', asset.file))
-      if (isBatch) templateAssets.forEach((asset) => body.append('templates', asset.file))
-      else body.append('template', template.file)
-      if (isBatch && mode === 'auto') body.append('template_modes', JSON.stringify(templateAssets.map((asset) => asset.templateMode || 'auto')))
-      body.append('mode', mode === 'auto' && !isBatch ? template.templateMode || 'auto' : mode)
+      if (needsProduct) products.forEach((asset) => body.append('products', asset.file))
+      templateAssets.forEach((asset) => body.append('templates', asset.file))
+      if (mode === 'auto') body.append('template_modes', JSON.stringify(templateAssets.map((asset) => asset.templateMode || 'auto')))
+      body.append('mode', mode)
       body.append('size', size)
       body.append('outline', '0.78')
       body.append('preserve_logo_pill', String(preserveLogo))
       body.append('quality', '100')
-      if (mode === 'template_replace' && manualSlot) {
+      if (mode === 'template_replace' && templateAssets.length === 1 && manualSlot) {
         body.append('slot', `${manualSlot.x.toFixed(4)},${manualSlot.y.toFixed(4)},${manualSlot.w.toFixed(4)},${manualSlot.h.toFixed(4)}`)
       }
-      const response = await fetch(isBatch ? '/api/compose-batch' : '/api/compose', { method: 'POST', body })
-      if (!response.ok) {
-        let message = '合成失败，请检查图片后重试'
-        try { const payload = await response.json(); message = payload.detail || message } catch { /* response may not be JSON */ }
-        throw new Error(message)
+      // A one-image task also uses the asynchronous API so its processing stage
+      // is real server progress, while keeping the single-result preview.
+      const payload = await submitComposition(body, setSubmissionProgress)
+      setSubmissionProgress(null)
+      setBatchProgress({ done: 0, total: payload.total, status: 'queued' })
+      let statusFailures = 0
+      type StatusPayload = {
+        status: string; done: number; total: number; images: BatchImage[]; skipped?: BatchSkipped[]
+        current_template_index?: number; template_count?: number; current_template_name?: string
+        download_url: string; error?: string | null
       }
-      if (isBatch) {
-        const payload = await response.json() as { batch_id: string; total: number; status_url: string }
-        setBatchImages([])
-        setSelectedBatchIds([])
-        setBatchDownloadUrl(null)
-        setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
-        setBatchProgress({ done: 0, total: payload.total })
-        let statusFailures = 0
-        for (;;) {
-          await new Promise((resolve) => setTimeout(resolve, 1500))
+      for (;;) {
+        let status: StatusPayload
+        try {
           const statusResponse = await fetch(payload.status_url)
-          if (!statusResponse.ok) {
-            statusFailures += 1
-            if (statusFailures > 6) throw new Error('批次状态读取失败')
-            continue
-          }
-          statusFailures = 0
-          const status = await statusResponse.json() as {
-            status: string
-            done: number
-            total: number
-            images: BatchImage[]
-            skipped?: BatchSkipped[]
-            current_template_index?: number
-            template_count?: number
-            current_template_name?: string
-            download_url: string
-            error?: string | null
-          }
-          setBatchProgress({ done: status.done, total: status.total, templateIndex: status.current_template_index, templateCount: status.template_count, templateName: status.current_template_name })
-          if (status.status !== 'done' && status.status !== 'failed') continue
-          setBatchProgress(null)
-          setBatchImages(status.images || [])
+          if (!statusResponse.ok) throw new Error('批次状态读取失败')
+          status = await statusResponse.json() as StatusPayload
+        } catch {
+          statusFailures += 1
+          if (statusFailures > 6) throw new Error('批次状态读取失败，请检查网络后重试')
+          await new Promise((resolve) => setTimeout(resolve, 1500))
+          continue
+        }
+        statusFailures = 0
+        if (!['queued', 'processing', 'done', 'failed'].includes(status.status)) throw new Error('服务器返回的任务状态不正确，请重试')
+        setBatchProgress({ done: status.done, total: status.total, status: status.status, templateIndex: status.current_template_index, templateCount: status.template_count, templateName: status.current_template_name })
+        if (status.status === 'done' || status.status === 'failed') {
+          const images = status.images || []
+          setLastMode(mode)
+          setLastSize(size)
           setBatchSkipped(status.skipped || [])
-          setSelectedBatchIds((status.images || []).map((image) => image.id))
-          setBatchDownloadUrl(status.download_url || null)
-          if (status.status === 'failed') throw new Error((status.skipped || []).map((item) => `模板 ${item.template_index}「${item.template_name}」 · 商品 ${item.product_index}「${item.product_name}」：${item.error}`).join('；') || status.error || '批量合成失败')
-          if (!(status.images || []).length) throw new Error(status.error || '没有图片合成成功，请检查模板与商品图')
+          if (isBatch) {
+            setBatchImages(images)
+            setSelectedBatchIds(images.map((image) => image.id))
+            setBatchDownloadUrl(status.download_url || null)
+          }
+          if (status.status === 'failed' || !images.length) throw new Error(status.error || '没有图片合成成功，请检查模板与商品图')
+          if (!isBatch) {
+            try {
+              const imageResponse = await fetch(images[0].url)
+              if (!imageResponse.ok) throw new Error('图片读取失败')
+              const blob = await imageResponse.blob()
+              setResultUrl(URL.createObjectURL(blob))
+            } catch {
+              throw new Error('合成已完成，但结果图片读取失败，请重试')
+            }
+          }
           break
         }
-      } else {
-        const blob = await response.blob()
-        setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return URL.createObjectURL(blob) })
-        setBatchImages([])
-        setSelectedBatchIds([])
-        setBatchDownloadUrl(null)
+        await new Promise((resolve) => setTimeout(resolve, 1500))
       }
-      setLastMode(mode)
-      setLastSize(size)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '合成失败，请重试')
     } finally {
+      setSubmissionProgress(null)
       setBatchProgress(null)
       setLoading(false)
     }
@@ -881,30 +883,24 @@ function App() {
           </label>
           {error && <div className="error-message" role="alert">{error}</div>}
           <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading} onClick={compose}>
-            {loading ? <><span className="button-loader" /> 正在处理</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
+            {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
           <p className="privacy-note"><span className="lock-dot" /> 图片只在本地 Python 引擎中处理</p>
         </fieldset></aside>
 
         <section className={`preview-panel ${resultUrl || hasBatch ? 'has-result' : ''}`} aria-live="polite">
           <div className="preview-topline">
-            <div><span className="section-label">03 / 预览</span><h2>{resultUrl ? '合成完成' : batchProgress ? '批量合成中' : hasBatch ? '批量合成完成' : '结果会出现在这里'}</h2></div>
+            <div><span className="section-label">03 / 预览</span><h2>{loading ? submissionProgress?.stage === 'uploading' ? '正在上传图片' : submissionProgress?.stage === 'preparing' ? '服务器准备任务' : '正在合成' : resultUrl ? '合成完成' : hasBatch ? '批量合成完成' : '结果会出现在这里'}</h2></div>
             {(resultUrl || hasBatch) && <span className="result-badge"><Icon name="check" size={13} /> READY</span>}
           </div>
           <div className="preview-stage">
-            {resultUrl ? (
+            {loading ? (
+              <ProcessingProgress submission={submissionProgress} batch={batchProgress} templateOnly={mode === 'template_replace'} />
+            ) : resultUrl ? (
               <button className="result-preview-button" type="button" onClick={() => setLightbox({ url: resultUrl, name: '合成海报.jpg' })} aria-label="点击放大查看合成海报">
                 <img className="result-image" src={resultUrl} alt="合成后的海报" />
                 <span className="preview-zoom-hint"><Icon name="zoom" size={14} /> 点击放大</span>
               </button>
-            ) : batchProgress ? (
-              <div className="batch-progress">
-                <span className="batch-progress-icon"><Icon name="refresh" size={26} /></span>
-                <strong>正在后台合成 {batchProgress.done} / {batchProgress.total} 张</strong>
-                <div className="batch-progress-bar"><i style={{ width: `${batchProgress.total ? Math.round((batchProgress.done / batchProgress.total) * 100) : 0}%` }} /></div>
-                {batchProgress.templateIndex && <span>正在处理第 {batchProgress.templateIndex} / {batchProgress.templateCount} 个模板：{batchProgress.templateName}</span>}
-                <span>{mode === 'template_replace' ? '按模板顺序生成空白模板' : '每张模板处理完全部商品后，再开始下一张模板'}</span>
-              </div>
             ) : hasBatch ? (
               <div className="batch-preview">
                 <div className="batch-toolbar">

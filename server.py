@@ -527,6 +527,7 @@ async def create_batch_composition(
     outline: Annotated[float, Form()] = 0.78,
     preserve_logo_pill: Annotated[bool, Form()] = True,
     quality: Annotated[int, Form()] = 100,
+    slot: Annotated[Optional[str], Form()] = None,
 ) -> JSONResponse:
     """Accept a batch upload and compose it in the background; poll /status for progress."""
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
@@ -541,6 +542,9 @@ async def create_batch_composition(
     if not image_templates or any(not upload.filename or Path(upload.filename).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"} for upload in image_templates):
         raise HTTPException(status_code=400, detail="请上传有效的模板图片")
 
+    manual_slot = _parse_manual_slot(slot)
+    if manual_slot is not None and (mode != "template_replace" or len(image_templates) != 1):
+        raise HTTPException(status_code=400, detail="手动框选区域仅单张模板替换可用")
     requested_modes = [mode] * len(image_templates)
     if template_modes is not None:
         try:
@@ -565,7 +569,7 @@ async def create_batch_composition(
             template_path = work_dir / f"template-{index:04d}{_safe_upload_suffix(upload.filename, '.jpg')}"
             total_upload_bytes += await _write_upload(upload, template_path, current_total=total_upload_bytes, total_limit=MAX_BATCH_UPLOAD_BYTES)
             name = Path(_repair_latin1_utf8(upload.filename) or f"模板{index}").stem
-            manifest_templates.append({"index": index, "work": template_path.name, "name": name, "mode": requested_modes[index - 1]})
+            manifest_templates.append({"index": index, "work": template_path.name, "name": name, "mode": requested_modes[index - 1], "slot": manual_slot})
         for index, upload in enumerate(image_products, start=1):
             product_path = work_dir / f"product-{index:03d}{_safe_upload_suffix(upload.filename, '.png')}"
             total_upload_bytes += await _write_upload(
@@ -642,6 +646,7 @@ def _compose_one(
             preserve_logo_pill=preserve_logo_pill,
             outline_strength=outline_strength,
             quality=quality,
+            manual_slot=item.get("manual_slot"),
         )
     except Exception as exc:
         return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "error": str(exc)}
@@ -699,7 +704,7 @@ def _run_batch_composition(
             template_path = work_dir / str(template_item["work"])
             entries = [dict(item, index=(template_index - 1) * len(items) + int(item["index"]),
                             template_index=template_index, template_name=template_item["name"],
-                            product_index=int(item["index"])) for item in items]
+                            product_index=int(item["index"]), manual_slot=tuple(template_item["slot"]) if template_item.get("slot") is not None else None) for item in items]
             pending_entries = iter(entries)
             futures = {}
             def submit_next():
