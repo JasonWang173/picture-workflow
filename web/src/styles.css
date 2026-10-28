@@ -60,7 +60,8 @@ h1 em { color: #f5b597; font-style: normal; }
 .library-upload { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border: 1px solid #535b50; color: #c8c9c1; background: #20241f; font-size: 10px; white-space: nowrap; }
 .library-upload:hover:not(:disabled) { color: #f6c1a7; border-color: #b46040; }
 .library-upload:disabled { cursor: wait; opacity: .55; }
-.template-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin-top: 12px; }
+.template-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: start; gap: 7px; max-height: min(420px, 50vh); overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #68745f #111411; margin-top: 12px; padding: 2px 5px 2px 2px; }
+.template-grid:focus-visible { outline: 1px solid #e7835e; outline-offset: 3px; }
 .template-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid #353c34; background: #111411; transition: border-color .18s, box-shadow .18s; }
 .template-card.is-selected { border-color: #e07b55; box-shadow: 0 0 0 1px rgba(224,123,85,.28); }
 .template-card-select { position: relative; display: block; width: 100%; padding: 0; border: 0; color: inherit; background: #111411; text-align: left; cursor: pointer; }
@@ -276,7 +277,7 @@ select option { background: #1c1f1c; }
   .batch-toolbar { align-items: flex-start; flex-direction: column; }
   .batch-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; max-height: 480px; }
   .batch-download-actions { flex-wrap: wrap; justify-content: flex-end; }
-  .template-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .template-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: min(360px, 50vh); }
   .result-actions { align-items: flex-start; gap: 13px; flex-direction: column; }
   .result-download-actions { justify-content: flex-start; }
   .result-preview-button { padding: 10px; }

@@ -184,7 +184,7 @@ function TemplateLibrary({
   return (
     <section className="template-library" aria-label="模板库">
       <div className="library-heading">
-        <div className="library-title"><span className="library-icon"><Icon name="library" size={15} /></span><div><strong>模板库</strong><small>{loading ? '正在读取模板…' : `${templates.length} 个模板可用 · 点卡片即可选用`}</small></div></div>
+        <div className="library-title"><span className="library-icon"><Icon name="library" size={15} /></span><div><strong>模板库</strong><small>{loading ? '正在读取模板…' : `${templates.length} 个模板 · 上下滚动，点击添加`}</small></div></div>
         <>
           <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleInput} hidden />
           <button className="library-upload" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><Icon name="upload" size={13} /> {busy ? '保存中' : '上传模板'}</button>
@@ -192,7 +192,7 @@ function TemplateLibrary({
       </div>
       {notice && <p className="library-notice"><Icon name="check" size={11} /> {notice}</p>}
       {templates.length ? (
-        <div className="template-grid">
+        <div className="template-grid" role="region" aria-label="可上下滚动的模板列表" tabIndex={0}>
           {templates.map((item) => (
             <article className={`template-card ${selectedIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
               <button className="template-card-select" type="button" onClick={() => onSelect(item)} aria-label={`使用模板 ${item.name}`}>
