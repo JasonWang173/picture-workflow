@@ -1,6 +1,7 @@
 import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useRef, useState } from 'react'
 import { submitComposition, type SubmissionProgress } from './compositionRequest'
 import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
+import { ProductSelection } from './productSelection'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
 type TemplateMode = 'auto' | 'overlay' | 'cutout'
@@ -454,6 +455,8 @@ function SlotEditorModal({
 
 function App() {
   const [products, setProducts] = useState<Asset[]>([])
+  const [productChecking, setProductChecking] = useState(false)
+  const [productNotice, setProductNotice] = useState('')
   const [templateAssets, setTemplateAssets] = useState<Asset[]>([])
   const template = templateAssets[0] || null
   const [mode, setMode] = useState<Mode>('auto')
@@ -480,12 +483,15 @@ function App() {
   const [manualSlot, setManualSlot] = useState<SlotRect | null>(null)
   const [slotEditorOpen, setSlotEditorOpen] = useState(false)
   const [resultSavedName, setResultSavedName] = useState<string | null>(null)
+  const productSelectionRef = useRef<ProductSelection | null>(null)
+  if (!productSelectionRef.current) productSelectionRef.current = new ProductSelection()
+  const productSelection = productSelectionRef.current
+  const mountedRef = useRef(true)
   const productsRef = useRef<Asset[]>([])
   const templateRef = useRef<Asset[]>([])
   const resultRef = useRef<string | null>(null)
   const noticeTimerRef = useRef<number | null>(null)
 
-  useEffect(() => { productsRef.current = products }, [products])
   useEffect(() => { templateRef.current = templateAssets }, [templateAssets])
   useEffect(() => { resultRef.current = resultUrl }, [resultUrl])
   const flashNotice = (message: string) => {
@@ -533,11 +539,16 @@ function App() {
       .then((payload: { available: boolean }) => setDemoAvailable(payload.available))
       .catch(() => setDemoAvailable(false))
   }, [])
-  useEffect(() => () => {
-    productsRef.current.forEach(releaseAsset)
-    templateRef.current.forEach(releaseAsset)
-    if (resultRef.current) URL.revokeObjectURL(resultRef.current)
-    if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      productSelection.clear()
+      productsRef.current.forEach(releaseAsset)
+      templateRef.current.forEach(releaseAsset)
+      if (resultRef.current) URL.revokeObjectURL(resultRef.current)
+      if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
+    }
   }, [])
 
   const resetResult = () => {
@@ -551,20 +562,37 @@ function App() {
     setLastSize(null)
     setResultSavedName(null)
   }
-  const replaceProducts = (files: File[]) => {
-    products.forEach(releaseAsset)
-    setProducts(files.map(makeAsset))
+  const appendProducts = async (files: File[]) => {
+    if (loading || !files.length) return
+    const version = productSelection.version
+    const active = () => mountedRef.current && productSelection.version === version
     setError('')
-    resetResult()
+    setProductChecking(true)
+    try {
+      const result = await productSelection.append(files, (checked, total) => {
+        if (active()) setProductNotice(`正在检查重复图片 ${checked} / ${total}…`)
+      })
+      if (!active() || result.cancelled) return
+      if (result.added.length) {
+        const next = [...productsRef.current, ...result.added.map(makeAsset)]
+        productsRef.current = next
+        setProducts(next)
+        resetResult()
+      }
+      setProductNotice(`本次新增 ${result.added.length} 张${result.duplicates ? `，已自动去除 ${result.duplicates} 张重复图片` : ''}；现有 ${productsRef.current.length} 张商品图${result.failed.length ? `。${result.failed.length} 张图片读取失败或超过像素限制，未添加` : ''}`)
+    } catch {
+      if (active()) setError('商品图检查失败，请重新选择图片')
+    } finally {
+      if (active()) setProductChecking(productSelection.pending > 0)
+    }
   }
-  const appendProducts = (files: File[]) => {
-    if (loading) return
-    setError('')
-    const seen = new Set(products.map((asset) => `${asset.file.name}:${asset.file.size}`))
-    const fresh = files.filter((file) => !seen.has(`${file.name}:${file.size}`))
-    if (!fresh.length) return
-    setProducts([...products, ...fresh.map(makeAsset)])
+  const replaceProducts = async (files: File[]) => {
+    productSelection.clear()
+    productsRef.current.forEach(releaseAsset)
+    productsRef.current = []
+    setProducts([])
     resetResult()
+    await appendProducts(files)
   }
   const replaceTemplate = (file: File) => {
     templateAssets.forEach(releaseAsset)
@@ -590,7 +618,7 @@ function App() {
     setTemplateAssets((current) => current.map((asset) => asset.url === url ? { ...asset, templateMode } : asset))
     resetResult()
   }
-  const clearProducts = () => { products.forEach(releaseAsset); setProducts([]); resetResult() }
+  const clearProducts = () => { productSelection.clear(); productsRef.current.forEach(releaseAsset); productsRef.current = []; setProducts([]); setProductChecking(false); setProductNotice(''); resetResult() }
   const clearTemplate = () => { templateAssets.forEach(releaseAsset); setTemplateAssets([]); setManualSlot(null); resetResult() }
   const chooseMode = (nextMode: Mode) => {
     setMode(nextMode)
@@ -703,7 +731,7 @@ function App() {
       ])
       if (!productResponse.ok || !templateResponse.ok) throw new Error('示例素材不可用')
       const [productBlob, templateBlob] = await Promise.all([productResponse.blob(), templateResponse.blob()])
-      replaceProducts([new File([productBlob], '商品示例.png', { type: productBlob.type })])
+      await replaceProducts([new File([productBlob], '商品示例.png', { type: productBlob.type })])
       replaceTemplate(new File([templateBlob], '模板示例.jpg', { type: templateBlob.type }))
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '加载示例失败')
@@ -713,7 +741,7 @@ function App() {
   const compose = async () => {
     const needsProduct = mode !== 'template_replace'
     const isBatch = templateAssets.length > 1 || (needsProduct && products.length > 1)
-    if (loading || !template || (needsProduct && !products.length)) return
+    if (loading || productChecking || !template || (needsProduct && !products.length)) return
     resetResult()
     setLoading(true)
     setError('')
@@ -834,7 +862,8 @@ function App() {
           </div>
           <TemplateLibrary templates={templates} selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={(item) => { void pickFromLibrary([item]) }} onDelete={deleteLibraryTemplate} />
           <div className="library-divider" />
-          <AssetDrop number="01" title="商品图" hint="可多次选择累加 · 支持多选与文件夹" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
+          <AssetDrop number="01" title="商品图" hint="支持多选与文件夹 · 自动去除重复图片" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
+          {productNotice && <p className={`product-notice ${productChecking ? 'is-checking' : ''}`} role="status">{productChecking && <span className="button-loader" />}{productNotice}</p>}
           {mode === 'template_replace' && <p className="template-mode-note">模板替换只清除每张模板原有的商品区，已上传的商品图会保留供其他合成模式使用。</p>}
           {mode === 'template_replace' && template && templateAssets.length === 1 && (
             <div className="slot-row">
@@ -882,7 +911,7 @@ function App() {
             <span className="switch-ui" aria-hidden="true"><i /></span>
           </label>
           {error && <div className="error-message" role="alert">{error}</div>}
-          <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading} onClick={compose}>
+          <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading || productChecking} onClick={compose}>
             {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
           <p className="privacy-note"><span className="lock-dot" /> 图片只在本地 Python 引擎中处理</p>

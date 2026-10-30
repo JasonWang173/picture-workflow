@@ -322,3 +322,6 @@ select option { background: #1c1f1c; }
 .upload-byte-count { color: #b6bcaf; font-family: 'DM Mono', monospace; font-size: 11px; }
 @keyframes progress-sweep { from { transform: translateX(-110%); } to { transform: translateX(420%); } }
 @media (prefers-reduced-motion: reduce) { .batch-progress-icon, .batch-progress-bar.is-indeterminate i { animation: none; } }
+
+.product-notice { display: flex; align-items: center; gap: 7px; margin: 9px 0 0; color: #b8d5a1; font-size: 11px; line-height: 1.6; }
+.product-notice.is-checking { color: #e8bb94; }
