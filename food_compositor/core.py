@@ -1075,51 +1075,31 @@ def _manual_slot(
     return (x0, y0, x1, y1), mask
 
 
-def _refine_manual_slot(
+def _manual_slot_for_contain(
     template: Image.Image,
     slot: tuple[float, float, float, float],
+    size: tuple[int, int],
 ) -> tuple[tuple[int, int, int, int], Image.Image]:
-    """Treat the drawn rectangle as a hint and snap it to the real product panel.
-
-    Stage 1 completes sloppy framing: a whole-image detection that contains
-    most of the drawn box (and is meaningfully covered by it) wins, so an
-    incomplete rectangle expands to the full panel boundaries.
-    Stage 2 re-runs detection inside the drawn crop for sub-region snapping.
-    Stage 3 falls back to the exact drawn rectangle.
-    """
-    width, height = template.size
+    """Map a manual selection to the contained page without interpolating its edge."""
     (x0, y0, x1, y1), _ = _manual_slot(template, slot)
-    drawn_area = max(1, (x1 - x0) * (y1 - y0))
-    detected_full = _template_replace_slot(template, include_frame=True)
-    if detected_full is not None:
-        (fx0, fy0, fx1, fy1), _ = detected_full
-        overlap = max(0, min(fx1, x1) - max(fx0, x0)) * max(0, min(fy1, y1) - max(fy0, y0))
-        full_area = max(1, (fx1 - fx0) * (fy1 - fy0))
-        if overlap / drawn_area >= 0.6 and drawn_area / full_area >= 0.35:
-            return detected_full
-    margin_x = max(6, int(round(width * 0.02)))
-    margin_y = max(6, int(round(height * 0.02)))
-    cx0 = max(0, x0 - margin_x)
-    cy0 = max(0, y0 - margin_y)
-    cx1 = min(width, x1 + margin_x)
-    cy1 = min(height, y1 + margin_y)
-    try:
-        detected = _template_replace_slot(template.crop((cx0, cy0, cx1, cy1)), include_frame=True)
-    except Exception:
-        LOGGER.warning("框选区域内精修识别失败，使用原始框", exc_info=True)
-        detected = None
-    if detected is not None:
-        (dx0, dy0, dx1, dy1), crop_mask = detected
-        crop_w, crop_h = cx1 - cx0, cy1 - cy0
-        fills_crop = dx0 <= 1 and dy0 <= 1 and dx1 >= crop_w - 1 and dy1 >= crop_h - 1
-        rx0, ry0, rx1, ry1 = cx0 + dx0, cy0 + dy0, cx0 + dx1, cy0 + dy1
-        overlap = max(0, min(rx1, x1) - max(rx0, x0)) * max(0, min(ry1, y1) - max(ry0, y0))
-        refined_area = max(1, (rx1 - rx0) * (ry1 - ry0))
-        if not fills_crop and overlap / drawn_area >= 0.5 and 0.25 * drawn_area <= refined_area <= 1.35 * drawn_area:
-            mask = Image.new("L", template.size, 0)
-            mask.paste(crop_mask.convert("L"), (cx0, cy0))
-            return (rx0, ry0, rx1, ry1), mask
-    return _manual_slot(template, slot)
+    width, height = size
+    scale = min(width / template.width, height / template.height)
+    resized_width = max(1, round(template.width * scale))
+    resized_height = max(1, round(template.height * scale))
+    left = (width - resized_width) // 2
+    top = (height - resized_height) // 2
+    mapped_x0 = left + round(x0 * resized_width / template.width)
+    mapped_y0 = top + round(y0 * resized_height / template.height)
+    mapped_x1 = left + round(x1 * resized_width / template.width)
+    mapped_y1 = top + round(y1 * resized_height / template.height)
+    if mapped_x1 - mapped_x0 < 1 or mapped_y1 - mapped_y0 < 1:
+        raise ValueError("手动框选区域在输出画布上过小，请重新框选")
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rectangle(
+        (mapped_x0, mapped_y0, mapped_x1 - 1, mapped_y1 - 1),
+        fill=255,
+    )
+    return (mapped_x0, mapped_y0, mapped_x1, mapped_y1), mask
 
 
 def _transparent_product_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
@@ -2216,10 +2196,11 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
     selected = mode
     if mode != "overlay":
         page = fit_contain(template, output_size)
-        native_slot = (_refine_manual_slot(template, manual_slot)
-                       if mode == "template_replace" and manual_slot is not None
-                       else _template_replace_slot(template, include_frame=(mode == "template_replace")))
-        mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
+        if mode == "template_replace" and manual_slot is not None:
+            mapped_slot = _manual_slot_for_contain(template, manual_slot, output_size)
+        else:
+            native_slot = _template_replace_slot(template, include_frame=(mode == "template_replace"))
+            mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
         if mode == "auto":
             if _has_transparency(page):
                 selected = "overlay"
@@ -2264,6 +2245,10 @@ def compose(
     source_size, output_size, template_page, mapped_slot, selected, layers = _prepare_template(
         _template_identity(template_path), size, mode, preserve_logo_pill, outline_strength, manual_slot)
     if mode == "template_replace":
+        # Sharpen the resized template before applying a manual hard mask. If
+        # sharpening runs afterwards, its convolution changes pixels just
+        # outside the selected rectangle and the green edge stops being exact.
+        template_page = _enhance_output_detail(template_page, source_size, output_size)
         result = _remove_template_product(template_page, detected=mapped_slot)
     else:
         if product_path is None:
@@ -2274,10 +2259,9 @@ def compose(
             result = _apply_overlay(background, None, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength, _layers=layers)
         else:
             result = _place_cutout(template_page, product=product, detected=mapped_slot)
-    # Apply the detail pass after compositing so both the preserved template
-    # typography and the inserted product benefit from the same final-scale
-    # treatment.  It is intentionally skipped for same-size exports.
-    result = _enhance_output_detail(result, source_size, output_size)
+        # Apply the detail pass after product compositing so both the preserved
+        # template typography and the inserted product benefit from it.
+        result = _enhance_output_detail(result, source_size, output_size)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()

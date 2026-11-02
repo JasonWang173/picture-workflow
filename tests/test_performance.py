@@ -51,6 +51,44 @@ class TemplateReuseTest(unittest.TestCase):
             self.assertNotEqual(results[0], results[1])
             self.assertEqual(core._prepare_template.cache_info().misses, 2)
 
+    def test_manual_region_is_an_exact_hard_boundary_without_auto_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template_path = root / 'template.png'
+            Image.new('RGB', (100, 100), (23, 45, 67)).save(template_path)
+            core._prepare_template.cache_clear()
+            with patch.object(core, '_template_replace_slot', side_effect=AssertionError('manual selection must not run auto detection')):
+                _, _, page, detected, selected, _ = core._prepare_template(
+                    core._template_identity(template_path), '100x100', 'template_replace', True, .78, (.2, .3, .4, .25))
+            self.assertEqual(selected, 'template_replace')
+            self.assertIsNotNone(detected)
+            self.assertEqual(detected[0], (20, 30, 60, 55))
+            blank = core._remove_template_product(page, detected=detected)
+            self.assertEqual(blank.getpixel((19, 40)), (23, 45, 67))
+            self.assertEqual(blank.getpixel((20, 30)), (0, 255, 0))
+            self.assertEqual(blank.getpixel((59, 54)), (0, 255, 0))
+            self.assertEqual(blank.getpixel((60, 54)), (23, 45, 67))
+
+            core._prepare_template.cache_clear()
+            with patch.object(core, '_template_replace_slot', side_effect=AssertionError('manual selection must not run auto detection')):
+                _, _, wide_page, wide_detected, _, _ = core._prepare_template(
+                    core._template_identity(template_path), '200x100', 'template_replace', True, .78, (.2, .3, .4, .25))
+            self.assertEqual(wide_page.size, (200, 100))
+            self.assertEqual(wide_detected[0], (70, 30, 110, 55))
+            wide_blank = core._remove_template_product(wide_page, detected=wide_detected)
+            self.assertEqual(wide_blank.getpixel((69, 40)), (23, 45, 67))
+            self.assertEqual(wide_blank.getpixel((70, 40)), (0, 255, 0))
+            self.assertEqual(wide_blank.getpixel((109, 54)), (0, 255, 0))
+            self.assertEqual(wide_blank.getpixel((110, 54)), (23, 45, 67))
+
+            output_path = root / 'manual-scaled.png'
+            core.compose(None, template_path, output_path, mode='template_replace', size='200x100', manual_slot=(.2, .3, .4, .25))
+            with Image.open(output_path) as output:
+                self.assertEqual(output.getpixel((69, 40)), (23, 45, 67))
+                self.assertEqual(output.getpixel((70, 40)), (0, 255, 0))
+                self.assertEqual(output.getpixel((109, 54)), (0, 255, 0))
+                self.assertEqual(output.getpixel((110, 54)), (23, 45, 67))
+
     def test_settings_are_part_of_cache_key(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
