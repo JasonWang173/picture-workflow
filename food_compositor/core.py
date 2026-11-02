@@ -855,6 +855,78 @@ def _trim_alpha(image: Image.Image, padding: int = 4) -> Image.Image:
     return image.crop((max(0, x0 - padding), max(0, y0 - padding), min(image.width, x1 + padding), min(image.height, y1 + padding)))
 
 
+def _longest_dense_span(values: np.ndarray, threshold: float = 0.55) -> tuple[int, int] | None:
+    """Return the longest contiguous interval whose row/column fill is dense."""
+    active = np.asarray(values) >= threshold
+    best: tuple[int, int] | None = None
+    start: int | None = None
+    for index, enabled in enumerate(np.append(active, False)):
+        if enabled and start is None:
+            start = index
+        elif not enabled and start is not None:
+            if best is None or index - start > best[1] - best[0]:
+                best = (start, index)
+            start = None
+    return best
+
+
+def _rectangular_green_component(
+    mask: np.ndarray,
+    broad_mask: np.ndarray,
+) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+    """Find a dense rectangular green panel while trimming connected artwork tails."""
+    height, width = mask.shape
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    minimum_area = height * width * 0.012
+    best: tuple[float, tuple[int, int, int, int], np.ndarray] | None = None
+    for index in range(1, count):
+        x, y, component_width, component_height, area = (int(value) for value in stats[index])
+        if area < minimum_area:
+            continue
+        component = labels == index
+        initial = (x, y, x + component_width, y + component_height)
+        refined_boxes: list[tuple[int, int, int, int]] = []
+        # A vertical panel connected to a wide grass band is isolated by
+        # trimming columns first; a horizontal panel needs the inverse order.
+        for order in ((1, 0), (0, 1)):
+            x0, y0, x1, y1 = initial
+            valid = True
+            for axis in order * 2:
+                region = component[y0:y1, x0:x1]
+                fills = np.mean(region, axis=axis)
+                span = _longest_dense_span(fills)
+                if span is None:
+                    valid = False
+                    break
+                if axis == 0:
+                    x0, x1 = x0 + span[0], x0 + span[1]
+                else:
+                    y0, y1 = y0 + span[0], y0 + span[1]
+            if valid:
+                refined_boxes.append((x0, y0, x1, y1))
+
+        for x0, y0, x1, y1 in refined_boxes:
+            box_width, box_height = x1 - x0, y1 - y0
+            if box_width < width * 0.25 or box_height < height * 0.16:
+                continue
+            panel = component[y0:y1, x0:x1]
+            occupancy = float(np.mean(panel))
+            if occupancy < 0.78:
+                continue
+            row_fill = np.mean(panel, axis=1)
+            col_fill = np.mean(panel, axis=0)
+            if np.quantile(row_fill, 0.10) < 0.58 or np.quantile(col_fill, 0.10) < 0.58:
+                continue
+            score = float(panel.sum()) * occupancy
+            if best is None or score > best[0]:
+                alpha = np.zeros_like(mask, dtype=np.uint8)
+                alpha[y0:y1, x0:x1] = broad_mask[y0:y1, x0:x1] * 255
+                best = score, (x0, y0, x1, y1), alpha
+    if best is None:
+        return None
+    return best[1], Image.fromarray(best[2], "L")
+
+
 def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Locate a large chroma-green placeholder in a template.
 
@@ -870,34 +942,33 @@ def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Ima
     if cv2 is not None:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        mask = (
+        broad_mask = (
             (hue >= 35)
             & (hue <= 90)
             & (saturation >= 90)
             & (value >= 70)
         ).astype(np.uint8)
         if opaque is not None:
-            mask = (mask & opaque).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-        if count <= 1:
-            return None
-        candidates = []
-        for index in range(1, count):
-            x, y, width, height, area = stats[index]
-            if area >= rgb.shape[0] * rgb.shape[1] * 0.012:
-                candidates.append((area, index, x, y, width, height))
-        if not candidates:
-            return None
-        _, index, x, y, width, height = max(candidates)
-        if width < rgb.shape[1] * 0.25 or height < rgb.shape[0] * 0.16:
-            return None
-        component = np.where(labels == index, 255, 0).astype(np.uint8)
-        # Keep the detected edge hard.  Product insertion applies its own
-        # one-pixel inward anti-aliasing so green pixels cannot bleed across a
-        # photo frame or become a fuzzy halo.
-        alpha = component
+            broad_mask = (broad_mask & opaque).astype(np.uint8)
+        broad_mask = cv2.morphologyEx(broad_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        broad_mask = cv2.morphologyEx(broad_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        strict_mask = (
+            (hue >= 45)
+            & (hue <= 75)
+            & (saturation >= 180)
+            & (value >= 180)
+        ).astype(np.uint8)
+        if opaque is not None:
+            strict_mask = (strict_mask & opaque).astype(np.uint8)
+        strict_mask = cv2.morphologyEx(strict_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        strict_mask = cv2.morphologyEx(strict_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        # Prefer the high-purity panel core. The broad pass remains available
+        # for darker or compressed chroma screens, but both passes must prove
+        # a dense rectangular panel instead of accepting the largest green art.
+        return (
+            _rectangular_green_component(strict_mask, broad_mask)
+            or _rectangular_green_component(broad_mask, broad_mask)
+        )
     else:
         red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
         mask = ((green > 105) & (green > red * 1.22) & (green > blue * 1.22) & (green - np.maximum(red, blue) > 28)).astype(np.uint8)
@@ -913,8 +984,7 @@ def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Ima
         alpha = Image.fromarray(mask * 255, "L")
 
     bbox = (int(x), int(y), int(x + width), int(y + height))
-    alpha_image = alpha if isinstance(alpha, Image.Image) else Image.fromarray(alpha, "L")
-    return bbox, alpha_image
+    return bbox, alpha
 
 
 def _neutral_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:

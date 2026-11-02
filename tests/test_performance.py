@@ -7,6 +7,7 @@ from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 from PIL import Image, ImageDraw
 from food_compositor import core, execution
 
@@ -100,6 +101,28 @@ class TemplateReuseTest(unittest.TestCase):
                 with Image.open(root/'out.jpg') as image:
                     self.assertEqual(image.size, tuple(map(int,size.split('x'))))
             self.assertEqual(core._prepare_template.cache_info().maxsize, 1)
+
+
+class GreenSlotDetectionTest(unittest.TestCase):
+    def test_neon_panel_isolated_from_connected_green_artwork(self):
+        template = Image.new('RGB', (640, 360), (170, 210, 245))
+        draw = ImageDraw.Draw(template)
+        draw.rectangle((0, 285, 639, 359), fill=(65, 158, 82))
+        draw.rounded_rectangle((345, 45, 614, 312), radius=28, fill=(0, 254, 0))
+        # Bright narrow leaves connect the panel to a broad natural-green area.
+        draw.polygon(((550, 312), (560, 215), (570, 359), (548, 359)), fill=(0, 254, 0))
+        draw.polygon(((120, 359), (135, 250), (145, 359)), fill=(0, 245, 20))
+        detected = core._template_replace_slot(template)
+        self.assertIsNotNone(detected)
+        (x0, y0, x1, y1), mask = detected
+        self.assertLessEqual(abs(x0 - 345), 2)
+        self.assertLessEqual(abs(y0 - 45), 2)
+        self.assertLessEqual(abs(x1 - 615), 2)
+        self.assertLessEqual(abs(y1 - 313), 2)
+        active = np.asarray(mask.convert('L')) >= 128
+        self.assertFalse(active[330, 560])
+        self.assertFalse(active[320, 120])
+        self.assertTrue(active[180, 480])
 
 
 class SharedExecutionTest(unittest.TestCase):
