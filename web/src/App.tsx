@@ -8,7 +8,7 @@ type TemplateMode = 'auto' | 'overlay' | 'cutout'
 type Asset = { file: File; url: string; templateMode?: TemplateMode; libraryId?: string }
 type BatchImage = { id: string; name: string; url: string; template_index: number; template_name: string; product_index: number; product_name: string }
 type BatchSkipped = { template_index: number; template_name: string; product_index: number; product_name: string; error: string }
-type LightboxImage = { url: string; name: string }
+type LightboxImage = { url: string; name: string; kind?: 'result' | 'template' }
 type TemplateRecord = { id: string; name: string; url: string; thumb_url?: string; source?: string; created_at?: string; size?: number }
 type SlotRect = { x: number; y: number; w: number; h: number }
 
@@ -159,7 +159,7 @@ function AssetDrop({
   )
 }
 
-function TemplateLibrary({
+export function TemplateLibrary({
   templates,
   selectedIds,
   loading,
@@ -167,6 +167,7 @@ function TemplateLibrary({
   notice,
   onUpload,
   onSelect,
+  onPreview,
   onDelete,
 }: {
   templates: TemplateRecord[]
@@ -176,6 +177,7 @@ function TemplateLibrary({
   notice: string
   onUpload: (files: File[]) => void
   onSelect: (template: TemplateRecord) => void
+  onPreview: (template: TemplateRecord) => void
   onDelete: (template: TemplateRecord) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -187,7 +189,7 @@ function TemplateLibrary({
   return (
     <section className="template-library" aria-label="模板库">
       <div className="library-heading">
-        <div className="library-title"><span className="library-icon"><Icon name="library" size={15} /></span><div><strong>模板库</strong><small>{loading ? '正在读取模板…' : `${templates.length} 个模板 · 上下滚动，点击添加`}</small></div></div>
+        <div className="library-title"><span className="library-icon"><Icon name="library" size={15} /></span><div><strong>模板库</strong><small>{loading ? '正在读取模板…' : `${templates.length} 个模板 · 点图预览 · 点圆圈选择`}</small></div></div>
         <>
           <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleInput} hidden />
           <button className="library-upload" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><Icon name="upload" size={13} /> {busy ? '保存中' : '上传模板'}</button>
@@ -198,11 +200,12 @@ function TemplateLibrary({
         <div className="template-grid" role="region" aria-label="可上下滚动的模板列表" tabIndex={0}>
           {templates.map((item) => (
             <article className={`template-card ${selectedIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
-              <button className="template-card-select" type="button" onClick={() => onSelect(item)} aria-label={`使用模板 ${item.name}`}>
+              <button className="template-card-preview" type="button" onClick={() => onPreview(item)} aria-label={`预览模板 ${item.name}`}>
                 <img src={item.thumb_url || item.url} alt={item.name} loading="lazy" />
-                <span className="template-card-check"><Icon name="check" size={11} /></span>
+                <span className="template-card-preview-hint"><Icon name="zoom" size={12} /> 预览</span>
               </button>
-              <div className="template-card-meta"><strong title={item.name}>{item.name}</strong><small>{item.source === 'template_replace' ? '模板替换生成' : '已上传模板'}</small></div>
+              <button className="template-card-check" type="button" disabled={busy || selectedIds.includes(item.id)} onClick={() => onSelect(item)} aria-pressed={selectedIds.includes(item.id)} aria-label={selectedIds.includes(item.id) ? `模板 ${item.name} 已在队列中` : `选择模板 ${item.name}`}><Icon name="check" size={11} /></button>
+              <div className="template-card-meta"><strong title={item.name}>{item.name}</strong><small>{selectedIds.includes(item.id) ? '已在队列中' : item.source === 'template_replace' ? '模板替换生成 · 可勾选' : '已上传模板 · 可勾选'}</small></div>
               <button className="template-card-delete" type="button" onClick={() => onDelete(item)} aria-label={`删除模板 ${item.name}`}><Icon name="close" size={12} /></button>
             </article>
           ))}
@@ -216,7 +219,7 @@ function TemplateLibrary({
   )
 }
 
-function TemplatePickerModal({
+export function TemplatePickerModal({
   templates,
   selectedIds,
   loading,
@@ -224,6 +227,7 @@ function TemplatePickerModal({
   notice,
   error,
   onPick,
+  onPreview,
   onUpload,
   onClose,
 }: {
@@ -234,6 +238,7 @@ function TemplatePickerModal({
   notice: string
   error: string
   onPick: (templates: TemplateRecord[]) => Promise<boolean>
+  onPreview: (template: TemplateRecord) => void
   onUpload: (files: File[]) => void
   onClose: () => void
 }) {
@@ -269,10 +274,11 @@ function TemplatePickerModal({
             <div className="picker-grid">
               {templates.map((item) => (
                 <article className={`template-card ${selectedIds.includes(item.id) || pendingIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
-                  <button className="template-card-select" type="button" disabled={busy || selectedIds.includes(item.id)} onClick={() => togglePick(item.id)} aria-pressed={pendingIds.includes(item.id)} aria-label={`${pendingIds.includes(item.id) ? '取消选择' : '选择'}模板 ${item.name}`}>
+                  <button className="template-card-preview" type="button" onClick={() => onPreview(item)} aria-label={`预览模板 ${item.name}`}>
                     <img src={item.thumb_url || item.url} alt={item.name} loading="lazy" />
-                    <span className="template-card-check"><Icon name="check" size={11} /></span>
+                    <span className="template-card-preview-hint"><Icon name="zoom" size={12} /> 预览</span>
                   </button>
+                  <button className="template-card-check" type="button" disabled={busy || selectedIds.includes(item.id)} onClick={() => togglePick(item.id)} aria-pressed={selectedIds.includes(item.id) || pendingIds.includes(item.id)} aria-label={selectedIds.includes(item.id) ? `模板 ${item.name} 已在队列中` : `${pendingIds.includes(item.id) ? '取消选择' : '选择'}模板 ${item.name}`}><Icon name="check" size={11} /></button>
                   <div className="template-card-meta"><strong title={item.name}>{item.name}</strong><small>{selectedIds.includes(item.id) ? '已在队列中' : pendingIds.includes(item.id) ? `已选 · 第 ${pendingIds.indexOf(item.id) + 1} 个` : item.source === 'template_replace' ? '模板替换生成' : '已上传模板'}</small></div>
                 </article>
               ))}
@@ -520,9 +526,9 @@ function App() {
     if (!lightbox && !pickerOpen && !slotEditorOpen) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setLightbox(null)
-        setPickerOpen(false)
-        setSlotEditorOpen(false)
+        if (lightbox) setLightbox(null)
+        else if (slotEditorOpen) setSlotEditorOpen(false)
+        else if (pickerOpen) setPickerOpen(false)
       }
     }
     const previousOverflow = document.body.style.overflow
@@ -860,7 +866,7 @@ function App() {
             <div><span className="section-label">01 / 工作流</span><h2>{mode === 'template_replace' ? '先制作空白模板' : '合成商品海报'}</h2></div>
             {demoAvailable && <button className="text-button" type="button" onClick={loadDemo}><Icon name="spark" size={14} /> 试用示例</button>}
           </div>
-          <TemplateLibrary templates={templates} selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={(item) => { void pickFromLibrary([item]) }} onDelete={deleteLibraryTemplate} />
+          <TemplateLibrary templates={templates} selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={(item) => { void pickFromLibrary([item]) }} onPreview={(item) => setLightbox({ url: item.url, name: item.name, kind: 'template' })} onDelete={deleteLibraryTemplate} />
           <div className="library-divider" />
           <AssetDrop number="01" title="商品图" hint="支持多选与文件夹 · 自动去除重复图片" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
           {productNotice && <p className={`product-notice ${productChecking ? 'is-checking' : ''}`} role="status">{productChecking && <span className="button-loader" />}{productNotice}</p>}
@@ -1004,6 +1010,7 @@ function App() {
           notice={libraryNotice}
           error={error}
           onPick={pickFromLibrary}
+          onPreview={(item) => setLightbox({ url: item.url, name: item.name, kind: 'template' })}
           onUpload={uploadTemplates}
           onClose={() => setPickerOpen(false)}
         />
@@ -1018,10 +1025,10 @@ function App() {
         />
       )}
       {lightbox && (
-        <div className="lightbox" role="dialog" aria-modal="true" aria-label="合成图放大预览" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
+        <div className={`lightbox ${pickerOpen ? 'is-stacked' : ''}`} role="dialog" aria-modal="true" aria-label={lightbox.kind === 'template' ? '模板放大预览' : '合成图放大预览'} onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
           <div className="lightbox-panel">
             <div className="lightbox-bar">
-              <div><span className="section-label">DETAIL PREVIEW</span><strong>{lightbox.name}</strong></div>
+              <div><span className="section-label">{lightbox.kind === 'template' ? 'TEMPLATE PREVIEW' : 'DETAIL PREVIEW'}</span><strong>{lightbox.name}</strong></div>
               <button className="lightbox-close" type="button" onClick={() => setLightbox(null)} aria-label="关闭放大预览"><Icon name="close" size={19} /></button>
             </div>
             <div className="lightbox-stage"><img src={lightbox.url} alt={`放大查看 ${lightbox.name}`} /></div>
