@@ -124,6 +124,74 @@ class GreenSlotDetectionTest(unittest.TestCase):
         self.assertFalse(active[320, 120])
         self.assertTrue(active[180, 480])
 
+    def test_cutout_preserves_rounded_corners_over_grass_and_removes_key_spill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sky, grass, green, food = (170, 210, 245), (65, 158, 82), (0, 254, 0), (188, 48, 30)
+            template = Image.new('RGB', (640, 360), sky)
+            draw = ImageDraw.Draw(template)
+            draw.rectangle((0, 270, 639, 359), fill=grass)
+            draw.rounded_rectangle((345, 45, 614, 312), radius=34, fill=green)
+            # Simulate a decoded JPEG pixel contaminated by the key color.
+            draw.line((344, 100, 344, 200), fill=(136, 219, 196))
+            template.save(root / 'template.png')
+            Image.new('RGB', (80, 60), food).save(root / 'product.png')
+
+            for mode, size, offset in (('cutout', '640x360', 0), ('auto', '640x640', 140)):
+                with self.subTest(mode=mode):
+                    core.compose(root / 'product.png', root / 'template.png', root / 'out.png',
+                                 mode=mode, size=size)
+                    with Image.open(root / 'out.png') as result:
+                        self.assertEqual(result.getpixel((611, 309 + offset)), grass)
+                        self.assertEqual(result.getpixel((348, 309 + offset)), grass)
+                        self.assertEqual(result.getpixel((480, 311 + offset)), food)
+                        self.assertEqual(result.getpixel((344, 140 + offset)), sky)
+                        self.assertEqual(result.getpixel((345, 140 + offset)), food)
+                        self.assertEqual(result.getpixel((200, 310 + offset)), grass)
+
+    def test_dark_jpeg_panel_does_not_capture_nearby_shades_of_green(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            grass, food = (65, 158, 82), (188, 48, 30)
+            template = Image.new('RGB', (640, 360), (170, 210, 245))
+            draw = ImageDraw.Draw(template)
+            draw.rectangle((0, 255, 639, 359), fill=grass)
+            draw.ellipse((18, 30, 110, 86), fill=(0, 245, 15))
+            draw.rounded_rectangle((345, 45, 614, 312), radius=36, fill=(40, 128, 56))
+            template.save(root / 'template.jpg', quality=82)
+            Image.new('RGB', (80, 60), food).save(root / 'product.png')
+            core.compose(root / 'product.png', root / 'template.jpg', root / 'out.png', mode='cutout')
+            with Image.open(root / 'template.jpg') as source, Image.open(root / 'out.png') as result:
+                for xy in ((611, 309), (348, 309), (65, 55), (200, 315)):
+                    self.assertEqual(result.getpixel(xy), source.getpixel(xy), xy)
+                self.assertEqual(result.getpixel((480, 290)), food)
+
+    def test_green_artwork_without_panel_does_not_become_a_product_slot(self):
+        template = Image.new('RGB', (640, 360), (170, 210, 245))
+        draw = ImageDraw.Draw(template)
+        draw.rectangle((0, 252, 639, 359), fill=(60, 158, 80))
+        draw.ellipse((18, 30, 110, 86), fill=(0, 245, 15))
+        self.assertIsNone(core._template_replace_slot(template))
+
+    def test_similar_green_panels_require_a_choice_and_manual_cutout_respects_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template = Image.new('RGB', (400, 200), (170, 210, 245))
+            draw = ImageDraw.Draw(template)
+            draw.rectangle((20, 40, 179, 159), fill=(0, 254, 0))
+            draw.rectangle((220, 40, 379, 159), fill=(0, 254, 0))
+            template.save(root / 'template.png')
+            Image.new('RGB', (80, 60), (188, 48, 30)).save(root / 'product.png')
+            for mode in ('auto', 'cutout', 'template_replace'):
+                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, '多个相似绿幕'):
+                    core.compose(root / 'product.png', root / 'template.png', root / 'out.png', mode=mode)
+            core.compose(root / 'product.png', root / 'template.png', root / 'out.png',
+                         mode='cutout', manual_slot=(.55, .2, .4, .6))
+            expected = template.copy()
+            expected.paste((188, 48, 30), (220, 40, 380, 160))
+            with Image.open(root / 'out.png') as result:
+                self.assertEqual(result.tobytes(), expected.tobytes())
+
 
 class SharedExecutionTest(unittest.TestCase):
     def tearDown(self):

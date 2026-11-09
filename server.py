@@ -470,8 +470,8 @@ async def create_composition(
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
     manual_slot = _parse_manual_slot(slot)
-    if manual_slot is not None and mode != "template_replace":
-        raise HTTPException(status_code=400, detail="手动框选区域仅模板替换模式可用")
+    if manual_slot is not None and mode not in {"template_replace", "cutout"}:
+        raise HTTPException(status_code=400, detail="手动框选仅在模板替换和主体抠图合成中可用")
     temp_dir = Path(tempfile.mkdtemp(prefix="food-compositor-"))
     background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
     try:
@@ -543,8 +543,8 @@ async def create_batch_composition(
         raise HTTPException(status_code=400, detail="请上传有效的模板图片")
 
     manual_slot = _parse_manual_slot(slot)
-    if manual_slot is not None and (mode != "template_replace" or len(image_templates) != 1):
-        raise HTTPException(status_code=400, detail="手动框选区域仅单张模板替换可用")
+    if manual_slot is not None and (mode not in {"template_replace", "cutout"} or len(image_templates) != 1):
+        raise HTTPException(status_code=400, detail="手动框选仅支持单张模板的模板替换或主体抠图合成")
     requested_modes = [mode] * len(image_templates)
     if template_modes is not None:
         try:
@@ -738,7 +738,10 @@ def _run_batch_composition(
             flush_status(force=True)
         if not status["images"]:
             status["status"] = "failed"
-            status["error"] = status.get("error") or "没有图片合成成功，请检查模板与商品图"
+            reasons = {item["error"] for item in status["skipped"]}
+            status["error"] = status.get("error") or (
+                next(iter(reasons)) if len(reasons) == 1 else "没有图片合成成功，请检查模板与商品图"
+            )
         else:
             status["status"] = "done"
     except Exception as exc:

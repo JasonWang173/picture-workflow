@@ -4,7 +4,7 @@ import io
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal, NamedTuple, Sequence
 
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
@@ -870,21 +870,86 @@ def _longest_dense_span(values: np.ndarray, threshold: float = 0.55) -> tuple[in
     return best
 
 
+class _GreenSlot(NamedTuple):
+    box: tuple[int, int, int, int]
+    alpha: Image.Image
+
+
+def _rounded_green_alpha(core: np.ndarray) -> np.ndarray | None:
+    """Fit a common corner radius only when independent sides support it."""
+    depth = min(core.shape) // 3
+    if depth < 12:
+        return None
+    distances = np.arange(depth) + 0.5
+    radii = []
+    for vertical in (core, core[::-1]):
+        for corner in (vertical, vertical[:, ::-1]):
+            estimates = []
+            for oriented in (corner, corner.T):
+                offsets = np.argmax(oriented[:depth], axis=1)
+                usable = (offsets >= 3) & (distances >= 2)
+                if np.count_nonzero(usable) < 6:
+                    continue
+                t, d = distances[usable], offsets[usable]
+                radius = float(np.median(t + d + np.sqrt(2 * t * d)))
+                if not 9 <= radius <= depth:
+                    continue
+                arc = (distances >= 2) & (distances <= radius * 0.7)
+                expected = radius - np.sqrt(radius**2 - (radius - distances[arc])**2)
+                support = float(np.mean(np.abs(offsets[arc] - expected) <= max(2, radius * 0.06)))
+                if support >= 0.85:
+                    estimates.append((support, radius))
+            if estimates:
+                radii.append(max(estimates)[1])
+    if len(radii) < 2:
+        return None
+    radius = float(np.median(radii))
+    if sum(abs(value - radius) <= max(3, radius * 0.08) for value in radii) < 2:
+        return None
+    # Distinct, well-supported radii indicate an intentionally asymmetric panel.
+    if any(abs(value - radius) > max(5, radius * 0.15) for value in radii):
+        return None
+
+    extent = int(np.ceil(radius))
+    offsets = np.maximum(radius - (np.arange(extent, dtype=np.float32) + 0.5), 0)
+    distance = np.hypot(offsets[:, None], offsets[None, :])
+    # If the model would paint over non-green content, retain the source mask.
+    corner_interior = distance < radius - 2
+    outside_arc = distance > radius + 2
+    if any(np.mean(corner[:extent, :extent][outside_arc]) > 0.97
+           for vertical in (core, core[::-1]) for corner in (vertical, vertical[:, ::-1])):
+        return None  # A solid square corner may be an intentional design.
+    interior = np.ones(core.shape, dtype=bool)
+    alpha = np.full(core.shape, 255, dtype=np.uint8)
+    corner_alpha = np.rint(np.clip(radius + 0.5 - distance, 0, 1) * 255).astype(np.uint8)
+    for target, opaque in ((alpha, corner_alpha), (interior, corner_interior)):
+        target[:extent, :extent] = opaque
+        target[:extent, -extent:] = opaque[:, ::-1]
+        target[-extent:, :extent] = opaque[::-1]
+        target[-extent:, -extent:] = opaque[::-1, ::-1]
+    if np.count_nonzero(interior & ~core) > 0.01 * np.count_nonzero(interior):
+        return None
+    return alpha
+
+
 def _rectangular_green_component(
+    rgb: np.ndarray,
     mask: np.ndarray,
-    broad_mask: np.ndarray,
+    *,
+    bright_seed: bool,
+    require_unambiguous: bool,
 ) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Find a dense rectangular green panel while trimming connected artwork tails."""
     height, width = mask.shape
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     minimum_area = height * width * 0.012
-    best: tuple[float, tuple[int, int, int, int], np.ndarray] | None = None
+    candidates = []
     for index in range(1, count):
         x, y, component_width, component_height, area = (int(value) for value in stats[index])
         if area < minimum_area:
             continue
-        component = labels == index
-        initial = (x, y, x + component_width, y + component_height)
+        component = labels[y:y + component_height, x:x + component_width] == index
+        initial = (0, 0, component_width, component_height)
         refined_boxes: list[tuple[int, int, int, int]] = []
         # A vertical panel connected to a wide grass band is isolated by
         # trimming columns first; a horizontal panel needs the inverse order.
@@ -905,10 +970,15 @@ def _rectangular_green_component(
             if valid:
                 refined_boxes.append((x0, y0, x1, y1))
 
+        best = None
         for x0, y0, x1, y1 in refined_boxes:
             box_width, box_height = x1 - x0, y1 - y0
             if box_width < width * 0.25 or box_height < height * 0.16:
                 continue
+            left, top, right, bottom = box = (x + x0, y + y0, x + x1, y + y1)
+            edge_contacts = sum((left <= 1, top <= 1, right >= width - 1, bottom >= height - 1))
+            if edge_contacts >= 2 or box_width * box_height > height * width * 0.92:
+                continue  # A green page or band along the canvas is not a panel.
             panel = component[y0:y1, x0:x1]
             occupancy = float(np.mean(panel))
             if occupancy < 0.78:
@@ -917,17 +987,70 @@ def _rectangular_green_component(
             col_fill = np.mean(panel, axis=0)
             if np.quantile(row_fill, 0.10) < 0.58 or np.quantile(col_fill, 0.10) < 0.58:
                 continue
-            score = float(panel.sum()) * occupancy
+            # Test actual color consistency in the middle of the candidate.
+            # A large patch of green artwork or a photo can pass HSV and shape
+            # tests while containing several different shades and textures.
+            cx, cy = box_width // 4, box_height // 4
+            step = max(1, min(box_width, box_height) // 64)
+            sample = rgb[top + cy:bottom - cy:step, left + cx:right - cx:step]
+            key = np.rint(np.median(sample, axis=(0, 1))).astype(np.int16)
+            if key[1] - max(key[0], key[2]) < 40:
+                continue
+            deviation = np.max(np.abs(sample.astype(np.int16) - key), axis=2)
+            spread = float(np.quantile(deviation, 0.90))
+            if spread > 28:
+                continue
+            score = float(panel.sum()) * occupancy * (1.0 - spread / 100)
             if best is None or score > best[0]:
-                alpha = np.zeros_like(mask, dtype=np.uint8)
-                alpha[y0:y1, x0:x1] = broad_mask[y0:y1, x0:x1] * 255
-                best = score, (x0, y0, x1, y1), alpha
-    if best is None:
+                best = score, box, key, spread
+        if best is not None:
+            candidates.append(best)
+    if not candidates:
         return None
-    return best[1], Image.fromarray(best[2], "L")
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    verified = []
+    for score, box, key, spread in candidates:
+        if verified and (not require_unambiguous or score < verified[0][0] * 0.72):
+            break
+        x0, y0, x1, y1 = box
+        # Use the chosen panel's own color for the mask, never all broad-green
+        # pixels in its rectangle. Distant colors and disconnected specks stay.
+        nearby = np.ones((y1 - y0, x1 - x0), dtype=bool)
+        tolerance = min(56, max(18, round(spread * 2 + 8)))
+        for channel, value in enumerate(key):
+            local = rgb[y0:y1, x0:x1, channel]
+            nearby &= (local >= value - tolerance) & (local <= value + tolerance)
+        n, components, sizes, _ = cv2.connectedComponentsWithStats(nearby.astype(np.uint8), 8)
+        if n <= 1:
+            continue
+        index = 1 + int(np.argmax(sizes[1:, cv2.CC_STAT_AREA]))
+        keyed = components == index
+        if np.mean(keyed) < 0.78:
+            continue
+        if verified:
+            raise ValueError("检测到多个相似绿幕，请单独添加此模板并手动框选商品区（智能判断时先切换到主体抠图合成）")
+        verified.append((score, box, keyed))
+    if not verified:
+        return None
+    _, box, keyed = verified[0]
+    x0, y0, x1, y1 = box
+    rounded = None
+    if x0 > 0 and y0 > 0 and x1 < width and y1 < height:
+        # A tight RGB match on a vivid JPEG is useful for excluding artwork
+        # but misses chroma-shifted edge pixels and biases the fitted radius.
+        # Use the vivid seed's broader contour only for the verified fit.
+        outline = mask[y0:y1, x0:x1] != 0 if bright_seed else keyed
+        rounded = _rounded_green_alpha(outline)
+        if rounded is not None and np.mean((rounded >= 250) & ~keyed) > 0.01:
+            rounded = None
+    alpha = Image.new("L", (width, height))
+    alpha.paste(Image.fromarray(rounded if rounded is not None else keyed.astype(np.uint8) * 255), (x0, y0))
+    return _GreenSlot(box, alpha)
 
 
-def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+def _green_slot(
+    background: Image.Image, *, require_unambiguous: bool = False
+) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Locate a large chroma-green placeholder in a template.
 
     Templates use green as a deliberate replacement surface. We detect it in
@@ -935,56 +1058,30 @@ def _green_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Ima
     slightly uneven fabric lighting do not leave a green fringe around the
     inserted product.
     """
+    if cv2 is None:
+        return None
     rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
     opaque = None
     if "A" in background.getbands():
         opaque = np.asarray(background.getchannel("A"), dtype=np.uint8) >= 12
-    if cv2 is not None:
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        broad_mask = (
-            (hue >= 35)
-            & (hue <= 90)
-            & (saturation >= 90)
-            & (value >= 70)
-        ).astype(np.uint8)
+    hue, saturation, value = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).transpose(2, 0, 1)
+    # Saturation and hue distinguish the key from foliage even when the
+    # placeholder is dark. Less saturated candidates still need the same
+    # geometry and color checks.
+    for hue_min, hue_max, min_saturation, min_value in ((45, 75, 180, 180), (45, 75, 175, 70), (35, 90, 90, 70)):
+        mask = ((hue >= hue_min) & (hue <= hue_max) & (saturation >= min_saturation) & (value >= min_value)).astype(np.uint8)
         if opaque is not None:
-            broad_mask = (broad_mask & opaque).astype(np.uint8)
-        broad_mask = cv2.morphologyEx(broad_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        broad_mask = cv2.morphologyEx(broad_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        strict_mask = (
-            (hue >= 45)
-            & (hue <= 75)
-            & (saturation >= 180)
-            & (value >= 180)
-        ).astype(np.uint8)
-        if opaque is not None:
-            strict_mask = (strict_mask & opaque).astype(np.uint8)
-        strict_mask = cv2.morphologyEx(strict_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        strict_mask = cv2.morphologyEx(strict_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        # Prefer the high-purity panel core. The broad pass remains available
-        # for darker or compressed chroma screens, but both passes must prove
-        # a dense rectangular panel instead of accepting the largest green art.
-        return (
-            _rectangular_green_component(strict_mask, broad_mask)
-            or _rectangular_green_component(broad_mask, broad_mask)
+            mask &= opaque
+        if np.count_nonzero(mask) < mask.size * 0.012:
+            continue
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        slot = _rectangular_green_component(
+            rgb, mask, bright_seed=min_value == 180, require_unambiguous=require_unambiguous
         )
-    else:
-        red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
-        mask = ((green > 105) & (green > red * 1.22) & (green > blue * 1.22) & (green - np.maximum(red, blue) > 28)).astype(np.uint8)
-        if opaque is not None:
-            mask = (mask & opaque).astype(np.uint8)
-        ys, xs = np.where(mask > 0)
-        if len(xs) < rgb.shape[0] * rgb.shape[1] * 0.012:
-            return None
-        x, y, x1, y1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-        width, height = x1 - x, y1 - y
-        if width < rgb.shape[1] * 0.25 or height < rgb.shape[0] * 0.16:
-            return None
-        alpha = Image.fromarray(mask * 255, "L")
-
-    bbox = (int(x), int(y), int(x + width), int(y + height))
-    return bbox, alpha
+        if slot is not None:
+            return slot
+    return None
 
 
 def _neutral_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
@@ -1051,11 +1148,6 @@ def _neutral_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], I
     return bbox, alpha_image
 
 
-def _product_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
-    """Find a green-screen or neutral placeholder suitable for product art."""
-    return _green_slot(background) or _neutral_slot(background)
-
-
 def _crisp_slot_alpha(slot_alpha: Image.Image, inset: int = 1) -> Image.Image:
     """Prepare a replacement mask without the blurred halo that causes spill.
 
@@ -1086,7 +1178,9 @@ def _fit_cover_mask(mask: Image.Image, size: tuple[int, int], focal: tuple[float
     return resized.crop((left, top, left + width, top + height))
 
 
-def _fit_contain_mask(mask: Image.Image, size: tuple[int, int]) -> Image.Image:
+def _fit_contain_mask(
+    mask: Image.Image, size: tuple[int, int], resample: Image.Resampling = Image.Resampling.LANCZOS
+) -> Image.Image:
     """Apply the same contain scale/offset as ``fit_contain`` to a mask."""
     width, height = size
     if mask.size == size:
@@ -1094,7 +1188,7 @@ def _fit_contain_mask(mask: Image.Image, size: tuple[int, int]) -> Image.Image:
     scale = min(width / mask.width, height / mask.height)
     resized = mask.resize(
         (max(1, round(mask.width * scale)), max(1, round(mask.height * scale))),
-        Image.Resampling.LANCZOS,
+        resample,
     )
     canvas = Image.new("L", size, 0)
     canvas.paste(resized, ((width - resized.width) // 2, (height - resized.height) // 2))
@@ -1120,11 +1214,14 @@ def _slot_for_contain(
 ) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Map a native-template slot through the same contain transform as the page."""
     _, native_mask = detected
-    mapped_mask = _fit_contain_mask(native_mask, size)
+    green = isinstance(detected, _GreenSlot)
+    mapped_mask = _fit_contain_mask(
+        native_mask, size, Image.Resampling.BILINEAR if green else Image.Resampling.LANCZOS
+    )
     bbox = mapped_mask.getbbox()
     if not bbox:
         return None
-    return (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])), mapped_mask
+    return _GreenSlot(bbox, mapped_mask) if green else (bbox, mapped_mask)
 
 
 def _manual_slot(
@@ -2001,87 +2098,65 @@ def _texture_photo_slot(
 
 
 def _mask_is_green(background: Image.Image, slot_alpha: Image.Image) -> bool:
-    """Classify a mapped slot so green panels receive an edge-to-edge mask."""
-    rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
-    active = np.asarray(slot_alpha.convert("L"), dtype=np.uint8) >= 128
+    """Recognize mostly green candidates that structural detectors should not use."""
+    box = slot_alpha.getbbox()
+    if box is None:
+        return False
+    rgb = np.asarray(background.crop(box).convert("RGB"))
+    active = np.asarray(slot_alpha.crop(box)) >= 128
     if not np.any(active):
         return False
-    pixels = rgb[active]
-    green = (pixels[:, 1] >= pixels[:, 0] + 35) & (pixels[:, 1] >= pixels[:, 2] + 35) & (pixels[:, 1] >= 95)
+    pixels = rgb[active].astype(np.int16)
+    green = (pixels[:, 1] - np.maximum(pixels[:, 0], pixels[:, 2]) >= 35) & (pixels[:, 1] >= 70)
     return float(np.mean(green)) >= 0.55
-
-
-def _is_solid_green_panel(
-    background: Image.Image,
-    detected: tuple[tuple[int, int, int, int], Image.Image] | None,
-) -> bool:
-    """Accept green only when it fills a panel, not when it is artwork noise."""
-    if detected is None:
-        return False
-    (x0, y0, x1, y1), slot_alpha = detected
-    if not _mask_is_green(background, slot_alpha):
-        return False
-    active = np.asarray(slot_alpha.convert("L"), dtype=np.uint8) >= 128
-    if x1 <= x0 or y1 <= y0:
-        return False
-    panel = active[y0:y1, x0:x1]
-    occupancy = float(np.mean(panel))
-    if occupancy < 0.78:
-        return False
-    # A green product package can occupy most of its bounding box while still
-    # containing irregular white labels and cut-outs.  A real chroma panel is
-    # rectangular: almost every row and column remains active.  The lower
-    # quantile rejects the photographed green package from horizontal sample
-    # templates without rejecting mildly compressed green placeholders.
-    row_fill = np.mean(panel, axis=1)
-    col_fill = np.mean(panel, axis=0)
-    return bool(
-        np.quantile(row_fill, 0.10) >= 0.58
-        and np.quantile(col_fill, 0.10) >= 0.58
-    )
 
 
 def _template_replace_slot(
     background: Image.Image,
     *,
     include_frame: bool = False,
+    require_unambiguous_green: bool = False,
 ) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Locate the best product area for the explicit template-replace mode."""
     # A fully green panel is an explicit placeholder and has a more reliable
     # boundary than Hough lines. Prefer it when it fills a rectangular area;
     # isolated green artwork still falls through to structural detection.
-    green = _green_slot(background)
-    if _is_solid_green_panel(background, green):
+    transparent = _transparent_product_slot(background)
+    if transparent is not None:
+        return transparent
+    green = _green_slot(background, require_unambiguous=require_unambiguous_green)
+    if green is not None:
         return green
     # Structural frame detection handles photographed panels and dark/white
     # placeholders while preserving their decorative border.
-    transparent = _transparent_product_slot(background)
-    framed = None if transparent is not None else _framed_photo_slot(background, preserve_frame=not include_frame)
-    detected = (
-        transparent
-        or framed
-        or _line_framed_photo_slot(background, include_frame=include_frame)
-        or _texture_photo_slot(background)
-        or _profile_photo_slot(background)
-        or green
-        or _product_slot(background)
-    )
+    framed = _framed_photo_slot(background, preserve_frame=not include_frame)
+    for fallback in (
+        lambda: framed,
+        lambda: _line_framed_photo_slot(background, include_frame=include_frame),
+        lambda: _texture_photo_slot(background),
+        lambda: _profile_photo_slot(background),
+        lambda: _neutral_slot(background),
+    ):
+        detected = fallback()
+        if detected is not None and not _mask_is_green(background, detected[1]):
+            break
+    else:
+        detected = None
     # ``_open_template`` normalizes every input to RGBA, including JPGs whose
     # alpha channel is fully opaque.  Apply the light-card expansion to those
     # templates too; gating on the presence of an ``A`` band left the white
     # strip above the 1f107c... product card untouched in the real compose
     # path even though direct RGB detection looked correct.
     alpha_is_opaque = "A" not in background.getbands() or background.getchannel("A").getextrema()[0] >= 250
-    if detected is not None and framed is not None and include_frame and alpha_is_opaque:
+    if detected is not None and detected is framed and include_frame and alpha_is_opaque:
         bbox, slot_alpha = detected
-        if not _mask_is_green(background, slot_alpha):
-            rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
-            expanded = _expand_light_frame_edges(rgb, bbox)
-            if expanded != bbox:
-                x0, y0, x1, y1 = expanded
-                mask = Image.new("L", background.size, 0)
-                ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
-                detected = expanded, mask
+        rgb = np.asarray(background.convert("RGB"), dtype=np.uint8)
+        expanded = _expand_light_frame_edges(rgb, bbox)
+        if expanded != bbox:
+            x0, y0, x1, y1 = expanded
+            mask = Image.new("L", background.size, 0)
+            ImageDraw.Draw(mask).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+            detected = expanded, mask
     return detected
 
 
@@ -2142,6 +2217,50 @@ def _remove_template_product(
     return canvas.convert("RGB")
 
 
+def _clean_green_edge(
+    background: Image.Image, slot: _GreenSlot, bleed: int
+) -> Image.Image:
+    """Remove key-color contamination before blending a verified green panel."""
+    x0, y0, x1, y1 = slot.box
+    padding = bleed + 3
+    box = (max(0, x0 - padding), max(0, y0 - padding),
+           min(background.width, x1 + padding), min(background.height, y1 + padding))
+    alpha = np.asarray(slot.alpha.crop(box))
+    occupied = (alpha > 0).astype(np.uint8)
+    def expand(radius: int) -> np.ndarray:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+        return cv2.dilate(occupied, kernel)
+
+    ys, xs = np.nonzero((expand(bleed) != 0) & (alpha < 255))
+    guard = expand(bleed + 1)
+    exterior = np.flatnonzero(guard == 0)
+    if not len(ys) or not exterior.size:
+        return background
+    _, labels = cv2.distanceTransformWithLabels(
+        guard, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+    )
+    nearest = np.empty(exterior.size + 1, dtype=np.intp)
+    nearest[labels.ravel()[exterior]] = exterior
+    ref_y, ref_x = np.unravel_index(nearest[labels[ys, xs]], alpha.shape)
+    rgba = np.array(background.crop(box).convert("RGBA"))
+    reference = rgba[ref_y, ref_x, :3].astype(np.float32)
+    current = rgba[ys, xs, :3].astype(np.float32)
+    mid_x, mid_y = (x0 + x1) // 2 - box[0], (y0 + y1) // 2 - box[1]
+    key = np.median(rgba[mid_y - 3:mid_y + 4, mid_x - 3:mid_x + 4, :3], axis=(0, 1))
+    direction = key - reference
+    delta = current - reference
+    length_sq = np.sum(direction**2, axis=1)
+    fraction = np.sum(delta * direction, axis=1) / np.maximum(length_sq, 1)
+    residual = np.linalg.norm(delta - np.clip(fraction, 0, 1)[:, None] * direction, axis=1)
+    # Only change pixels whose color has actually shifted toward the sampled
+    # green. Nearby artwork that does not match the spill model is preserved.
+    spill = (length_sq > 50**2) & (fraction > 0.07) & (residual < 24 + 20 * fraction)
+    rgba[ys[spill], xs[spill], :3] = reference[spill]
+    cleaned = background.convert("RGBA")
+    cleaned.paste(Image.fromarray(rgba), box[:2])
+    return cleaned
+
+
 def _place_product_slot(
     background: Image.Image,
     product: Image.Image,
@@ -2154,9 +2273,6 @@ def _place_product_slot(
     resize into the detected slot. The only softness is the 1 px anti-aliased
     edge used to hide JPEG and template boundary noise.
     """
-    explicit_detected = detected is not None
-    green_detected = None if explicit_detected else _green_slot(background)
-    detected = detected or green_detected or _neutral_slot(background) or _template_replace_slot(background)
     if detected is None:
         return None
     (x0, y0, x1, y1), slot_alpha = detected
@@ -2170,14 +2286,8 @@ def _place_product_slot(
     source_plate = fit_cover(product.convert("RGB"), (slot_width, slot_height))
     plate_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     plate_layer.paste(source_plate.convert("RGBA"), (x0, y0))
-    slot_overlay = Image.new("L", canvas.size, 0)
-    # A slot mapped from the native template already includes the intended
-    # frame ring. Applying another erosion here creates a one pixel gap that
-    # becomes a visible halo after JPEG encoding. Only heuristic neutral/photo
-    # detections need the tiny safety inset.
-    edge_inset = 0 if (explicit_detected or green_detected is not None or _mask_is_green(background, slot_alpha)) else max(1, round(min(slot_width, slot_height) * 0.0025))
-    slot_overlay.paste(_crisp_slot_alpha(slot_alpha, edge_inset), (0, 0))
-    plate_layer.putalpha(slot_overlay)
+    plate_layer.putalpha(slot_alpha if isinstance(detected, _GreenSlot)
+                         else _crisp_slot_alpha(slot_alpha, inset=0))
     return Image.alpha_composite(canvas, plate_layer).convert("RGB")
 
 
@@ -2266,23 +2376,31 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
     selected = mode
     if mode != "overlay":
         page = fit_contain(template, output_size)
-        if mode == "template_replace" and manual_slot is not None:
+        if mode in {"template_replace", "cutout"} and manual_slot is not None:
             mapped_slot = _manual_slot_for_contain(template, manual_slot, output_size)
+        elif mode == "auto" and _has_transparency(page):
+            selected = "overlay"
         else:
-            native_slot = _template_replace_slot(template, include_frame=(mode == "template_replace"))
+            native_slot = _template_replace_slot(
+                template, include_frame=(mode == "template_replace"), require_unambiguous_green=True
+            )
             mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
-        if mode == "auto":
-            if _has_transparency(page):
-                selected = "overlay"
-            elif mapped_slot is not None or _product_slot(page) is not None:
-                selected = "cutout"
-            else:
-                selected = "overlay" if _looks_like_flat_template(template) else "cutout"
+            if mode == "auto":
+                selected = "overlay" if mapped_slot is None and _looks_like_flat_template(template) else "cutout"
     layers = None
     if selected == "overlay":
         layers = _build_overlay_layers(template, output_size, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
         page = None
         mapped_slot = None
+    elif selected == "cutout" and isinstance(mapped_slot, _GreenSlot):
+        # Prepare the clean edge once per template, before blending any product.
+        # Sharpening after blending would bring back a halo along the curve.
+        page = _enhance_output_detail(page, template.size, output_size)
+        scale = min(output_size[0] / template.width, output_size[1] / template.height)
+        bleed = min(6, max(2, int(np.ceil(2 * scale))))
+        page = _clean_green_edge(page, mapped_slot, bleed)
+    elif selected == "cutout" and manual_slot is not None:
+        page = _enhance_output_detail(page, template.size, output_size)
     return template.size, output_size, page, mapped_slot, selected, layers
 
 
@@ -2331,7 +2449,8 @@ def compose(
             result = _place_cutout(template_page, product=product, detected=mapped_slot)
         # Apply the detail pass after product compositing so both the preserved
         # template typography and the inserted product benefit from it.
-        result = _enhance_output_detail(result, source_size, output_size)
+        if not isinstance(mapped_slot, _GreenSlot) and not (selected == "cutout" and manual_slot is not None):
+            result = _enhance_output_detail(result, source_size, output_size)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()

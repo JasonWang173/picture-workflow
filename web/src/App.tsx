@@ -314,12 +314,14 @@ function SlotEditorModal({
   imageUrl,
   imageName,
   initial,
+  action,
   onConfirm,
   onClose,
 }: {
   imageUrl: string
   imageName: string
   initial: SlotRect | null
+  action: 'clear' | 'place'
   onConfirm: (rect: SlotRect) => void
   onClose: () => void
 }) {
@@ -447,7 +449,7 @@ function SlotEditorModal({
         </div>
         <div className="slot-editor-actions">
           <span>{usable && rect
-            ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 框内拖动移动 · 拖手柄缩放 · 方向键微调 · 仅精确清除框内区域`
+            ? `已框选 ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% · 框内拖动移动 · 拖手柄缩放 · 方向键微调 · ${action === 'place' ? '仅在框内放置商品图' : '仅精确清除框内区域'}`
             : '在空白处拖拽画框；画好后可拖动框内移动、拖角点/边手柄缩放'}</span>
           <div className="picker-actions">
             <button className="library-upload" type="button" onClick={onClose}>取消</button>
@@ -627,6 +629,7 @@ function App() {
   const clearProducts = () => { productSelection.clear(); productsRef.current.forEach(releaseAsset); productsRef.current = []; setProducts([]); setProductChecking(false); setProductNotice(''); resetResult() }
   const clearTemplate = () => { templateAssets.forEach(releaseAsset); setTemplateAssets([]); setManualSlot(null); resetResult() }
   const chooseMode = (nextMode: Mode) => {
+    if (nextMode !== mode) setManualSlot(null)
     setMode(nextMode)
     setError('')
     resetResult()
@@ -762,7 +765,7 @@ function App() {
       body.append('outline', '0.78')
       body.append('preserve_logo_pill', String(preserveLogo))
       body.append('quality', '100')
-      if (mode === 'template_replace' && templateAssets.length === 1 && manualSlot) {
+      if ((mode === 'template_replace' || mode === 'cutout') && templateAssets.length === 1 && manualSlot) {
         body.append('slot', `${manualSlot.x.toFixed(4)},${manualSlot.y.toFixed(4)},${manualSlot.w.toFixed(4)},${manualSlot.h.toFixed(4)}`)
       }
       // A one-image task also uses the asynchronous API so its processing stage
@@ -871,7 +874,7 @@ function App() {
           <AssetDrop number="01" title="商品图" hint="支持多选与文件夹 · 自动去除重复图片" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
           {productNotice && <p className={`product-notice ${productChecking ? 'is-checking' : ''}`} role="status">{productChecking && <span className="button-loader" />}{productNotice}</p>}
           {mode === 'template_replace' && <p className="template-mode-note">模板替换只清除每张模板原有的商品区，已上传的商品图会保留供其他合成模式使用。</p>}
-          {mode === 'template_replace' && template && templateAssets.length === 1 && (
+          {(mode === 'template_replace' || mode === 'cutout') && template && templateAssets.length === 1 && (
             <div className="slot-row">
               <button className="drop-choice" type="button" onClick={() => setSlotEditorOpen(true)}>
                 <Icon name="zoom" size={12} /> {manualSlot ? '重新框选商品区' : '手动框选商品区'}
@@ -879,10 +882,10 @@ function App() {
               {manualSlot ? (
                 <>
                   <span className="slot-chip">已框选 {Math.round(manualSlot.w * 100)}% × {Math.round(manualSlot.h * 100)}%</span>
-                  <button className="slot-clear" type="button" onClick={() => setManualSlot(null)}>清除，恢复自动识别</button>
+                  <button className="slot-clear" type="button" onClick={() => { setManualSlot(null); resetResult() }}>清除，恢复自动识别</button>
                 </>
               ) : (
-                <span className="slot-hint-inline">自动识别不准时，可手动框选；系统只清除框内区域，不改动框外内容</span>
+                <span className="slot-hint-inline">{mode === 'cutout' ? '绿幕难以区分时，可手动指定商品图放置范围' : '自动识别不准时，可手动框选；系统只清除框内区域，不改动框外内容'}</span>
               )}
             </div>
           )}
@@ -1020,7 +1023,8 @@ function App() {
           imageUrl={template.url}
           imageName={template.file.name}
           initial={manualSlot}
-          onConfirm={(next) => { setManualSlot(next); setSlotEditorOpen(false) }}
+          action={mode === 'cutout' ? 'place' : 'clear'}
+          onConfirm={(next) => { setManualSlot(next); setSlotEditorOpen(false); setError(''); resetResult() }}
           onClose={() => setSlotEditorOpen(false)}
         />
       )}
