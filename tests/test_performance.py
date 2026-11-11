@@ -129,6 +129,34 @@ class TransparentFrameTest(unittest.TestCase):
                         self.assertEqual(result.tobytes(), expected.tobytes())
 
 
+class DarkFrameTest(unittest.TestCase):
+    def test_cutout_replaces_black_matte_through_rounded_antialiased_edges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            size = (240, 320)
+            frame = Image.new("RGBA", size, (236, 152, 52, 255))
+            large_alpha = Image.new("L", (size[0] * 4, size[1] * 4), 255)
+            ImageDraw.Draw(large_alpha).rounded_rectangle(
+                (42 * 4, 93 * 4, 195 * 4 - 1, 276 * 4 - 1), radius=17 * 4, fill=0,
+            )
+            frame.putalpha(large_alpha.resize(size, Image.Resampling.BOX))
+            ImageDraw.Draw(frame).rectangle((20, 20, 57, 58), fill=(5, 5, 5, 255))
+            matte = Image.alpha_composite(Image.new("RGBA", size, "black"), frame).convert("RGB")
+            matte.save(root / "frame.png")
+            color = (40, 90, 155)
+            Image.new("RGB", (96, 96), color).save(root / "photo.png")
+
+            for mode, output_size in (("cutout", size), ("auto", (120, 160))):
+                with self.subTest(mode=mode, size=output_size):
+                    core.compose(root / "photo.png", root / "frame.png", root / "result.png",
+                                 mode=mode, size=output_size)
+                    scaled = frame.resize(output_size, Image.Resampling.LANCZOS)
+                    expected = Image.alpha_composite(Image.new("RGBA", output_size, color), scaled).convert("RGB")
+                    with Image.open(root / "result.png") as result:
+                        error = np.abs(np.asarray(result, dtype=np.int16) - np.asarray(expected))
+                        self.assertLessEqual(int(error.max()), 5)
+
+
 class GreenSlotDetectionTest(unittest.TestCase):
     def test_neon_panel_isolated_from_connected_green_artwork(self):
         template = Image.new('RGB', (640, 360), (170, 210, 245))

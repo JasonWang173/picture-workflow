@@ -885,6 +885,11 @@ class _TransparentSlot(NamedTuple):
     alpha: Image.Image
 
 
+class _DarkSlot(NamedTuple):
+    box: tuple[int, int, int, int]
+    alpha: Image.Image
+
+
 def _rounded_green_alpha(core: np.ndarray) -> np.ndarray | None:
     """Fit a common corner radius only when independent sides support it."""
     depth = min(core.shape) // 3
@@ -1337,6 +1342,70 @@ def _transparent_product_slot(background: Image.Image) -> _TransparentSlot | Non
     opening.paste(Image.fromarray(coverage), (left, top))
     box = opening.getbbox()
     return _TransparentSlot(box, opening) if box is not None else None
+
+
+def _dark_product_slot(background: Image.Image) -> _DarkSlot | None:
+    """Find a nearly black filled opening and recover its antialiased outline."""
+    if cv2 is None or _has_transparency(background):
+        return None
+    peak = np.asarray(background.convert("RGB")).max(axis=2)
+    height, width = peak.shape
+    dark = (peak <= 32).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    candidates = []
+    for index in range(1, count):
+        x, y, w, h, area = map(int, stats[index])
+        if area < width * height * 0.06 or area < w * h * 0.90:
+            continue
+        if w < width * 0.22 or h < height * 0.22:
+            continue
+        if x < 4 or y < 4 or x + w > width - 4 or y + h > height - 4:
+            continue
+        center = peak[y + h // 8:y + h - h // 8, x + w // 8:x + w - w // 8]
+        if np.mean(center <= 16) < 0.98:
+            continue
+        candidates.append((area, index, x, y, w, h))
+    if not candidates:
+        return None
+
+    _, index, x, y, w, h = max(candidates)
+    pad = 4
+    left, top = x - pad, y - pad
+    region = np.s_[top:y + h + pad, left:x + w + pad]
+    component = (labels[region] == index).astype(np.uint8)
+    nearby = cv2.dilate(component, kernel) > 0
+    interior = cv2.erode(component, kernel) > 0
+    values = peak[region]
+
+    # Black contributes no light. Near the contour the brightest local frame
+    # sample estimates how much frame colour was mixed into each edge pixel.
+    reference_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    reference = cv2.dilate(values, reference_kernel)
+    edge = nearby & ~interior & (reference >= 64)
+    coverage = component * 255
+    frame_share = values[edge].astype(np.float32) / reference[edge]
+    opening_share = np.where(frame_share >= 0.94, 0, 1 - frame_share)
+    opening_share[values[edge] <= 12] = 1
+    coverage[edge] = np.rint(opening_share * 255).astype(np.uint8)
+    mask = Image.new("L", background.size)
+    mask.paste(Image.fromarray(coverage), (left, top))
+    return _DarkSlot(mask.getbbox(), mask)
+
+
+def _unmatte_dark_slot(template: Image.Image, slot: _DarkSlot) -> Image.Image:
+    """Recover the original frame colour before placing the product beneath it."""
+    pixels = np.array(template.crop(slot.box).convert("RGBA"))
+    frame_alpha = 255 - np.asarray(slot.alpha.crop(slot.box))
+    partial = (frame_alpha > 0) & (frame_alpha < 255)
+    pixels[partial, :3] = np.minimum(
+        255, np.rint(pixels[partial, :3] * (255.0 / frame_alpha[partial, None]))
+    ).astype(np.uint8)
+    pixels[..., 3] = frame_alpha
+    result = template.copy()
+    result.paste(Image.fromarray(pixels), slot.box[:2])
+    return result
 
 
 def _framed_photo_slot(
@@ -2139,6 +2208,7 @@ def _template_replace_slot(
     *,
     include_frame: bool = False,
     require_unambiguous_green: bool = False,
+    recover_dark_frame: bool = False,
 ) -> tuple[tuple[int, int, int, int], Image.Image] | None:
     """Locate the best product area for the explicit template-replace mode."""
     # A fully green panel is an explicit placeholder and has a more reliable
@@ -2150,6 +2220,10 @@ def _template_replace_slot(
     green = _green_slot(background, require_unambiguous=require_unambiguous_green)
     if green is not None:
         return green
+    if recover_dark_frame:
+        dark = _dark_product_slot(background)
+        if dark is not None:
+            return dark
     # Structural frame detection handles photographed panels and dark/white
     # placeholders while preserving their decorative border.
     framed = _framed_photo_slot(background, preserve_frame=not include_frame)
@@ -2409,8 +2483,12 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
             selected = "overlay"
         else:
             native_slot = _template_replace_slot(
-                template, include_frame=(mode == "template_replace"), require_unambiguous_green=True
+                template, include_frame=(mode == "template_replace"), require_unambiguous_green=True,
+                recover_dark_frame=mode in {"cutout", "auto"},
             )
+            if isinstance(native_slot, _DarkSlot):
+                template = _unmatte_dark_slot(template, native_slot)
+                native_slot = _TransparentSlot(*native_slot)
             mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
             if mode == "auto":
                 selected = "overlay" if mapped_slot is None and _looks_like_flat_template(template) else "cutout"
