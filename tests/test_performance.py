@@ -103,6 +103,32 @@ class TemplateReuseTest(unittest.TestCase):
             self.assertEqual(core._prepare_template.cache_info().maxsize, 1)
 
 
+class TransparentFrameTest(unittest.TestCase):
+    def test_cutout_fills_transparent_opening_under_antialiased_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = Image.new("RGBA", (240, 320), (224, 148, 52, 255))
+            alpha = frame.getchannel("A")
+            draw = ImageDraw.Draw(alpha)
+            draw.rounded_rectangle((42, 93, 195, 276), radius=12, fill=92)
+            draw.rounded_rectangle((44, 95, 193, 274), radius=10, fill=0)
+            frame.putalpha(alpha)
+            frame.save(root / "frame.png")
+            color = (40, 90, 155)
+            Image.new("RGB", (96, 96), color).save(root / "photo.png")
+
+            for size in (frame.size, (120, 160)):
+                with self.subTest(size=size):
+                    core.compose(root / "photo.png", root / "frame.png", root / "result.png",
+                                 mode="cutout", size=size)
+                    scaled_frame = frame.resize(size, Image.Resampling.LANCZOS)
+                    expected = Image.alpha_composite(Image.new("RGBA", size, color), scaled_frame).convert("RGB")
+                    with Image.open(root / "result.png") as result:
+                        # The entire frame should equal the original PNG drawn
+                        # over the photo, including partial coverage at corners.
+                        self.assertEqual(result.tobytes(), expected.tobytes())
+
+
 class GreenSlotDetectionTest(unittest.TestCase):
     def test_neon_panel_isolated_from_connected_green_artwork(self):
         template = Image.new('RGB', (640, 360), (170, 210, 245))

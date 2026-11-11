@@ -257,7 +257,9 @@ def _edge_fill_color(image: Image.Image) -> tuple[int, int, int]:
     return tuple(int(value) for value in np.median(opaque, axis=0))
 
 
-def fit_contain(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+def fit_contain(
+    image: Image.Image, size: tuple[int, int], *, preserve_alpha_mask: Image.Image | None = None
+) -> Image.Image:
     """Fit the complete template inside a canvas without cropping or stretching.
 
     A vertical downloaded template may be exported to a horizontal preset (or
@@ -270,13 +272,16 @@ def fit_contain(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     scale = min(width / image.width, height / image.height)
     resized_size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
     resized = image.resize(resized_size, Image.Resampling.LANCZOS)
-    if scale < 0.98:
+    if scale < 0.98 and preserve_alpha_mask is None:
         resized = resized.filter(ImageFilter.UnsharpMask(radius=0.45, percent=105, threshold=3))
     fill = _edge_fill_color(image)
     canvas = Image.new("RGBA", size, (*fill, 255))
     left = (width - resized.width) // 2
     top = (height - resized.height) // 2
     canvas.alpha_composite(resized.convert("RGBA"), (left, top))
+    if preserve_alpha_mask is not None:
+        region = (left, top, left + resized.width, top + resized.height)
+        canvas.paste(resized, (left, top), preserve_alpha_mask.crop(region))
     return canvas
 
 
@@ -875,6 +880,11 @@ class _GreenSlot(NamedTuple):
     alpha: Image.Image
 
 
+class _TransparentSlot(NamedTuple):
+    box: tuple[int, int, int, int]
+    alpha: Image.Image
+
+
 def _rounded_green_alpha(core: np.ndarray) -> np.ndarray | None:
     """Fit a common corner radius only when independent sides support it."""
     depth = min(core.shape) // 3
@@ -1221,6 +1231,8 @@ def _slot_for_contain(
     bbox = mapped_mask.getbbox()
     if not bbox:
         return None
+    if isinstance(detected, _TransparentSlot):
+        return _TransparentSlot(bbox, mapped_mask)
     return _GreenSlot(bbox, mapped_mask) if green else (bbox, mapped_mask)
 
 
@@ -1269,7 +1281,7 @@ def _manual_slot_for_contain(
     return (mapped_x0, mapped_y0, mapped_x1, mapped_y1), mask
 
 
-def _transparent_product_slot(background: Image.Image) -> tuple[tuple[int, int, int, int], Image.Image] | None:
+def _transparent_product_slot(background: Image.Image) -> _TransparentSlot | None:
     """Find a large interior transparent hole in a PNG template.
 
     Transparent template pixels are intentional replacement slots, not black
@@ -1300,20 +1312,31 @@ def _transparent_product_slot(background: Image.Image) -> tuple[tuple[int, int, 
         if not candidates:
             return None
         _, index, x, y, box_width, box_height = max(candidates)
-        component = np.where(labels == index, 255, 0).astype(np.uint8)
-        return (int(x), int(y), int(x + box_width), int(y + box_height)), Image.fromarray(component, "L")
+    else:
+        # Dependency-light fallback: only accept a clean interior bounding box.
+        ys, xs = np.where(mask > 0)
+        if len(xs) < width * height * 0.04:
+            return None
+        x, y, x1, y1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+        box_width, box_height = x1 - x, y1 - y
+        if x <= 2 or y <= 2 or x1 >= width - 2 or y1 >= height - 2:
+            return None
+        if box_width < width * 0.25 or box_height < height * 0.25:
+            return None
 
-    # Dependency-light fallback: only accept a clean interior bounding box.
-    ys, xs = np.where(mask > 0)
-    if len(xs) < width * height * 0.04:
-        return None
-    x, y, x1, y1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-    box_width, box_height = x1 - x, y1 - y
-    if x <= 2 or y <= 2 or x1 >= width - 2 or y1 >= height - 2:
-        return None
-    if box_width < width * 0.25 or box_height < height * 0.25:
-        return None
-    return (int(x), int(y), int(x1), int(y1)), Image.fromarray(mask * 255, "L")
+    # Use the hard component only to locate the opening. Recover its original
+    # alpha in the adjacent pixels, including the antialiased frame edge.
+    pad = 3
+    left, top = max(0, x - pad), max(0, y - pad)
+    right, bottom = min(width, x + box_width + pad), min(height, y + box_height + pad)
+    region = np.s_[top:bottom, left:right]
+    selected = (labels[region] == index) if cv2 is not None else mask[region] > 0
+    support = Image.fromarray(selected.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(2 * pad + 1))
+    opening = Image.new("L", (width, height))
+    coverage = np.where(np.asarray(support) > 0, 255 - alpha[region], 0).astype(np.uint8)
+    opening.paste(Image.fromarray(coverage), (left, top))
+    box = opening.getbbox()
+    return _TransparentSlot(box, opening) if box is not None else None
 
 
 def _framed_photo_slot(
@@ -2286,6 +2309,11 @@ def _place_product_slot(
     source_plate = fit_cover(product.convert("RGB"), (slot_width, slot_height))
     plate_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     plate_layer.paste(source_plate.convert("RGBA"), (x0, y0))
+    if isinstance(detected, _TransparentSlot):
+        # The template itself supplies the edge opacity. An opaque photo
+        # beneath that edge fills the opening without showing a matte seam.
+        plate_layer.putalpha(slot_alpha.point([0] + [255] * 255))
+        return Image.alpha_composite(plate_layer, canvas).convert("RGB")
     plate_layer.putalpha(slot_alpha if isinstance(detected, _GreenSlot)
                          else _crisp_slot_alpha(slot_alpha, inset=0))
     return Image.alpha_composite(canvas, plate_layer).convert("RGB")
@@ -2375,10 +2403,9 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
     mapped_slot = None
     selected = mode
     if mode != "overlay":
-        page = fit_contain(template, output_size)
         if mode in {"template_replace", "cutout"} and manual_slot is not None:
             mapped_slot = _manual_slot_for_contain(template, manual_slot, output_size)
-        elif mode == "auto" and _has_transparency(page):
+        elif mode == "auto" and output_size == template.size and _has_transparency(template):
             selected = "overlay"
         else:
             native_slot = _template_replace_slot(
@@ -2390,9 +2417,13 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
     layers = None
     if selected == "overlay":
         layers = _build_overlay_layers(template, output_size, preserve_logo_pill=preserve_logo_pill, outline_strength=outline_strength)
-        page = None
         mapped_slot = None
-    elif selected == "cutout" and isinstance(mapped_slot, _GreenSlot):
+    else:
+        preserve_alpha_mask = None
+        if selected == "cutout" and isinstance(mapped_slot, _TransparentSlot):
+            preserve_alpha_mask = mapped_slot.alpha.point([0] + [255] * 255)
+        page = fit_contain(template, output_size, preserve_alpha_mask=preserve_alpha_mask)
+    if selected == "cutout" and isinstance(mapped_slot, _GreenSlot):
         # Prepare the clean edge once per template, before blending any product.
         # Sharpening after blending would bring back a halo along the curve.
         page = _enhance_output_detail(page, template.size, output_size)
@@ -2449,7 +2480,7 @@ def compose(
             result = _place_cutout(template_page, product=product, detected=mapped_slot)
         # Apply the detail pass after product compositing so both the preserved
         # template typography and the inserted product benefit from it.
-        if not isinstance(mapped_slot, _GreenSlot) and not (selected == "cutout" and manual_slot is not None):
+        if not isinstance(mapped_slot, (_GreenSlot, _TransparentSlot)) and not (selected == "cutout" and manual_slot is not None):
             result = _enhance_output_detail(result, source_size, output_size)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
