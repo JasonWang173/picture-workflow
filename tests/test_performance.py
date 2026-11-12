@@ -158,6 +158,29 @@ class DarkFrameTest(unittest.TestCase):
 
 
 class GreenSlotDetectionTest(unittest.TestCase):
+    def test_cutout_recovers_jpeg_slot_edges_and_keeps_nearby_green_artwork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template = Image.new("RGB", (420, 480), (242, 220, 184))
+            draw = ImageDraw.Draw(template)
+            draw.rectangle((51, 136, 357, 427), fill=(0, 255, 0))
+            draw.rectangle((35, 280, 42, 342), fill=(0, 255, 0))
+            draw.polygon(((358, 282), (389, 280), (399, 340), (359, 342)), fill=(65, 158, 82))
+            template.save(root / "template.jpg", quality=72, subsampling=2)
+            food = (185, 54, 39)
+            Image.new("RGB", (96, 96), food).save(root / "product.png")
+
+            core.compose(root / "product.png", root / "template.jpg", root / "out.png", mode="cutout")
+            with Image.open(root / "template.jpg") as source, Image.open(root / "out.png") as result:
+                for xy in ((51, 220), (135, 136), (357, 220), (135, 427)):
+                    self.assertEqual(result.getpixel(xy), food, xy)
+                for xy in ((38, 315), (372, 315)):
+                    self.assertEqual(result.getpixel(xy), source.getpixel(xy), xy)
+                edge = np.asarray(result.crop((44, 130, 363, 435)), dtype=np.int16)
+                green = (edge[..., 1] >= 100) & (edge[..., 1] - np.maximum(edge[..., 0], edge[..., 2]) >= 25)
+                green[150 - 130:350 - 130, 358 - 44:] = False  # Adjacent green decoration.
+                self.assertLessEqual(np.count_nonzero(green), 10)
+
     def test_neon_panel_isolated_from_connected_green_artwork(self):
         template = Image.new('RGB', (640, 360), (170, 210, 245))
         draw = ImageDraw.Draw(template)

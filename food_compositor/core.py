@@ -2314,16 +2314,18 @@ def _remove_template_product(
     return canvas.convert("RGB")
 
 
-def _clean_green_edge(
-    background: Image.Image, slot: _GreenSlot, bleed: int
-) -> Image.Image:
-    """Remove key-color contamination before blending a verified green panel."""
+def _prepare_green_opening(
+    background: Image.Image, slot: _GreenSlot
+) -> tuple[Image.Image, _TransparentSlot]:
+    """Recover a verified green opening before resizing the template."""
     x0, y0, x1, y1 = slot.box
+    bleed = 5
     padding = bleed + 3
     box = (max(0, x0 - padding), max(0, y0 - padding),
            min(background.width, x1 + padding), min(background.height, y1 + padding))
-    alpha = np.asarray(slot.alpha.crop(box))
+    alpha = np.array(slot.alpha.crop(box))
     occupied = (alpha > 0).astype(np.uint8)
+
     def expand(radius: int) -> np.ndarray:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
         return cv2.dilate(occupied, kernel)
@@ -2331,31 +2333,56 @@ def _clean_green_edge(
     ys, xs = np.nonzero((expand(bleed) != 0) & (alpha < 255))
     guard = expand(bleed + 1)
     exterior = np.flatnonzero(guard == 0)
-    if not len(ys) or not exterior.size:
-        return background
-    _, labels = cv2.distanceTransformWithLabels(
-        guard, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
-    )
-    nearest = np.empty(exterior.size + 1, dtype=np.intp)
-    nearest[labels.ravel()[exterior]] = exterior
-    ref_y, ref_x = np.unravel_index(nearest[labels[ys, xs]], alpha.shape)
     rgba = np.array(background.crop(box).convert("RGBA"))
-    reference = rgba[ref_y, ref_x, :3].astype(np.float32)
-    current = rgba[ys, xs, :3].astype(np.float32)
-    mid_x, mid_y = (x0 + x1) // 2 - box[0], (y0 + y1) // 2 - box[1]
-    key = np.median(rgba[mid_y - 3:mid_y + 4, mid_x - 3:mid_x + 4, :3], axis=(0, 1))
-    direction = key - reference
-    delta = current - reference
-    length_sq = np.sum(direction**2, axis=1)
-    fraction = np.sum(delta * direction, axis=1) / np.maximum(length_sq, 1)
-    residual = np.linalg.norm(delta - np.clip(fraction, 0, 1)[:, None] * direction, axis=1)
-    # Only change pixels whose color has actually shifted toward the sampled
-    # green. Nearby artwork that does not match the spill model is preserved.
-    spill = (length_sq > 50**2) & (fraction > 0.07) & (residual < 24 + 20 * fraction)
-    rgba[ys[spill], xs[spill], :3] = reference[spill]
+    if ys.size and exterior.size:
+        _, labels = cv2.distanceTransformWithLabels(
+            guard, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+        )
+        nearest = np.empty(exterior.size + 1, dtype=np.intp)
+        nearest[labels.ravel()[exterior]] = exterior
+        ref_y, ref_x = np.unravel_index(nearest[labels[ys, xs]], alpha.shape)
+        reference = rgba[ref_y, ref_x, :3].astype(np.float32)
+        current = rgba[ys, xs, :3].astype(np.float32)
+        mid_x, mid_y = (x0 + x1) // 2 - box[0], (y0 + y1) // 2 - box[1]
+        key = np.median(rgba[mid_y - 3:mid_y + 4, mid_x - 3:mid_x + 4, :3], axis=(0, 1))
+
+        # JPEG often spreads chroma farther than luma. Compare channel
+        # differences so a luma jump at the actual edge won't hide green spill.
+        color_delta = current - reference
+        key_delta = key - reference
+        delta = color_delta[:, 1:2] - color_delta[:, [0, 2]]
+        direction = key_delta[:, 1:2] - key_delta[:, [0, 2]]
+        strength = np.sum(direction**2, axis=1)
+        fraction = np.sum(delta * direction, axis=1) / np.maximum(strength, 1)
+        residual = np.linalg.norm(delta - fraction[:, None] * direction, axis=1)
+        spill = ((strength > 50**2) & (fraction > 0.07) & (fraction < 1.2)
+                 & (residual < 18 + 24 * np.clip(fraction, 0, 1)))
+
+        # Require a connected run back to the panel. Separate green details
+        # in the narrow search band should not be used to enlarge the opening.
+        support = occupied.copy()
+        support[ys[spill], xs[spill]] = 1
+        _, connected = cv2.connectedComponents(support, connectivity=8)
+        panel_labels = np.unique(connected[occupied != 0])
+        spill &= np.isin(connected[ys, xs], panel_labels)
+
+        # The broad detector gives safe outer bounds. Reclaim strongly keyed
+        # pixels missed by the tight mask inside them, but keep fitted curves.
+        if not np.any((alpha > 0) & (alpha < 255)):
+            inside_box = ((xs + box[0] >= x0) & (xs + box[0] < x1)
+                          & (ys + box[1] >= y0) & (ys + box[1] < y1))
+            recover = spill & inside_box & (fraction >= 0.43) & (expand(3)[ys, xs] > 0)
+            alpha[ys[recover], xs[recover]] = 255
+        rgba[ys[spill], xs[spill], :3] = reference[spill]
+
+    # Resampling a transparent opening keeps the key colour from bleeding
+    # back out of its fully replaced pixels when the output size changes.
+    rgba[..., 3] = (rgba[..., 3].astype(np.uint16) * (255 - alpha) + 127) // 255
     cleaned = background.convert("RGBA")
     cleaned.paste(Image.fromarray(rgba), box[:2])
-    return cleaned
+    opening = Image.new("L", background.size)
+    opening.paste(Image.fromarray(alpha), box[:2])
+    return cleaned, _TransparentSlot(slot.box, opening)
 
 
 def _place_product_slot(
@@ -2489,6 +2516,8 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
             if isinstance(native_slot, _DarkSlot):
                 template = _unmatte_dark_slot(template, native_slot)
                 native_slot = _TransparentSlot(*native_slot)
+            elif isinstance(native_slot, _GreenSlot) and mode in {"cutout", "auto"}:
+                template, native_slot = _prepare_green_opening(template, native_slot)
             mapped_slot = _slot_for_contain(native_slot, output_size) if native_slot is not None else None
             if mode == "auto":
                 selected = "overlay" if mapped_slot is None and _looks_like_flat_template(template) else "cutout"
@@ -2501,14 +2530,7 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
         if selected == "cutout" and isinstance(mapped_slot, _TransparentSlot):
             preserve_alpha_mask = mapped_slot.alpha.point([0] + [255] * 255)
         page = fit_contain(template, output_size, preserve_alpha_mask=preserve_alpha_mask)
-    if selected == "cutout" and isinstance(mapped_slot, _GreenSlot):
-        # Prepare the clean edge once per template, before blending any product.
-        # Sharpening after blending would bring back a halo along the curve.
-        page = _enhance_output_detail(page, template.size, output_size)
-        scale = min(output_size[0] / template.width, output_size[1] / template.height)
-        bleed = min(6, max(2, int(np.ceil(2 * scale))))
-        page = _clean_green_edge(page, mapped_slot, bleed)
-    elif selected == "cutout" and manual_slot is not None:
+    if selected == "cutout" and manual_slot is not None:
         page = _enhance_output_detail(page, template.size, output_size)
     return template.size, output_size, page, mapped_slot, selected, layers
 
