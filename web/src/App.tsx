@@ -2,6 +2,8 @@ import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useRef, use
 import { submitComposition, type SubmissionProgress } from './compositionRequest'
 import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
 import { ProductSelection } from './productSelection'
+import { CompositionArchive } from './CompositionArchive'
+import { checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
 type TemplateMode = 'auto' | 'overlay' | 'cutout'
@@ -471,6 +473,11 @@ function App() {
   const [size, setSize] = useState('1080x1920')
   const [preserveLogo, setPreserveLogo] = useState(true)
   const [resultUrl, setResultUrl] = useState<string | null>(null)
+  const [singleResult, setSingleResult] = useState<BatchImage | null>(null)
+  const [resultBatchId, setResultBatchId] = useState<string | null>(null)
+  const [archiveOpen, setArchiveOpen] = useState(false)
+  const [resultAction, setResultAction] = useState('')
+  const [resultNotice, setResultNotice] = useState('')
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
   const [batchSkipped, setBatchSkipped] = useState<BatchSkipped[]>([])
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null)
@@ -525,12 +532,13 @@ function App() {
   }
   useEffect(() => { loadTemplates() }, [])
   useEffect(() => {
-    if (!lightbox && !pickerOpen && !slotEditorOpen) return
+    if (!lightbox && !pickerOpen && !slotEditorOpen && !archiveOpen) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
         if (lightbox) setLightbox(null)
         else if (slotEditorOpen) setSlotEditorOpen(false)
         else if (pickerOpen) setPickerOpen(false)
+        else if (archiveOpen) setArchiveOpen(false)
       }
     }
     const previousOverflow = document.body.style.overflow
@@ -540,7 +548,7 @@ function App() {
       document.body.style.overflow = previousOverflow
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [lightbox, pickerOpen, slotEditorOpen])
+  }, [lightbox, pickerOpen, slotEditorOpen, archiveOpen])
   useEffect(() => {
     fetch('/api/demo-available')
       .then((response) => response.ok ? response.json() : { available: false })
@@ -562,6 +570,9 @@ function App() {
   const resetResult = () => {
     setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
     setBatchImages([])
+    setSingleResult(null)
+    setResultBatchId(null)
+    setResultNotice('')
     setBatchSkipped([])
     setBatchProgress(null)
     setSelectedBatchIds([])
@@ -750,7 +761,7 @@ function App() {
   const compose = async () => {
     const needsProduct = mode !== 'template_replace'
     const isBatch = templateAssets.length > 1 || (needsProduct && products.length > 1)
-    if (loading || productChecking || !template || (needsProduct && !products.length)) return
+    if (loading || resultAction || productChecking || !template || (needsProduct && !products.length)) return
     resetResult()
     setLoading(true)
     setError('')
@@ -796,6 +807,7 @@ function App() {
         setBatchProgress({ done: status.done, total: status.total, status: status.status, templateIndex: status.current_template_index, templateCount: status.template_count, templateName: status.current_template_name })
         if (status.status === 'done' || status.status === 'failed') {
           const images = status.images || []
+          setResultBatchId(payload.batch_id)
           setLastMode(mode)
           setLastSize(size)
           setBatchSkipped(status.skipped || [])
@@ -811,6 +823,7 @@ function App() {
               if (!imageResponse.ok) throw new Error('图片读取失败')
               const blob = await imageResponse.blob()
               setResultUrl(URL.createObjectURL(blob))
+              setSingleResult(images[0])
             } catch {
               throw new Error('合成已完成，但结果图片读取失败，请重试')
             }
@@ -842,6 +855,75 @@ function App() {
     setSelectedBatchIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
   }
 
+  const downloadResult = async (image: BatchImage) => {
+    if (!resultBatchId || resultAction) return
+    setResultAction(image.id)
+    setResultNotice('')
+    try {
+      const response = await fetch(`/api/batches/${resultBatchId}/images/${image.id}/download`)
+      await checkArchiveResponse(response, '下载失败，请重试')
+      const record = response.headers.get('X-Composition-Record')
+      if (record) updateArchiveRecords([JSON.parse(decodeURIComponent(record)) as ArchiveEntry])
+      const url = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = image.name
+      link.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+      setResultNotice('已存入合成记录')
+    } catch (cause) {
+      setResultNotice(cause instanceof Error ? cause.message : '下载失败，请重试')
+    } finally {
+      setResultAction('')
+    }
+  }
+
+  const downloadResults = async (url: string, name: string) => {
+    if (resultAction) return
+    setResultAction('zip')
+    setResultNotice('')
+    try {
+      const response = await fetch(url, { method: 'POST' })
+      await checkArchiveResponse(response, '打包下载失败，请重试')
+      const payload = await response.json() as { items: ArchiveEntry[]; url: string }
+      updateArchiveRecords(payload.items)
+      const link = document.createElement('a')
+      link.href = payload.url
+      link.download = name
+      link.click()
+      setResultNotice('已存入合成记录')
+    } catch (cause) {
+      setResultNotice(cause instanceof Error ? cause.message : '打包下载失败，请重试')
+    } finally {
+      setResultAction('')
+    }
+  }
+
+  const trashResult = async (image: BatchImage) => {
+    if (!resultBatchId || resultAction) return
+    setResultAction(image.id)
+    setResultNotice('')
+    try {
+      const response = await fetch(`/api/batches/${resultBatchId}/images/${image.id}`, { method: 'DELETE' })
+      await checkArchiveResponse(response, '移入回收站失败，请重试')
+      const { item } = await response.json() as { item: ArchiveEntry }
+      updateArchiveRecords([item])
+      if (singleResult?.id === image.id) {
+        setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
+        setSingleResult(null)
+        setResultSavedName(null)
+      } else {
+        setBatchImages((current) => current.filter((item) => item.id !== image.id))
+        setSelectedBatchIds((current) => current.filter((id) => id !== image.id))
+      }
+      setResultNotice('已移入回收站，可在合成空间站恢复')
+    } catch (cause) {
+      setResultNotice(cause instanceof Error ? cause.message : '移入回收站失败，请重试')
+    } finally {
+      setResultAction('')
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -850,6 +932,7 @@ function App() {
           <span>FRAME<span>/</span>FOOD</span>
         </a>
         <div className="topbar-right">
+          <button className="toolbar-button archive-entry" type="button" onClick={() => setArchiveOpen(true)}>合成空间站</button>
           <span className="engine-status"><i /> Python compositor</span>
           <span className="version">v0.1</span>
         </div>
@@ -864,7 +947,7 @@ function App() {
       </section>
 
       <section className="workspace" aria-label="图片合成工作台">
-        <aside className="control-panel"><fieldset className="control-fields" disabled={loading || libraryBusy}>
+        <aside className="control-panel"><fieldset className="control-fields" disabled={loading || libraryBusy || !!resultAction}>
           <div className="panel-heading">
             <div><span className="section-label">01 / 工作流</span><h2>{mode === 'template_replace' ? '先制作空白模板' : '合成商品海报'}</h2></div>
             {demoAvailable && <button className="text-button" type="button" onClick={loadDemo}><Icon name="spark" size={14} /> 试用示例</button>}
@@ -923,7 +1006,7 @@ function App() {
           <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading || productChecking} onClick={compose}>
             {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
-          <p className="privacy-note"><span className="lock-dot" /> 图片只在本地 Python 引擎中处理</p>
+          <p className="privacy-note"><span className="lock-dot" /> 下载或删除的合成图在 OSS 保存 7 天</p>
         </fieldset></aside>
 
         <section className={`preview-panel ${resultUrl || hasBatch ? 'has-result' : ''}`} aria-live="polite">
@@ -967,7 +1050,10 @@ function App() {
                         <div className="batch-card-meta">
                           <span>{String(index + 1).padStart(2, '0')}</span>
                           <span title={`模板 ${image.template_index}：${image.template_name} · 商品 ${image.product_index}：${image.product_name}`}>模板 {image.template_index} · {image.template_name}<br />{lastMode === 'template_replace' ? '空白模板' : `商品 ${image.product_index} · ${image.product_name}`}</span>
-                          <a href={image.url} download={image.name} aria-label={`下载 ${image.name}`}><Icon name="download" size={14} /></a>
+                          <div className="result-card-buttons">
+                            <button type="button" disabled={!!resultAction} onClick={() => void downloadResult(image)} aria-label={`下载 ${image.name}`}><Icon name="download" size={14} /></button>
+                            <button type="button" disabled={!!resultAction} onClick={() => void trashResult(image)} aria-label={`移入回收站 ${image.name}`}><Icon name="close" size={14} /></button>
+                          </div>
                         </div>
                       </article>
                       </Fragment>
@@ -988,19 +1074,22 @@ function App() {
               <div><span className="result-caption">输出尺寸</span><strong>{displaySize.replace('x', ' × ')} px · JPG <span className="size-limit">&lt;300KB</span> · {lastMode === 'auto' ? '智能判断' : lastMode === 'overlay' ? '模板叠加 · Logo/文字' : lastMode === 'template_replace' ? '模板替换 · 绿色占位模板' : '主体抠图 · 区域替换'}</strong></div>
               <div className="result-download-actions">{lastMode === 'template_replace' && (resultSavedName
                 ? <span className="download-button save-template-button is-saved"><Icon name="check" size={15} /> 已存入模板库</span>
-                : <button className="download-button save-template-button" type="button" disabled={libraryBusy} onClick={saveResultToLibrary}><Icon name="library" size={15} /> {libraryBusy ? '保存中' : '存入模板库'}</button>)}<a className="download-button" href={resultUrl} download={`food-composite-${Date.now()}.jpg`}><Icon name="download" size={16} /> 下载 JPG</a></div>
+                : <button className="download-button save-template-button" type="button" disabled={libraryBusy} onClick={saveResultToLibrary}><Icon name="library" size={15} /> {libraryBusy ? '保存中' : '存入模板库'}</button>)}
+                {singleResult && <><button className="toolbar-button" type="button" disabled={!!resultAction} onClick={() => void trashResult(singleResult)}>移入回收站</button><button className="download-button" type="button" disabled={!!resultAction} onClick={() => void downloadResult(singleResult)}><Icon name="download" size={16} /> 下载 JPG</button></>}
+              </div>
             </div>
           ) : hasBatch ? (
             <div className="result-actions">
               <div><span className="result-caption">批量输出</span><strong>{displaySize.replace('x', ' × ')} px · {batchImages.length} 张 JPG · 单张 &lt;300KB</strong></div>
               <div className="batch-download-actions">
-                <a className={`download-button ${selectedDownloadUrl ? '' : 'is-disabled'}`} href={selectedDownloadUrl || '#'} onClick={(event) => { if (!selectedDownloadUrl) event.preventDefault() }} download="food-composites-selected.zip"><Icon name="download" size={16} /> 下载选中</a>
-                <a className="download-button download-button-secondary" href={batchDownloadUrl || '#'} onClick={(event) => { if (!batchDownloadUrl) event.preventDefault() }} download="food-composites.zip"><Icon name="download" size={16} /> 下载全部</a>
+                <button className="download-button" type="button" disabled={!selectedDownloadUrl || !!resultAction} onClick={() => { if (selectedDownloadUrl) void downloadResults(selectedDownloadUrl, 'food-composites-selected.zip') }}><Icon name="download" size={16} /> 下载选中</button>
+                <button className="download-button download-button-secondary" type="button" disabled={!batchDownloadUrl || !!resultAction} onClick={() => { if (batchDownloadUrl) void downloadResults(batchDownloadUrl, 'food-composites.zip') }}><Icon name="download" size={16} /> 下载全部</button>
               </div>
             </div>
           ) : (
               <div className="preview-footnote"><span>TIP</span> {mode === 'cutout' ? '主体抠图会识别绿色占位区，只替换该区域，商品原图按比例高清嵌入。' : mode === 'overlay' ? '模板叠加优先使用 PNG 原生透明层；没有透明层时才识别边缘连通底色。商品图按比例铺满，不拉伸变形。' : mode === 'template_replace' ? '模板替换无需商品素材：只清除模板里的商品图片区，输出绿色占位模板。自动识别不准时用“手动框选商品区”精确选区，系统仅清除框内区域，框外保持原样。' : '智能判断会分别识别每张模板，自动选择主体抠图或模板叠加；识别不理想时可在模板列表中指定方式。'}</div>
           )}
+          {resultNotice && <p className="archive-result-notice" role="status">{resultNotice}</p>}
         </section>
       </section>
       <footer className="footer"><span>FRAME/FOOD</span><span>Built for fast food campaigns · 本地图片工作流</span></footer>
@@ -1028,8 +1117,9 @@ function App() {
           onClose={() => setSlotEditorOpen(false)}
         />
       )}
+      {archiveOpen && <CompositionArchive onClose={() => setArchiveOpen(false)} onPreview={setLightbox} />}
       {lightbox && (
-        <div className={`lightbox ${pickerOpen ? 'is-stacked' : ''}`} role="dialog" aria-modal="true" aria-label={lightbox.kind === 'template' ? '模板放大预览' : '合成图放大预览'} onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
+        <div className={`lightbox ${pickerOpen || archiveOpen ? 'is-stacked' : ''}`} role="dialog" aria-modal="true" aria-label={lightbox.kind === 'template' ? '模板放大预览' : '合成图放大预览'} onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
           <div className="lightbox-panel">
             <div className="lightbox-bar">
               <div><span className="section-label">{lightbox.kind === 'template' ? 'TEMPLATE PREVIEW' : 'DETAIL PREVIEW'}</span><strong>{lightbox.name}</strong></div>

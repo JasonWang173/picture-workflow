@@ -5,6 +5,9 @@ import os
 for _thread_setting in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_thread_setting, "1")
 import re
+import asyncio
+import hashlib
+import secrets
 import shutil
 import tempfile
 import uuid
@@ -16,27 +19,29 @@ from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
+from threading import Lock
 import time
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from food_compositor import compose
+from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION
 from food_compositor.execution import submit_composition, worker_count, estimate_memory, shutdown_executor
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
-BATCH_ROOT = ROOT / "runtime" / "batches"
+BATCH_ROOT = Path(os.environ.get("COMPOSITION_BATCH_ROOT", ROOT / "runtime" / "batches"))
 # Optional machine-specific settings contain no credentials and are never committed.
 _local_oss_settings = ROOT / "runtime" / "local-oss.json"
 if _local_oss_settings.is_file():
     try:
         _settings = json.loads(_local_oss_settings.read_text(encoding="utf-8"))
-        for _name in ("OSS_BUCKET", "OSS_ENDPOINT", "OSS_TEMPLATE_PREFIX", "OSS_TRANSPORT"):
+        for _name in ("OSS_BUCKET", "OSS_ENDPOINT", "OSS_TEMPLATE_PREFIX", "OSS_COMPOSITION_PREFIX", "OSS_TRANSPORT"):
             if isinstance(_settings.get(_name), str):
                 os.environ.setdefault(_name, _settings[_name])
     except (OSError, ValueError, AttributeError):
@@ -45,6 +50,9 @@ if _local_oss_settings.is_file():
 # template is a set of self-describing objects (image, thumb, meta json), so
 # concurrent uploads never fight over a shared mutable index.
 OSS_PREFIX = os.environ.get("OSS_TEMPLATE_PREFIX", "picture-workflow/templates/")
+ARCHIVE_PREFIX = os.environ.get("OSS_COMPOSITION_PREFIX", "picture-workflow/compositions/").strip("/") + "/"
+WORKSPACE_COOKIE = "composition_workspace"
+_batch_locks = [Lock() for _ in range(64)]
 _OSS_BUCKET = None
 _TEMPLATE_ID_RE = re.compile(r"[0-9a-f]{16}")
 DEMO_ASSETS = {
@@ -61,9 +69,13 @@ LOGGER = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app):
     _fail_interrupted_batches()
+    cleanup = asyncio.create_task(_archive_cleanup_loop())
     try:
         yield
     finally:
+        cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup
         await run_in_threadpool(shutdown_executor)
 
 
@@ -139,6 +151,65 @@ def _oss_bucket():
     auth = oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
     _OSS_BUCKET = oss2.Bucket(auth, os.environ["OSS_ENDPOINT"], os.environ["OSS_BUCKET"], connect_timeout=15)
     return _OSS_BUCKET
+
+
+def _workspace_owner(request: Request, response: Response | None = None) -> str | None:
+    token = request.cookies.get(WORKSPACE_COOKIE, "")
+    if not OWNER_ID.fullmatch(token):
+        if response is None:
+            return None
+        token = secrets.token_hex(32)
+        response.set_cookie(WORKSPACE_COOKIE, token, max_age=365 * 24 * 3600,
+                            httponly=True, secure=request.url.scheme == "https", samesite="strict")
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+@contextmanager
+def _composition_archive():
+    sdk = _oss_sdk()
+    try:
+        yield CompositionArchive(_oss_bucket(), sdk, ARCHIVE_PREFIX)
+    except sdk.exceptions.OssError as exc:
+        LOGGER.warning("合成记录 OSS 操作失败", exc_info=True)
+        raise HTTPException(status_code=503, detail="合成记录暂时无法连接 OSS，请稍后重试") from exc
+
+
+def _purge_composition_storage() -> None:
+    now = datetime.now(timezone.utc)
+    for path in BATCH_ROOT.glob("*/status.json"):
+        try:
+            batch_id = path.parent.name
+            if not re.fullmatch(r"[0-9a-f]{12}", batch_id):
+                continue
+            with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+                status = _read_batch_status(path.parent)
+                if not status or status["status"] not in {"done", "failed"}:
+                    continue
+                timestamp = status.get("finished_at") or status.get("created_at")
+                if timestamp and datetime.fromisoformat(timestamp) + RETENTION <= now:
+                    shutil.rmtree(path.parent)
+                    continue
+                for prepared in path.parent.glob("download-*.zip"):
+                    if now.timestamp() - prepared.stat().st_mtime > 3600:
+                        prepared.unlink(missing_ok=True)
+        except (OSError, ValueError, KeyError):
+            LOGGER.warning("本地批次清理失败：%s", path.parent.name, exc_info=True)
+    if not os.environ.get("OSS_BUCKET") and _OSS_BUCKET is None:
+        return
+    try:
+        with _composition_archive() as archive:
+            archive.purge_expired()
+    except HTTPException as exc:
+        LOGGER.warning("合成空间站未能清理 OSS：%s", exc.detail)
+
+
+async def _archive_cleanup_loop() -> None:
+    while True:
+        try:
+            await run_in_threadpool(_purge_composition_storage)
+        except Exception:
+            LOGGER.exception("合成空间站定期清理异常")
+        await asyncio.sleep(15 * 60)
 
 
 def _validated_template_id(template_id: str) -> str:
@@ -518,6 +589,7 @@ async def create_composition(
 @app.post("/api/compose-batch")
 async def create_batch_composition(
     background_tasks: BackgroundTasks,
+    request: Request,
     products: Annotated[Optional[list[UploadFile]], File(description="商品图片文件夹或多选图片")] = None,
     template: Annotated[Optional[UploadFile], File(description="兼容单张模板")] = None,
     templates: Annotated[Optional[list[UploadFile]], File(description="按顺序处理的模板图")] = None,
@@ -556,6 +628,12 @@ async def create_batch_composition(
         requested_modes = parsed_modes
 
     batch_id = uuid.uuid4().hex[:12]
+    response = JSONResponse({
+        "batch_id": batch_id,
+        "total": max(1, len(image_products)) * len(image_templates),
+        "status_url": f"/api/batches/{batch_id}/status",
+    })
+    owner = _workspace_owner(request, response)
     batch_dir = BATCH_ROOT / batch_id
     work_dir = batch_dir / "work"
     output_dir = batch_dir / "outputs"
@@ -590,6 +668,7 @@ async def create_batch_composition(
         )
         _write_batch_status(batch_dir, {
             "status": "queued",
+            "owner": owner,
             "total": len(manifest_items) * len(manifest_templates),
             "done": 0,
             "skipped": [],
@@ -614,11 +693,7 @@ async def create_batch_composition(
         preserve_logo_pill,
         max(1, min(100, int(quality))),
     )
-    return JSONResponse({
-        "batch_id": batch_id,
-        "total": len(manifest_items) * len(manifest_templates),
-        "status_url": f"/api/batches/{batch_id}/status",
-    })
+    return response
 
 
 def _compose_one(
@@ -752,6 +827,7 @@ def _run_batch_composition(
         # A failed submit/status write must not remove inputs while workers use them.
         if futures:
             wait(futures)
+        status["finished_at"] = datetime.now(timezone.utc).isoformat()
         _write_batch_status(batch_dir, status)
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -765,43 +841,205 @@ def _batch_directory(batch_id: str) -> Path:
     return directory
 
 
-@app.get("/api/batches/{batch_id}/status")
-def get_batch_status(batch_id: str) -> JSONResponse:
-    batch_dir = _batch_directory(batch_id)
+def _owned_batch_status(batch_dir: Path, request: Request) -> dict:
     status = _read_batch_status(batch_dir)
-    if status is None:
-        raise HTTPException(status_code=404, detail="批次状态不存在")
-    return JSONResponse(status)
+    if status is None or (status.get("owner") and status["owner"] != _workspace_owner(request)):
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return status
+
+
+def _batch_result(batch_dir: Path, image: dict) -> Path:
+    output_dir = (batch_dir / "outputs").resolve()
+    path = (output_dir / Path(image["name"]).name).resolve()
+    if path.parent != output_dir or path.suffix.lower() != ".jpg" or not path.is_file():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return path
+
+
+def _result_image(status: dict, image_id: str) -> dict:
+    for image in status.get("images", []):
+        if image["id"] == image_id:
+            return image
+    raise HTTPException(status_code=404, detail="图片不存在")
+
+
+@app.get("/api/batches/{batch_id}/status")
+def get_batch_status(batch_id: str, request: Request) -> JSONResponse:
+    batch_dir = _batch_directory(batch_id)
+    status = _owned_batch_status(batch_dir, request)
+    return JSONResponse({key: value for key, value in status.items() if key != "owner"},
+                        headers={"Cache-Control": "private, no-store"})
+
+
+def _prepare_batch_download(batch_id: str, request: Request, ids: str | None, ticket: str | None = None) -> tuple[Path, list[dict]]:
+    batch_dir = _batch_directory(batch_id)
+    archive_path = None
+    records = []
+    try:
+        with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+            status = _owned_batch_status(batch_dir, request)
+            wanted = {item.strip() for item in ids.split(",")} if ids is not None else None
+            selected = [(image, _batch_result(batch_dir, image)) for image in status.get("images", [])
+                        if wanted is None or image["id"] in wanted]
+            if not selected:
+                raise HTTPException(status_code=404, detail="没有可下载的合成图")
+            if ticket:
+                archive_path = batch_dir / f"download-{ticket}.zip"
+            else:
+                with tempfile.NamedTemporaryFile(prefix="food-composites-", suffix=".zip", delete=False) as temporary:
+                    archive_path = Path(temporary.name)
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as zipped:
+                for _, path in selected:
+                    zipped.write(path, arcname=path.name)
+            owner = status.get("owner")
+            if owner:
+                with _composition_archive() as archive:
+                    def save_item(item):
+                        image, path = item
+                        return archive.save(owner, f"{batch_id}-{image['id']}", image, path, "history")
+                    with ThreadPoolExecutor(max_workers=6) as pool:
+                        records = list(pool.map(save_item, selected))
+    except Exception:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
+        raise
+    return archive_path, records
+
+
+def _batch_zip_response(archive_path: Path, background_tasks: BackgroundTasks) -> FileResponse:
+    background_tasks.add_task(archive_path.unlink, missing_ok=True)
+    return FileResponse(archive_path, media_type="application/zip", filename="food-composites.zip",
+                        headers={"Cache-Control": "private, no-store"}, background=background_tasks)
 
 
 @app.get("/api/batches/{batch_id}/download")
-def download_batch(batch_id: str, background_tasks: BackgroundTasks, ids: Optional[str] = None) -> FileResponse:
+def download_batch(batch_id: str, request: Request, background_tasks: BackgroundTasks, ids: Optional[str] = None) -> FileResponse:
+    archive_path, _ = _prepare_batch_download(batch_id, request, ids)
+    return _batch_zip_response(archive_path, background_tasks)
+
+
+@app.post("/api/batches/{batch_id}/download")
+def prepare_batch_download(batch_id: str, request: Request, ids: Optional[str] = None) -> JSONResponse:
+    ticket = uuid.uuid4().hex
+    _, records = _prepare_batch_download(batch_id, request, ids, ticket)
+    return JSONResponse({"items": records, "url": f"/api/batches/{batch_id}/downloads/{ticket}"},
+                        headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/batches/{batch_id}/downloads/{ticket}")
+def get_prepared_batch_download(batch_id: str, ticket: str, request: Request, background_tasks: BackgroundTasks) -> FileResponse:
     batch_dir = _batch_directory(batch_id)
-    output_dir = (batch_dir / "outputs").resolve()
-    available = sorted(output_dir.glob("*.jpg"))
-    if ids:
-        wanted = {item.strip() for item in ids.split(",") if item.strip()}
-        selected = [path for path in available if path.stem.split("_", 1)[0] in wanted]
-    else:
-        selected = available
-    if not selected:
-        raise HTTPException(status_code=404, detail="没有可下载的合成图")
-    archive_path = batch_dir / f"selected-{uuid.uuid4().hex[:8]}.zip"
-    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
-        for image_path in selected:
-            archive.write(image_path, arcname=image_path.name)
-    background_tasks.add_task(archive_path.unlink, missing_ok=True)
-    return FileResponse(archive_path, media_type="application/zip", filename="food-composites.zip", background=background_tasks)
+    status = _owned_batch_status(batch_dir, request)
+    path = batch_dir / f"download-{ticket}.zip"
+    if not status.get("owner") or not re.fullmatch(r"[0-9a-f]{32}", ticket) or not path.is_file():
+        raise HTTPException(status_code=404, detail="下载文件不存在，请重新下载")
+    return _batch_zip_response(path, background_tasks)
+
+
+@app.get("/api/batches/{batch_id}/images/{image_id}/download")
+def download_batch_image(batch_id: str, image_id: str, request: Request) -> Response:
+    batch_dir = _batch_directory(batch_id)
+    record = None
+    with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+        status = _owned_batch_status(batch_dir, request)
+        image = _result_image(status, image_id)
+        path = _batch_result(batch_dir, image)
+        content = path.read_bytes()
+        owner = status.get("owner")
+        if owner:
+            with _composition_archive() as archive:
+                record = archive.save(owner, f"{batch_id}-{image_id}", image, path, "history")
+    response = _archived_image_response(path.name, content, download=True)
+    if record:
+        response.headers["X-Composition-Record"] = quote(json.dumps(record, ensure_ascii=True), safe="")
+    return response
+
+
+@app.delete("/api/batches/{batch_id}/images/{image_id}")
+def delete_batch_image(batch_id: str, image_id: str, request: Request) -> dict:
+    batch_dir = _batch_directory(batch_id)
+    with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+        status = _owned_batch_status(batch_dir, request)
+        if status["status"] not in {"done", "failed"}:
+            raise HTTPException(status_code=409, detail="请等待合成结束后再删除")
+        owner = status.get("owner")
+        if not owner:
+            raise HTTPException(status_code=409, detail="该批旧结果不支持移入回收站")
+        image = _result_image(status, image_id)
+        path = _batch_result(batch_dir, image)
+        with _composition_archive() as archive:
+            record = archive.save(owner, f"{batch_id}-{image_id}", image, path, "trash")
+        status["images"] = [item for item in status["images"] if item["id"] != image_id]
+        _write_batch_status(batch_dir, status)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("已移入回收站的本地文件暂未清理：%s/%s", batch_id, image_id)
+    return {"status": "trashed", "item": record}
+
+
+@app.get("/api/composition-archive")
+def list_composition_archive(request: Request, response: Response) -> dict:
+    owner = _workspace_owner(request, response)
+    response.headers["Cache-Control"] = "private, no-store"
+    with _composition_archive() as archive:
+        return {"items": archive.list(owner)}
+
+
+def _archive_owner(request: Request, entry_id: str) -> str:
+    owner = _workspace_owner(request)
+    if not owner or not RECORD_ID.fullmatch(entry_id):
+        raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
+    return owner
+
+
+def _archived_image_response(name: str, content: bytes, *, download: bool) -> Response:
+    headers = {"Cache-Control": "private, no-store"}
+    if download:
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(name, safe='')}"
+    return Response(content, media_type="image/jpeg", headers=headers)
+
+
+@app.get("/api/composition-archive/{entry_id}/image")
+def get_archived_image(entry_id: str, request: Request, download: bool = False) -> Response:
+    owner = _archive_owner(request, entry_id)
+    with _composition_archive() as archive:
+        image = archive.read_image(owner, entry_id, download=download)
+    if image is None:
+        raise HTTPException(status_code=404, detail="合成图片不存在或已过期")
+    return _archived_image_response(*image, download=download)
+
+
+@app.post("/api/composition-archive/{entry_id}/restore")
+def restore_archived_image(entry_id: str, request: Request) -> dict:
+    owner = _archive_owner(request, entry_id)
+    with _composition_archive() as archive:
+        record = archive.restore(owner, entry_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
+    return {"status": "restored", "item": record}
+
+
+@app.delete("/api/composition-archive/{entry_id}")
+def trash_archived_image(entry_id: str, request: Request) -> dict:
+    owner = _archive_owner(request, entry_id)
+    with _composition_archive() as archive:
+        record = archive.trash(owner, entry_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
+    return {"status": "trashed", "item": record}
 
 
 @app.get("/api/batches/{batch_id}/{filename}")
-def get_batch_image(batch_id: str, filename: str) -> FileResponse:
+def get_batch_image(batch_id: str, filename: str, request: Request) -> Response:
     batch_dir = _batch_directory(batch_id)
-    output_dir = (batch_dir / "outputs").resolve()
-    image_path = (output_dir / Path(filename).name).resolve()
-    if output_dir not in image_path.parents or image_path.suffix.lower() not in {".jpg", ".jpeg"} or not image_path.is_file():
-        raise HTTPException(status_code=404, detail="图片不存在")
-    return FileResponse(image_path, media_type="image/jpeg", filename=image_path.name)
+    with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+        status = _owned_batch_status(batch_dir, request)
+        image = next((item for item in status.get("images", []) if item["name"] == filename), None)
+        if image is None:
+            raise HTTPException(status_code=404, detail="图片不存在")
+        path = _batch_result(batch_dir, image)
+        return _archived_image_response(path.name, path.read_bytes(), download=False)
 
 
 if WEB_DIST.is_dir():
@@ -809,13 +1047,15 @@ if WEB_DIST.is_dir():
 
 
 @app.get("/{path:path}")
-def serve_frontend(path: str = ""):
+def serve_frontend(request: Request, path: str = ""):
     index = WEB_DIST / "index.html"
     if index.is_file():
         requested = (WEB_DIST / path).resolve()
         if requested.is_file() and WEB_DIST.resolve() in requested.parents:
             return FileResponse(requested)
-        return FileResponse(index)
+        response = FileResponse(index, headers={"Cache-Control": "private, no-cache"})
+        _workspace_owner(request, response)
+        return response
     return JSONResponse(
         {"message": "前端尚未构建，请运行 npm install && npm run build，或使用 npm run dev。"},
         status_code=404,

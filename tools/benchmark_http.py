@@ -31,6 +31,7 @@ def main():
     base='http://127.0.0.1:'+str(args.port)
     results={}
     try:
+        session=requests.Session()
         for _ in range(80):
             if process.poll() is not None: raise RuntimeError('Service exited; see '+str(root/'server.log'))
             try:
@@ -44,18 +45,18 @@ def main():
             if mode!='template_replace':
                 files += [('products',('product'+str(i)+'.jpg',(root/'product.jpg').read_bytes(),'image/jpeg')) for i in range(4)]
             start=time.perf_counter()
-            response=requests.post(base+'/api/compose-batch',files=files,data={'mode':mode,'size':'1080x1920'},timeout=20)
+            response=session.post(base+'/api/compose-batch',files=files,data={'mode':mode,'size':'1080x1920'},timeout=20)
             response.raise_for_status()
             status_url=base+response.json()['status_url']
             for _ in range(1200):
-                status=requests.get(status_url,timeout=5).json()
+                status=session.get(status_url,timeout=5).json()
                 if status['status'] in ('done','failed'): break
                 time.sleep(.05)
             assert status['status']=='done' and not status['skipped'],status
             expected=[(t,p) for t in range(1,len(templates)+1) for p in range(1, 2 if mode=='template_replace' else 5)]
             assert [(x['template_index'],x['product_index']) for x in status['images']]==expected,status
             elapsed=round(time.perf_counter()-start,3)
-            hashes=[hashlib.sha256(requests.get(base+image['url'],timeout=10).content).hexdigest() for image in status['images']]
+            hashes=[hashlib.sha256(session.get(base+image['url'],timeout=10).content).hexdigest() for image in status['images']]
             results[label]={'seconds':elapsed,'hashes':hashes}
             print(label,elapsed,'seconds',len(hashes),'images',flush=True)
         # A single heavy request must leave health/status endpoints responsive.
@@ -73,6 +74,7 @@ def main():
         print('health-during-single',results['single-health-latency'],flush=True)
         (root/'http-results.json').write_text(json.dumps(results,indent=2))
     finally:
+        session.close()
         process.terminate()
         try: process.wait(timeout=15)
         except subprocess.TimeoutExpired:

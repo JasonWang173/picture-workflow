@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from email.utils import formatdate
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,7 +124,12 @@ def ObjectIteratorV2(bucket: Bucket, prefix: str = ''):
         for obj in root.findall('{*}Contents'):
             key = obj.findtext('{*}Key')
             if key is not None:
-                yield SimpleNamespace(key=urllib.parse.unquote(key))
+                modified = obj.findtext('{*}LastModified')
+                try:
+                    last_modified = datetime.fromisoformat(modified.replace('Z', '+00:00')).timestamp() if modified else None
+                except ValueError:
+                    last_modified = None
+                yield SimpleNamespace(key=urllib.parse.unquote(key), last_modified=last_modified)
         if root.findtext('{*}IsTruncated', '').lower() != 'true':
             break
         next_token = root.findtext('{*}NextContinuationToken')

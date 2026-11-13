@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
 from food_compositor.core import compose
+from food_compositor import oss_rest
 
 import server
 
@@ -37,6 +38,31 @@ class BatchCompositionTest(unittest.TestCase):
         self.root_patch.start()
         self.pool_patch.start()
         self.client = TestClient(server.app)
+        self.archive_objects = {}
+        self.oss_failure = False
+        def get_object(key):
+            if key not in self.archive_objects:
+                raise oss_rest.NoSuchKey(key)
+            return io.BytesIO(self.archive_objects[key])
+        def put_object(key, data):
+            if self.oss_failure:
+                raise oss_rest.OssError("test outage")
+            self.archive_objects[key] = data.encode() if isinstance(data, str) else data
+        bucket = SimpleNamespace(
+            get_object=get_object, put_object=put_object,
+            put_object_from_file=lambda key, path: put_object(key, Path(path).read_bytes()),
+            delete_object=lambda key: self.archive_objects.pop(key, None),
+        )
+        sdk = SimpleNamespace(
+            exceptions=oss_rest.exceptions,
+            ObjectIteratorV2=lambda bucket, prefix: [
+                SimpleNamespace(key=key) for key in sorted(self.archive_objects) if key.startswith(prefix)
+            ],
+        )
+        for mock in (patch.object(server, '_oss_bucket', return_value=bucket),
+                     patch.object(server, '_oss_sdk', return_value=sdk)):
+            mock.start()
+            self.addCleanup(mock.stop)
         self.events = []
         self.compose_patch = patch.object(server, 'compose', self.fake_compose)
         self.compose_patch.start()
@@ -157,6 +183,66 @@ class BatchCompositionTest(unittest.TestCase):
         response = self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.client.get(response.json()['status_url']).json()['status'], 'done')
+
+    def test_archive_tracks_selected_downloads_and_recovers_deleted_results(self):
+        files = [('templates', ('one.png', picture('red'), 'image/png')),
+                 ('products', ('first.png', picture('green'), 'image/png')),
+                 ('products', ('second.png', picture('blue'), 'image/png'))]
+        batch = self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'}).json()
+        status = self.client.get(batch['status_url']).json()
+        first, second = status['images']
+        endpoint = '/api/composition-archive'
+        path = f"/api/batches/{batch['batch_id']}/images"
+        preview = self.client.get(second['url']).content
+        self.assertEqual(self.client.get(endpoint).json()['items'], [])
+        prepared = self.client.post(status['download_url'], params={'ids': first['id']})
+        self.assertEqual(prepared.status_code, 200)
+        download = prepared.json()
+        self.assertEqual([item['id'] for item in download['items']], [f"{batch['batch_id']}-{first['id']}"])
+        self.assertEqual(TestClient(server.app).get(download['url']).status_code, 404)
+        with zipfile.ZipFile(io.BytesIO(self.client.get(download['url']).content)) as zipped:
+            self.assertEqual(zipped.namelist(), [first['name']])
+        self.assertEqual(len(self.client.get(endpoint).json()['items']), 1)
+        individual = self.client.get(f"{path}/{first['id']}/download")
+        self.assertEqual(individual.status_code, 200)
+        from urllib.parse import unquote
+        self.assertEqual(json.loads(unquote(individual.headers["X-Composition-Record"])), download["items"][0])
+        self.assertEqual(len(self.client.get(endpoint).json()['items']), 1)
+
+        self.oss_failure = True
+        self.assertEqual(self.client.delete(f"{path}/{second['id']}").status_code, 503)
+        self.assertEqual(self.client.get(second['url']).status_code, 200)
+        self.oss_failure = False
+        deletion = self.client.delete(f"{path}/{second['id']}")
+        self.assertEqual(deletion.status_code, 200)
+        self.assertEqual(deletion.json()['item']['section'], 'trash')
+        self.assertEqual(self.client.get(second['url']).status_code, 404)
+        self.assertEqual(self.client.get(batch['status_url']).json()['images'], [first])
+        entry = next(item for item in self.client.get(endpoint).json()['items'] if item['section'] == 'trash')
+        archived_image = f"{endpoint}/{entry['id']}/image"
+        other = TestClient(server.app)
+        self.assertEqual(other.get(endpoint).json()['items'], [])
+        self.assertEqual(other.get(archived_image).status_code, 404)
+        self.assertEqual(other.get(batch['status_url']).status_code, 404)
+        other.close()
+        restoration = self.client.post(f"{endpoint}/{entry['id']}/restore")
+        self.assertEqual(restoration.status_code, 200)
+        self.assertEqual(restoration.json()['item']['section'], 'history')
+        self.assertEqual(self.client.get(archived_image, params={'download': True}).content, preview)
+        restored = next(item for item in self.client.get(endpoint).json()['items'] if item['id'] == entry['id'])
+        self.assertEqual((restored['section'], restored['expires_at']), ('history', entry['expires_at']))
+        batch_dir = Path(self.directory.name) / batch['batch_id']
+        disk_status = server._read_batch_status(batch_dir)
+        disk_status['finished_at'] = '2020-01-01T00:00:00+00:00'
+        server._write_batch_status(batch_dir, disk_status)
+        server._purge_composition_storage()
+        self.assertFalse(batch_dir.exists())
+        self.assertEqual(self.client.get(archived_image, params={'download': True}).content, preview)
+        metadata_key = next(key for key in self.archive_objects if key.endswith(entry['id'] + '.json'))
+        self.archive_objects[metadata_key] = json.dumps({**restored, 'expires_at': '2020-01-01T00:00:00+00:00'}).encode()
+        self.assertEqual(self.client.get(archived_image).status_code, 404)
+        server._purge_composition_storage()
+        self.assertFalse(any(entry['id'] in key for key in self.archive_objects))
 
 
 class TemplateLibraryErrorsTest(unittest.TestCase):
