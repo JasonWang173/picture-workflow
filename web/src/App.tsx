@@ -1,5 +1,5 @@
 import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useRef, useState } from 'react'
-import { submitComposition, type SubmissionProgress } from './compositionRequest'
+import { CompositionTask, type SubmissionProgress } from './compositionRequest'
 import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
 import { ProductSelection } from './productSelection'
 import { CompositionArchive } from './CompositionArchive'
@@ -171,6 +171,7 @@ export function TemplateLibrary({
   onSelect,
   onPreview,
   onDelete,
+  onRefresh,
 }: {
   templates: TemplateRecord[]
   selectedIds: string[]
@@ -181,6 +182,7 @@ export function TemplateLibrary({
   onSelect: (template: TemplateRecord) => void
   onPreview: (template: TemplateRecord) => void
   onDelete: (template: TemplateRecord) => void
+  onRefresh?: () => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const handleInput = (event: ChangeEvent<HTMLInputElement>) => {
@@ -194,6 +196,7 @@ export function TemplateLibrary({
         <div className="library-title"><span className="library-icon"><Icon name="library" size={15} /></span><div><strong>模板库</strong><small>{loading ? '正在读取模板…' : `${templates.length} 个模板 · 点图预览 · 点圆圈选择`}</small></div></div>
         <>
           <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleInput} hidden />
+          {onRefresh && <button className="library-upload" type="button" disabled={busy || loading} onClick={onRefresh} aria-label="刷新模板库"><Icon name="refresh" size={13} /></button>}
           <button className="library-upload" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><Icon name="upload" size={13} /> {busy ? '保存中' : '上传模板'}</button>
         </>
       </div>
@@ -485,6 +488,9 @@ function App() {
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([])
   const [batchDownloadUrl, setBatchDownloadUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const [taskCancelled, setTaskCancelled] = useState(false)
+  const activeTaskRef = useRef<CompositionTask | null>(null)
   const [error, setError] = useState('')
   const [lastMode, setLastMode] = useState<Mode | null>(null)
   const [lastSize, setLastSize] = useState<string | null>(null)
@@ -514,23 +520,32 @@ function App() {
     if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
     noticeTimerRef.current = window.setTimeout(() => setLibraryNotice(''), 3600)
   }
-  const loadTemplates = async () => {
+  const templateRetryRef = useRef<number | undefined>(undefined)
+  const loadTemplates = async (force = false, attempt = 0) => {
+    window.clearTimeout(templateRetryRef.current)
     try {
-      const response = await fetch('/api/templates')
+      const response = await fetch(`/api/templates${force ? '?refresh=true' : ''}`, { signal: AbortSignal.timeout(20_000) })
       if (!response.ok) {
         let message = '模板库读取失败'
         try { const payload = await response.json(); message = payload.detail || message } catch { /* response may not be JSON */ }
+        if (response.status === 503 && attempt < 3) {
+          flashNotice('模板目录正在同步，稍后自动重试')
+          templateRetryRef.current = window.setTimeout(() => { void loadTemplates(false, attempt + 1) }, 3000)
+          return
+        }
         throw new Error(message)
       }
-      const payload = await response.json() as { templates?: TemplateRecord[] }
+      const payload = await response.json() as { templates?: TemplateRecord[]; stale?: boolean }
       setTemplates(payload.templates || [])
+      setError('')
+      if (payload.stale) flashNotice('已显示上次成功加载的模板，可稍后点击刷新更新')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '模板库读取失败')
     } finally {
       setLibraryLoading(false)
     }
   }
-  useEffect(() => { loadTemplates() }, [])
+  useEffect(() => { void loadTemplates(); return () => window.clearTimeout(templateRetryRef.current) }, [])
   useEffect(() => {
     if (!lightbox && !pickerOpen && !slotEditorOpen && !archiveOpen) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -568,6 +583,7 @@ function App() {
   }, [])
 
   const resetResult = () => {
+    setTaskCancelled(false)
     setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
     setBatchImages([])
     setSingleResult(null)
@@ -758,12 +774,20 @@ function App() {
     }
   }
 
+  const cancelComposition = () => {
+    if (!activeTaskRef.current) return
+    setCancelling(true)
+    setError('')
+    activeTaskRef.current.cancel()
+  }
+
   const compose = async () => {
     const needsProduct = mode !== 'template_replace'
     const isBatch = templateAssets.length > 1 || (needsProduct && products.length > 1)
     if (loading || resultAction || productChecking || !template || (needsProduct && !products.length)) return
     resetResult()
     setLoading(true)
+    setCancelling(false)
     setError('')
     setSubmissionProgress({ stage: 'uploading', loaded: 0, total: null })
     try {
@@ -781,7 +805,9 @@ function App() {
       }
       // A one-image task also uses the asynchronous API so its processing stage
       // is real server progress, while keeping the single-result preview.
-      const payload = await submitComposition(body, setSubmissionProgress)
+      const task = new CompositionTask((message) => { if (activeTaskRef.current !== task) return; setError(message); setCancelling(false) })
+      activeTaskRef.current = task
+      const payload = await task.begin(body, setSubmissionProgress)
       setSubmissionProgress(null)
       setBatchProgress({ done: 0, total: payload.total, status: 'queued' })
       let statusFailures = 0
@@ -793,7 +819,7 @@ function App() {
       for (;;) {
         let status: StatusPayload
         try {
-          const statusResponse = await fetch(payload.status_url)
+          const statusResponse = await fetch(payload.status_url, { signal: AbortSignal.timeout(15_000) })
           if (!statusResponse.ok) throw new Error('批次状态读取失败')
           status = await statusResponse.json() as StatusPayload
         } catch {
@@ -803,9 +829,9 @@ function App() {
           continue
         }
         statusFailures = 0
-        if (!['queued', 'processing', 'done', 'failed'].includes(status.status)) throw new Error('服务器返回的任务状态不正确，请重试')
+        if (!['uploading', 'queued', 'processing', 'cancelling', 'cancelled', 'done', 'failed'].includes(status.status)) throw new Error('服务器返回的任务状态不正确，请重试')
         setBatchProgress({ done: status.done, total: status.total, status: status.status, templateIndex: status.current_template_index, templateCount: status.template_count, templateName: status.current_template_name })
-        if (status.status === 'done' || status.status === 'failed') {
+        if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
           const images = status.images || []
           setResultBatchId(payload.batch_id)
           setLastMode(mode)
@@ -815,6 +841,12 @@ function App() {
             setBatchImages(images)
             setSelectedBatchIds(images.map((image) => image.id))
             setBatchDownloadUrl(status.download_url || null)
+          }
+          if (status.status === 'cancelled') {
+            setTaskCancelled(true)
+            setError('')
+            setResultNotice(images.length ? `任务已取消，已保留完成的 ${images.length} 张图片，可以重新选择图片合成。` : '任务已取消，可以重新选择图片合成。')
+            if (!images.length) break
           }
           if (status.status === 'failed' || !images.length) throw new Error(status.error || '没有图片合成成功，请检查模板与商品图')
           if (!isBatch) {
@@ -835,6 +867,8 @@ function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '合成失败，请重试')
     } finally {
+      activeTaskRef.current = null
+      setCancelling(false)
       setSubmissionProgress(null)
       setBatchProgress(null)
       setLoading(false)
@@ -952,7 +986,7 @@ function App() {
             <div><span className="section-label">01 / 工作流</span><h2>{mode === 'template_replace' ? '先制作空白模板' : '合成商品海报'}</h2></div>
             {demoAvailable && <button className="text-button" type="button" onClick={loadDemo}><Icon name="spark" size={14} /> 试用示例</button>}
           </div>
-          <TemplateLibrary templates={templates} selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={(item) => { void pickFromLibrary([item]) }} onPreview={(item) => setLightbox({ url: item.url, name: item.name, kind: 'template' })} onDelete={deleteLibraryTemplate} />
+          <TemplateLibrary templates={templates} selectedIds={templateAssets.flatMap((asset) => asset.libraryId ? [asset.libraryId] : [])} loading={libraryLoading} busy={libraryBusy} notice={libraryNotice} onUpload={uploadTemplates} onSelect={(item) => { void pickFromLibrary([item]) }} onPreview={(item) => setLightbox({ url: item.url, name: item.name, kind: 'template' })} onDelete={deleteLibraryTemplate} onRefresh={() => { void loadTemplates(true) }} />
           <div className="library-divider" />
           <AssetDrop number="01" title="商品图" hint="支持多选与文件夹 · 自动去除重复图片" assets={products} allowFolder accept="image/png,image/jpeg,image/webp" onChange={appendProducts} onClear={clearProducts} />
           {productNotice && <p className={`product-notice ${productChecking ? 'is-checking' : ''}`} role="status">{productChecking && <span className="button-loader" />}{productNotice}</p>}
@@ -1007,16 +1041,18 @@ function App() {
             {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
           <p className="privacy-note"><span className="lock-dot" /> 下载或删除的合成图在 OSS 保存 7 天</p>
-        </fieldset></aside>
+        </fieldset>
+          {loading && <button className="toolbar-button cancel-task-button control-cancel-button" type="button" disabled={cancelling} onClick={cancelComposition} aria-label="取消当前合成任务">{cancelling ? '正在取消任务…' : '取消任务'}</button>}
+        </aside>
 
         <section className={`preview-panel ${resultUrl || hasBatch ? 'has-result' : ''}`} aria-live="polite">
           <div className="preview-topline">
-            <div><span className="section-label">03 / 预览</span><h2>{loading ? submissionProgress?.stage === 'uploading' ? '正在上传图片' : submissionProgress?.stage === 'preparing' ? '服务器准备任务' : '正在合成' : resultUrl ? '合成完成' : hasBatch ? '批量合成完成' : '结果会出现在这里'}</h2></div>
+            <div><span className="section-label">03 / 预览</span><h2>{loading ? cancelling ? '正在取消任务' : submissionProgress?.stage === 'uploading' ? '正在上传图片' : submissionProgress?.stage === 'preparing' ? '服务器准备任务' : '正在合成' : taskCancelled ? '任务已取消' : resultUrl ? '合成完成' : hasBatch ? '批量合成完成' : '结果会出现在这里'}</h2></div>
             {(resultUrl || hasBatch) && <span className="result-badge"><Icon name="check" size={13} /> READY</span>}
           </div>
           <div className="preview-stage">
             {loading ? (
-              <ProcessingProgress submission={submissionProgress} batch={batchProgress} templateOnly={mode === 'template_replace'} />
+              <ProcessingProgress submission={submissionProgress} batch={batchProgress} templateOnly={mode === 'template_replace'} cancelling={cancelling || batchProgress?.status === 'cancelling'} onCancel={cancelComposition} />
             ) : resultUrl ? (
               <button className="result-preview-button" type="button" onClick={() => setLightbox({ url: resultUrl, name: '合成海报.jpg' })} aria-label="点击放大查看合成海报">
                 <img className="result-image" src={resultUrl} alt="合成后的海报" />
@@ -1064,8 +1100,8 @@ function App() {
             ) : (
               <div className="empty-preview">
                 <div className="empty-frame"><span className="empty-corner corner-tl" /><span className="empty-corner corner-tr" /><span className="empty-corner corner-bl" /><span className="empty-corner corner-br" /><Icon name="image" size={30} /></div>
-                <strong>{mode === 'template_replace' ? '等待模板图' : '等待两张图片'}</strong>
-                <span>{mode === 'template_replace' ? '无需上传商品图，处理后生成空白模板' : '上传后，预览将在这里展开'}</span>
+                <strong>{taskCancelled ? '任务已取消' : mode === 'template_replace' ? '等待模板图' : '等待两张图片'}</strong>
+                <span>{taskCancelled ? '可以修改所选图片，然后重新合成' : mode === 'template_replace' ? '无需上传商品图，处理后生成空白模板' : '上传后，预览将在这里展开'}</span>
               </div>
             )}
           </div>

@@ -53,6 +53,12 @@ class Bucket:
     def _request(self, method: str, key: str = '', *, params: dict | None = None, data=None, content_type: str = ''):
         date = formatdate(usegmt=True)
         resource = f'/{self.bucket}/{key}'
+        # ListObjectsV2 continuation-token is a signed V1 subresource (unlike
+        # prefix/list-type/encoding-type). Sign its raw value, then URL-encode
+        # separately for transport, matching the official oss2 V1 auth rules.
+        if params and 'continuation-token' in params:
+            token = params['continuation-token']
+            resource += '?continuation-token' + ('=' + token if token else '')
         sign_data = f'{method}\n\n{content_type}\n{date}\n{resource}'.encode('utf-8')
         digest = hmac.new(self.auth.access_key_secret.encode('utf-8'), sign_data, hashlib.sha1).digest()
         signature = base64.b64encode(digest).decode('ascii')
@@ -129,7 +135,8 @@ def ObjectIteratorV2(bucket: Bucket, prefix: str = ''):
                     last_modified = datetime.fromisoformat(modified.replace('Z', '+00:00')).timestamp() if modified else None
                 except ValueError:
                     last_modified = None
-                yield SimpleNamespace(key=urllib.parse.unquote(key), last_modified=last_modified)
+                yield SimpleNamespace(key=urllib.parse.unquote(key), last_modified=last_modified,
+                                      etag=obj.findtext('{*}ETag'))
         if root.findtext('{*}IsTruncated', '').lower() != 'true':
             break
         next_token = root.findtext('{*}NextContinuationToken')

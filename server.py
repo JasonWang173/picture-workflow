@@ -14,6 +14,7 @@ import uuid
 import zipfile
 import logging
 import json
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -30,8 +31,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from food_compositor import compose
-from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION
+from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION, history_time, history_day
 from food_compositor.execution import submit_composition, worker_count, estimate_memory, shutdown_executor
+from food_compositor.record_cache import RecordCache, read_records
+from food_compositor.request_limits import RequestLimits
+from food_compositor.cancellation import CompositionCancelled, cancellation_scope
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
@@ -55,13 +59,20 @@ WORKSPACE_COOKIE = "composition_workspace"
 _batch_locks = [Lock() for _ in range(64)]
 _OSS_BUCKET = None
 _TEMPLATE_ID_RE = re.compile(r"[0-9a-f]{16}")
+_template_cache = RecordCache()
+
+
+def _template_cache_key(bucket):
+    return f"{os.environ.get('OSS_ENDPOINT', '')}:{getattr(bucket, 'bucket_name', getattr(bucket, 'bucket', id(bucket)))}:{OSS_PREFIX}"
 DEMO_ASSETS = {
     "template": ROOT / "1.jpg",
     "product": ROOT / "商品1.png",
 }
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-# Disk guard for one batch upload only; there is no per-batch image count limit.
-MAX_BATCH_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
+MAX_BATCH_UPLOAD_BYTES = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "512")) * 1024 * 1024
+MAX_BATCH_PRODUCTS = int(os.environ.get("MAX_BATCH_PRODUCTS", "200"))
+MAX_BATCH_TEMPLATES = int(os.environ.get("MAX_BATCH_TEMPLATES", "50"))
+MAX_BATCH_OUTPUTS = int(os.environ.get("MAX_BATCH_OUTPUTS", "2000"))
 THUMBNAIL_MAX_EDGE = 360
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
 LOGGER = logging.getLogger(__name__)
@@ -80,6 +91,7 @@ async def lifespan(app):
 
 
 app = FastAPI(title="商品海报合成工作台", version="0.1.0", lifespan=lifespan)
+app.add_middleware(RequestLimits, storage=BATCH_ROOT)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173", "http://127.0.0.1:4173"],
@@ -119,6 +131,17 @@ def _parse_manual_slot(raw: str | None) -> tuple[float, float, float, float] | N
     if not (0 <= x <= 1 and 0 <= y <= 1 and 0.01 < w <= 1 and 0.01 < h <= 1 and x + w <= 1.001 and y + h <= 1.001):
         raise HTTPException(status_code=400, detail="框选区域超出图片范围")
     return (x, y, min(w, 1 - x), min(h, 1 - y))
+
+
+def _validate_output_size(size: str) -> str:
+    size = size.strip() or "1080x1920"
+    try:
+        width, height = (int(value) for value in size.lower().split("x"))
+        if width <= 0 or height <= 0 or max(width, height) > 4096 or width * height > 8_000_000:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="输出尺寸无效，最长边须在 4096 像素内，总像素不超过 800 万") from None
+    return size
 
 
 def _oss_sdk():
@@ -172,6 +195,8 @@ def _composition_archive():
     except sdk.exceptions.OssError as exc:
         LOGGER.warning("合成记录 OSS 操作失败", exc_info=True)
         raise HTTPException(status_code=503, detail="合成记录暂时无法连接 OSS，请稍后重试") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="合成记录读取超时，请稍后重试") from exc
 
 
 def _purge_composition_storage() -> None:
@@ -183,7 +208,13 @@ def _purge_composition_storage() -> None:
                 continue
             with _batch_locks[hash(batch_id) % len(_batch_locks)]:
                 status = _read_batch_status(path.parent)
-                if not status or status["status"] not in {"done", "failed"}:
+                if not status:
+                    continue
+                if status["status"] == "uploading" and not (path.parent / "upload.claimed").exists():
+                    if datetime.fromisoformat(status["created_at"]).timestamp() < now.timestamp() - 3600:
+                        shutil.rmtree(path.parent)
+                    continue
+                if status["status"] not in {"done", "failed", "cancelled"}:
                     continue
                 timestamp = status.get("finished_at") or status.get("created_at")
                 if timestamp and datetime.fromisoformat(timestamp) + RETENTION <= now:
@@ -222,8 +253,15 @@ def _template_record(template_id: str) -> dict[str, object] | None:
     template_id = _validated_template_id(template_id)
     bucket = _oss_bucket()
     oss2 = _oss_sdk()
+    cached = _template_cache.peek(_template_cache_key(bucket), template_id)
+    if cached is not None:
+        return cached
     try:
-        payload = json.loads(bucket.get_object(f"{OSS_PREFIX}{template_id}.json").read())
+        result = bucket.get_object(f"{OSS_PREFIX}{template_id}.json")
+        try:
+            payload = json.loads(result.read())
+        finally:
+            result.close()
     except oss2.exceptions.NoSuchKey:
         return None
     except oss2.exceptions.OssError as exc:
@@ -255,18 +293,21 @@ async def _write_upload(
     *,
     current_total: int = 0,
     total_limit: int | None = None,
+    cancel_marker: Path | None = None,
 ) -> int:
     """Stream an upload to disk while enforcing per-file and batch limits."""
     max_allowed = MAX_UPLOAD_BYTES
     if total_limit is not None:
         max_allowed = min(max_allowed, total_limit - current_total)
     if max_allowed <= 0:
-        raise HTTPException(status_code=413, detail="批量上传总大小不能超过 8 GB")
+        raise HTTPException(status_code=413, detail=f"批量上传总大小不能超过 {MAX_BATCH_UPLOAD_BYTES // 1024 // 1024} MB")
 
     written = 0
     try:
         with destination.open("wb") as handle:
             while True:
+                if cancel_marker is not None and cancel_marker.exists():
+                    raise CompositionCancelled('任务已取消')
                 chunk = await upload.read(1024 * 1024)
                 if not chunk:
                     break
@@ -275,7 +316,7 @@ async def _write_upload(
                     batch_exceeded = total_limit is not None and current_total + written > total_limit
                     raise HTTPException(
                         status_code=413,
-                        detail=("批量上传总大小不能超过 8 GB" if batch_exceeded else "单个图片不能超过 24 MB"),
+                        detail=(f"批量上传总大小不能超过 {MAX_BATCH_UPLOAD_BYTES // 1024 // 1024} MB" if batch_exceeded else "单个图片不能超过 24 MB"),
                     )
                 handle.write(chunk)
     except HTTPException:
@@ -335,9 +376,11 @@ def _fail_interrupted_batches() -> None:
             payload = json.loads(status_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("status") in {"queued", "processing"}:
-            payload["status"] = "failed"
-            payload["error"] = "服务重启导致该批次中断，请重新上传合成"
+        if isinstance(payload, dict) and payload.get("status") in {"queued", "processing", "cancelling", "uploading"}:
+            cancelled = (status_path.parent / "cancel.requested").exists()
+            payload["status"] = "cancelled" if cancelled else "failed"
+            payload["error"] = None if cancelled else "服务重启导致该批次中断，请重新上传合成"
+            payload["finished_at"] = datetime.now(timezone.utc).isoformat()
             _write_batch_status(status_path.parent, payload)
 
 
@@ -348,38 +391,33 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "food-compositor"}
 
 
+@app.get("/api/ready")
+def readiness() -> JSONResponse:
+    checks = {
+        "frontend": (WEB_DIST / "index.html").is_file() and (WEB_DIST / "assets").is_dir(),
+        "disk": shutil.disk_usage(BATCH_ROOT).free >= int(os.environ.get("MIN_FREE_DISK_MB", "1024")) * 1024 * 1024,
+    }
+    return JSONResponse({"status": "ok" if all(checks.values()) else "degraded", "checks": checks},
+                        status_code=200 if all(checks.values()) else 503)
+
+
 @app.get("/api/templates")
-def list_templates() -> dict[str, object]:
+def list_templates(response: Response, refresh: bool = False) -> dict[str, object]:
     bucket = _oss_bucket()
     oss2 = _oss_sdk()
-    class TemplateReadError(Exception):
-        pass
-
-    def read_record(key: str) -> dict[str, object] | None:
-        try:
-            response = bucket.get_object(key)
-            try:
-                meta = json.loads(response.read())
-            finally:
-                if callable(getattr(response, "close", None)):
-                    response.close()
-        except (OSError, ValueError, oss2.exceptions.OssError) as exc:
-            LOGGER.warning("模板元数据读取失败：%s", key, exc_info=True)
-            raise TemplateReadError("模板库读取不完整，请稍后重试") from exc
-        if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
-            return None
-        return {**meta, "url": f"/api/templates/{meta['id']}/file", "thumb_url": f"/api/templates/{meta['id']}/thumb"}
-
     try:
-        keys = [obj.key for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_PREFIX) if obj.key.endswith(".json")]
-        workers = min(4, max(1, len(keys))) if os.environ.get("OSS_TRANSPORT", "sdk").lower() == "rest" else 1
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            records = [record for record in executor.map(read_record, keys) if record is not None]
-    except (TemplateReadError, oss2.exceptions.OssError) as exc:
-        LOGGER.exception("模板库列表读取失败")
+        records, stale = _template_cache.get(
+            _template_cache_key(bucket),
+            lambda old, versions: read_records(bucket, oss2, OSS_PREFIX, old, versions, _TEMPLATE_ID_RE),
+            force=refresh,
+            disk=ROOT / "runtime" / "template-catalog-cache.json" if bucket is _OSS_BUCKET else None,
+        )
+    except RuntimeError as exc:
         raise HTTPException(status_code=503, detail="模板库读取失败或不完整，请稍后重试") from exc
+    response.headers["Cache-Control"] = "private, no-store"
+    records = [{**meta, "url": f"/api/templates/{meta['id']}/file", "thumb_url": f"/api/templates/{meta['id']}/thumb"} for meta in records]
     records.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
-    return {"templates": records}
+    return {"templates": records, "stale": stale}
 
 
 @app.post("/api/templates")
@@ -400,7 +438,7 @@ async def save_template(
         repaired_name = _repair_latin1_utf8(name)
         repaired_filename = _repair_latin1_utf8(template.filename)
         clean_name = (repaired_name or Path(repaired_filename or "未命名模板").stem).strip()[:80] or "未命名模板"
-        has_thumb = _generate_thumbnail(destination, thumb_path)
+        has_thumb = await run_in_threadpool(_generate_thumbnail, destination, thumb_path)
         object_key = f"{OSS_PREFIX}{template_id}{suffix}"
         thumb_key = f"{OSS_PREFIX}{template_id}_thumb.jpg"
         record: dict[str, object] = {
@@ -416,12 +454,15 @@ async def save_template(
             "source": (_repair_latin1_utf8(source) or "upload").strip()[:40],
             "size": size,
         }
-        bucket = _oss_bucket()
-        bucket.put_object_from_file(object_key, str(destination))
-        if has_thumb:
-            bucket.put_object_from_file(thumb_key, str(thumb_path))
-        # Meta last: a template becomes visible only once its record exists.
-        bucket.put_object(f"{OSS_PREFIX}{template_id}.json", json.dumps(record, ensure_ascii=False))
+        def persist():
+            bucket = _oss_bucket()
+            bucket.put_object_from_file(object_key, str(destination))
+            if has_thumb:
+                bucket.put_object_from_file(thumb_key, str(thumb_path))
+            # Meta last: a template becomes visible only once its record exists.
+            bucket.put_object(f"{OSS_PREFIX}{template_id}.json", json.dumps(record, ensure_ascii=False))
+            _template_cache.update(_template_cache_key(bucket), template_id, record)
+        await run_in_threadpool(persist)
         return record
     except HTTPException:
         raise
@@ -451,7 +492,7 @@ def get_template_file(template_id: str) -> StreamingResponse:
     return StreamingResponse(
         obj,
         media_type=media_type,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}", "Cache-Control": "private, max-age=3600"},
     )
 
 
@@ -464,7 +505,7 @@ def get_template_thumbnail(background_tasks: BackgroundTasks, template_id: str) 
     oss2 = _oss_sdk()
     thumb_key = str(record.get("thumb_key") or f"{OSS_PREFIX}{template_id}_thumb.jpg")
     try:
-        return StreamingResponse(bucket.get_object(thumb_key), media_type="image/jpeg")
+        return StreamingResponse(bucket.get_object(thumb_key), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
     except oss2.exceptions.NoSuchKey:
         pass  # older records predate thumbnails; backfill below
     except oss2.exceptions.OssError as exc:
@@ -479,7 +520,7 @@ def get_template_thumbnail(background_tasks: BackgroundTasks, template_id: str) 
         bucket.get_object_to_file(object_key, str(source_path))
         if _generate_thumbnail(source_path, thumb_path):
             bucket.put_object_from_file(thumb_key, str(thumb_path))
-            return FileResponse(thumb_path, media_type="image/jpeg")
+            return FileResponse(thumb_path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
     except oss2.exceptions.OssError:
         LOGGER.warning("模板缩略图回填失败：%s", template_id, exc_info=True)
     except Exception:
@@ -500,6 +541,7 @@ def delete_template(template_id: str) -> dict[str, str]:
         bucket.delete_object(object_key)
         bucket.delete_object(thumb_key)
         bucket.delete_object(f"{OSS_PREFIX}{template_id}.json")
+        _template_cache.update(_template_cache_key(bucket), template_id, None)
     except Exception as exc:
         LOGGER.exception("模板删除失败：%s", template_id)
         raise HTTPException(status_code=500, detail="模板删除失败，请稍后重试") from exc
@@ -538,6 +580,7 @@ async def create_composition(
     quality: Annotated[int, Form()] = 100,
     slot: Annotated[Optional[str], Form()] = None,
 ) -> FileResponse:
+    size = _validate_output_size(size)
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
     manual_slot = _parse_manual_slot(slot)
@@ -586,10 +629,42 @@ async def create_composition(
     )
 
 
+@app.post("/api/batches/reserve")
+def reserve_batch(request: Request) -> JSONResponse:
+    batch_id = uuid.uuid4().hex[:12]
+    response = JSONResponse({"batch_id": batch_id, "total": 0, "status_url": f"/api/batches/{batch_id}/status"})
+    owner = _workspace_owner(request, response)
+    batch_dir = BATCH_ROOT / batch_id
+    batch_dir.mkdir()
+    _write_batch_status(batch_dir, {"status": "uploading", "owner": owner, "total": 0, "done": 0,
+                                  "images": [], "skipped": [], "error": None,
+                                  "download_url": f"/api/batches/{batch_id}/download",
+                                  "created_at": datetime.now(timezone.utc).isoformat()})
+    return response
+
+
+@app.post("/api/batches/{batch_id}/cancel")
+def cancel_batch(batch_id: str, request: Request) -> dict:
+    batch_dir = _batch_directory(batch_id)
+    with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+        status = _owned_batch_status(batch_dir, request)
+        if not status.get("owner"):
+            raise HTTPException(status_code=404, detail="批次不存在")
+        if status["status"] not in {"done", "failed", "cancelled"}:
+            (batch_dir / "cancel.requested").touch(exist_ok=True)
+            status["status"] = "cancelling"
+            if not (batch_dir / "upload.claimed").exists() and not (batch_dir / "work" / "manifest.json").exists():
+                status["status"] = "cancelled"
+                status["finished_at"] = datetime.now(timezone.utc).isoformat()
+            _write_batch_status(batch_dir, status)
+    return {"status": status["status"]}
+
+
 @app.post("/api/compose-batch")
 async def create_batch_composition(
     background_tasks: BackgroundTasks,
     request: Request,
+    batch_id: Annotated[Optional[str], Form(description="上传前预留的任务编号")] = None,
     products: Annotated[Optional[list[UploadFile]], File(description="商品图片文件夹或多选图片")] = None,
     template: Annotated[Optional[UploadFile], File(description="兼容单张模板")] = None,
     templates: Annotated[Optional[list[UploadFile]], File(description="按顺序处理的模板图")] = None,
@@ -602,6 +677,7 @@ async def create_batch_composition(
     slot: Annotated[Optional[str], Form()] = None,
 ) -> JSONResponse:
     """Accept a batch upload and compose it in the background; poll /status for progress."""
+    size = _validate_output_size(size)
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise HTTPException(status_code=400, detail="合成方式必须是 auto、overlay、cutout 或 template_replace")
     image_products = [upload for upload in (products or []) if upload.filename and Path(upload.filename).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
@@ -613,6 +689,10 @@ async def create_batch_composition(
     image_templates = list(templates or []) + ([template] if template is not None else [])
     if not image_templates or any(not upload.filename or Path(upload.filename).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"} for upload in image_templates):
         raise HTTPException(status_code=400, detail="请上传有效的模板图片")
+    if len(image_products) > MAX_BATCH_PRODUCTS or len(image_templates) > MAX_BATCH_TEMPLATES:
+        raise HTTPException(status_code=413, detail=f"每批最多 {MAX_BATCH_PRODUCTS} 张商品图、{MAX_BATCH_TEMPLATES} 张模板图")
+    if max(1, len(image_products)) * len(image_templates) > MAX_BATCH_OUTPUTS:
+        raise HTTPException(status_code=413, detail=f"每批最多生成 {MAX_BATCH_OUTPUTS} 张合成图，请分批处理")
 
     manual_slot = _parse_manual_slot(slot)
     if manual_slot is not None and (mode not in {"template_replace", "cutout"} or len(image_templates) != 1):
@@ -627,7 +707,19 @@ async def create_batch_composition(
             raise HTTPException(status_code=400, detail="请为每张模板提供有效的合成方式，且批次方式须为智能判断")
         requested_modes = parsed_modes
 
-    batch_id = uuid.uuid4().hex[:12]
+    reserved = batch_id is not None
+    if reserved:
+        batch_dir = _batch_directory(batch_id)
+        with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+            previous = _owned_batch_status(batch_dir, request)
+            if not previous.get("owner") or previous["status"] != "uploading" or (batch_dir / "cancel.requested").exists():
+                raise HTTPException(status_code=409, detail="任务已取消或已提交，请重新创建任务")
+            try:
+                (batch_dir / "upload.claimed").touch(exist_ok=False)
+            except FileExistsError:
+                raise HTTPException(status_code=409, detail="任务已提交，请勿重复上传") from None
+    else:
+        batch_id = uuid.uuid4().hex[:12]
     response = JSONResponse({
         "batch_id": batch_id,
         "total": max(1, len(image_products)) * len(image_templates),
@@ -645,7 +737,7 @@ async def create_batch_composition(
         manifest_templates = []
         for index, upload in enumerate(image_templates, start=1):
             template_path = work_dir / f"template-{index:04d}{_safe_upload_suffix(upload.filename, '.jpg')}"
-            total_upload_bytes += await _write_upload(upload, template_path, current_total=total_upload_bytes, total_limit=MAX_BATCH_UPLOAD_BYTES)
+            total_upload_bytes += await _write_upload(upload, template_path, current_total=total_upload_bytes, total_limit=MAX_BATCH_UPLOAD_BYTES, cancel_marker=batch_dir / "cancel.requested")
             name = Path(_repair_latin1_utf8(upload.filename) or f"模板{index}").stem
             manifest_templates.append({"index": index, "work": template_path.name, "name": name, "mode": requested_modes[index - 1], "slot": manual_slot})
         for index, upload in enumerate(image_products, start=1):
@@ -655,6 +747,7 @@ async def create_batch_composition(
                 product_path,
                 current_total=total_upload_bytes,
                 total_limit=MAX_BATCH_UPLOAD_BYTES,
+                cancel_marker=batch_dir / "cancel.requested",
             )
             stem = Path(_repair_latin1_utf8(upload.filename) or f"product-{index:03d}").stem
             safe_stem = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in stem).strip("_") or f"product-{index:03d}"
@@ -666,7 +759,10 @@ async def create_batch_composition(
             json.dumps({"templates": manifest_templates, "items": manifest_items}, ensure_ascii=False),
             encoding="utf-8",
         )
-        _write_batch_status(batch_dir, {
+        with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+            if (batch_dir / "cancel.requested").exists():
+                raise CompositionCancelled('任务已取消')
+            _write_batch_status(batch_dir, {
             "status": "queued",
             "owner": owner,
             "total": len(manifest_items) * len(manifest_templates),
@@ -676,12 +772,38 @@ async def create_batch_composition(
             "images": [],
             "download_url": f"/api/batches/{batch_id}/download",
             "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+            })
+    except CompositionCancelled:
+        status = _read_batch_status(batch_dir) or {}
+        status.update(status="cancelled", error=None, finished_at=datetime.now(timezone.utc).isoformat())
+        _write_batch_status(batch_dir, status)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=409, detail="任务已取消") from None
+    except asyncio.CancelledError:
+        status = _read_batch_status(batch_dir) or {}
+        cancelled = (batch_dir / "cancel.requested").exists()
+        status.update(status="cancelled" if cancelled else "failed", error=None if cancelled else "上传连接已中断，请重新上传",
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        _write_batch_status(batch_dir, status)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
     except HTTPException:
-        shutil.rmtree(batch_dir, ignore_errors=True)
+        if reserved:
+            status = _read_batch_status(batch_dir) or {}
+            status.update(status="failed", error="上传未完成，请重新选择图片", finished_at=datetime.now(timezone.utc).isoformat())
+            _write_batch_status(batch_dir, status)
+            shutil.rmtree(work_dir, ignore_errors=True)
+        else:
+            shutil.rmtree(batch_dir, ignore_errors=True)
         raise
     except Exception:
-        shutil.rmtree(batch_dir, ignore_errors=True)
+        if reserved:
+            status = _read_batch_status(batch_dir) or {}
+            status.update(status="failed", error="上传未完成，请重新选择图片", finished_at=datetime.now(timezone.utc).isoformat())
+            _write_batch_status(batch_dir, status)
+            shutil.rmtree(work_dir, ignore_errors=True)
+        else:
+            shutil.rmtree(batch_dir, ignore_errors=True)
         LOGGER.exception("批量上传失败")
         raise HTTPException(status_code=500, detail="批量上传失败，请稍后重试") from None
     background_tasks.add_task(
@@ -712,17 +834,21 @@ def _compose_one(
     index = int(item["index"])
     output_path = Path(output_dir) / f"{index:09d}_T{item['template_index']:04d}_P{item['product_index']:04d}_{item['stem']}.jpg"
     try:
-        compose(
-            Path(work_dir) / str(item["work"]) if item["work"] is not None else None,
-            Path(template_path),
-            output_path,
-            mode=mode,  # type: ignore[arg-type]
-            size=size,
-            preserve_logo_pill=preserve_logo_pill,
-            outline_strength=outline_strength,
-            quality=quality,
-            manual_slot=item.get("manual_slot"),
-        )
+        with cancellation_scope(Path(work_dir).parent / "cancel.requested"):
+            compose(
+                Path(work_dir) / str(item["work"]) if item["work"] is not None else None,
+                Path(template_path),
+                output_path,
+                mode=mode,  # type: ignore[arg-type]
+                size=size,
+                preserve_logo_pill=preserve_logo_pill,
+                outline_strength=outline_strength,
+                quality=quality,
+                manual_slot=item.get("manual_slot"),
+            )
+    except CompositionCancelled:
+        output_path.unlink(missing_ok=True)
+        return {"index": index, "cancelled": True}
     except Exception as exc:
         return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "error": str(exc)}
     return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "name": output_path.name, "url": f"/api/batches/{batch_id}/{quote(output_path.name)}"}
@@ -751,7 +877,30 @@ def _run_batch_composition(
     status["status"] = "processing"
     _write_batch_status(batch_dir, status)
     futures = {}
+    cancel_marker = batch_dir / "cancel.requested"
+    def cancel_check():
+        if cancel_marker.exists():
+            raise CompositionCancelled('任务已取消')
+    def consume(future, entry):
+        if future.cancelled():
+            return
+        try:
+            result = future.result()
+        except CompositionCancelled:
+            return
+        except Exception as exc:
+            result = {**entry, "product_name": entry.get("name", entry["stem"]), "error": str(exc) or "处理进程异常"}
+        if result.get("cancelled"):
+            return
+        metadata = {key: result[key] for key in ("template_index", "template_name", "product_index", "product_name")}
+        if result.get("error"):
+            LOGGER.warning("批次 %s 模板 %s 商品 %s 合成失败：%s", batch_id, result["template_index"], result["product_index"], result["error"])
+            status["skipped"].append({"index": result["index"], **metadata, "error": result["error"]})
+        else:
+            status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": result["name"], "url": result["url"]})
+        status["done"] = int(status.get("done", 0)) + 1
     try:
+        cancel_check()
         manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
         items = manifest["items"]
         template_items = manifest.get("templates") or [{"index": 1, "work": manifest.get("template"), "name": "模板"}]
@@ -771,6 +920,7 @@ def _run_batch_composition(
         # One shared pool bounds CPU/memory across batches and single requests.
         # Finish all products for one template before starting the next.
         for template_item in template_items:
+            cancel_check()
             template_index = int(template_item["index"])
             status["current_template_index"] = template_index
             status["current_template_name"] = template_item["name"]
@@ -783,31 +933,25 @@ def _run_batch_composition(
             pending_entries = iter(entries)
             futures = {}
             def submit_next():
+                cancel_check()
                 entry = next(pending_entries, None)
                 if entry is None:
                     return
                 product_path = work_dir / str(entry["work"]) if entry["work"] is not None else None
                 future = submit_composition(_compose_one, entry, str(template_path), batch_id, template_item.get("mode", mode), size,
                                             outline_strength, preserve_logo_pill, quality, str(work_dir), str(output_dir),
-                                            estimated_bytes=estimate_memory(product_path, template_path, size))
+                                            estimated_bytes=estimate_memory(product_path, template_path, size), cancel_check=cancel_check)
                 futures[future] = entry
             for _ in range(min(workers, len(entries))):
                 submit_next()
             while futures:
-                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                cancel_check()
+                completed, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
+                if not completed:
+                    continue
                 future = next(iter(completed))
                 entry = futures.pop(future)
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = {**entry, "product_name": entry.get("name", entry["stem"]), "error": str(exc) or "处理进程异常"}
-                metadata = {key: result[key] for key in ("template_index", "template_name", "product_index", "product_name")}
-                if result.get("error"):
-                    LOGGER.warning("批次 %s 模板 %s 商品 %s 合成失败：%s", batch_id, result["template_index"], result["product_index"], result["error"])
-                    status["skipped"].append({"index": result["index"], **metadata, "error": result["error"]})
-                else:
-                    status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": result["name"], "url": result["url"]})
-                status["done"] = int(status.get("done", 0)) + 1
+                consume(future, entry)
                 flush_status()
                 submit_next()
             flush_status(force=True)
@@ -819,6 +963,9 @@ def _run_batch_composition(
             )
         else:
             status["status"] = "done"
+    except CompositionCancelled:
+        status.update(status="cancelling", error=None)
+        _write_batch_status(batch_dir, status)
     except Exception as exc:
         LOGGER.exception("批量合成失败")
         status["status"] = "failed"
@@ -826,10 +973,20 @@ def _run_batch_composition(
     finally:
         # A failed submit/status write must not remove inputs while workers use them.
         if futures:
+            if cancel_marker.exists():
+                for future in futures:
+                    future.cancel()
             wait(futures)
-        status["finished_at"] = datetime.now(timezone.utc).isoformat()
-        _write_batch_status(batch_dir, status)
+            for future, entry in futures.items():
+                consume(future, entry)
         shutil.rmtree(work_dir, ignore_errors=True)
+        with _batch_locks[hash(batch_id) % len(_batch_locks)]:
+            if cancel_marker.exists():
+                status.update(status="cancelled", error=None)
+            status["images"].sort(key=lambda image: int(image["id"]))
+            status["skipped"].sort(key=lambda item: item["index"])
+            status["finished_at"] = datetime.now(timezone.utc).isoformat()
+            _write_batch_status(batch_dir, status)
 
 
 def _batch_directory(batch_id: str) -> Path:
@@ -845,6 +1002,8 @@ def _owned_batch_status(batch_dir: Path, request: Request) -> dict:
     status = _read_batch_status(batch_dir)
     if status is None or (status.get("owner") and status["owner"] != _workspace_owner(request)):
         raise HTTPException(status_code=404, detail="批次不存在")
+    if status.get("status") in {"queued", "processing", "uploading"} and (batch_dir / "cancel.requested").exists():
+        status["status"] = "cancelling"
     return status
 
 
@@ -979,11 +1138,44 @@ def delete_batch_image(batch_id: str, image_id: str, request: Request) -> dict:
 
 
 @app.get("/api/composition-archive")
-def list_composition_archive(request: Request, response: Response) -> dict:
+def list_composition_archive(request: Request, response: Response, view: str = "all", section: str = "history",
+                             day: str | None = None, cursor: str | None = None, limit: int = 20, refresh: bool = False) -> dict:
+    if view not in {"all", "folders", "page"} or section not in {"history", "trash"} or not 1 <= limit <= 100:
+        raise HTTPException(status_code=400, detail="目录查询参数不正确")
+    if day is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="日期格式不正确")
     owner = _workspace_owner(request, response)
     response.headers["Cache-Control"] = "private, no-store"
     with _composition_archive() as archive:
-        return {"items": archive.list(owner)}
+        records = archive.list(owner, refresh=refresh)
+    if view == "all":
+        return {"items": records}  # compatibility for existing clients
+    if view == "folders":
+        days = {}
+        for record in records:
+            if record["section"] == "history":
+                key = history_day(record)
+                days[key] = days.get(key, 0) + 1
+        return {"folders": [{"day": day, "count": days[day]} for day in sorted(days, reverse=True)],
+                "trash_count": sum(record["section"] == "trash" for record in records)}
+    records = [record for record in records if record["section"] == section and (day is None or history_day(record) == day)]
+    sort_key = lambda record: (history_time(record) if section == "history" else record.get("trashed_at") or record["saved_at"], record["id"])
+    records.sort(key=sort_key, reverse=True)
+    total = len(records)
+    if cursor:
+        try:
+            data = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+            if data["section"] != section or data["day"] != day or not RECORD_ID.fullmatch(data["id"]):
+                raise ValueError()
+            records = [record for record in records if sort_key(record) < (data["time"], data["id"])]
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            raise HTTPException(status_code=400, detail="分页位置无效，请刷新列表") from None
+    page = records[:limit]
+    next_cursor = None
+    if len(records) > limit:
+        stamp, record_id = sort_key(page[-1])
+        next_cursor = base64.urlsafe_b64encode(json.dumps({"section": section, "day": day, "time": stamp, "id": record_id}).encode()).decode()
+    return {"items": page, "next_cursor": next_cursor, "total": total}
 
 
 def _archive_owner(request: Request, entry_id: str) -> str:
@@ -1043,7 +1235,7 @@ def get_batch_image(batch_id: str, filename: str, request: Request) -> Response:
 
 
 if WEB_DIST.is_dir():
-    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets", check_dir=False), name="assets")
 
 
 @app.get("/{path:path}")

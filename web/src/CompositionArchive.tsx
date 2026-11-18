@@ -1,25 +1,33 @@
-import { useEffect, useState } from 'react'
-import { archiveEndpoint as endpoint, checkArchiveResponse, readCompositionArchive, updateArchiveRecords, useCompositionArchive, type ArchiveEntry } from './compositionArchiveStore'
+import { useState } from 'react'
+import { archiveEndpoint as endpoint, checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
+import { dayIdentity } from './compositionArchiveFolders'
+import { readArchiveQuery, useArchiveQuery } from './archiveQueries'
 
 type Section = 'history' | 'trash'
 
-const pageSize = 20
 const dateFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
   month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
 })
+const savedTimeFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })
 
 export function CompositionArchive({ onClose, onPreview }: {
   onClose: () => void
   onPreview: (image: { url: string; name: string }) => void
 }) {
   const [section, setSection] = useState<Section>('history')
-  const { items, loaded, loading, error: readError } = useCompositionArchive()
-  const [limit, setLimit] = useState(pageSize)
+  const [openDay, setOpenDay] = useState<string | null>(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
-  useEffect(() => {
-    void readCompositionArchive()
-  }, [])
+  const folders = useArchiveQuery('view=folders')
+  const pageKey = section === 'trash' ? 'view=page&section=trash' : openDay ? `view=page&section=history&day=${openDay}` : null
+  const page = useArchiveQuery(pageKey)
+  const historyGroups = (folders.data.folders || []).map((group) => ({ ...dayIdentity(`${group.day}T12:00:00+08:00`), count: group.count }))
+  const activeGroup = openDay ? { ...dayIdentity(`${openDay}T12:00:00+08:00`), count: page.data.total || 0 } : undefined
+  const visible = (page.data.items || []).filter((item) => Date.parse(item.expires_at) > Date.now())
+  const loading = pageKey ? page.loading : folders.loading
+  const loaded = pageKey ? page.loaded : folders.loaded
+  const readError = pageKey ? page.error : folders.error
 
   const move = async (entry: ArchiveEntry, destination: Section) => {
     setBusy(entry.id)
@@ -38,7 +46,6 @@ export function CompositionArchive({ onClose, onPreview }: {
     }
   }
 
-  const visible = items.filter((item) => item.section === section)
   return (
     <div className="lightbox" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
       <section className="lightbox-panel archive-panel" role="dialog" aria-modal="true" aria-labelledby="archive-title">
@@ -49,20 +56,42 @@ export function CompositionArchive({ onClose, onPreview }: {
         <div className="archive-toolbar">
           <div role="group" aria-label="记录分类">
             {(['history', 'trash'] as const).map((tab) => (
-              <button className="toolbar-button" aria-pressed={section === tab} key={tab} type="button" onClick={() => { setSection(tab); setLimit(pageSize) }}>
+              <button className="toolbar-button" aria-pressed={section === tab} key={tab} type="button" onClick={() => { setSection(tab); setOpenDay(null) }}>
                 {tab === 'history' ? '合成记录' : '回收站'}
               </button>
             ))}
           </div>
-          <button className="toolbar-button" type="button" onClick={() => { setError(''); void readCompositionArchive(true) }} disabled={loading || !!busy}>刷新</button>
+          <button className="toolbar-button" type="button" onClick={() => { setError(''); void readArchiveQuery('view=folders', true); void readArchiveQuery(pageKey, true) }} disabled={loading || !!busy}>刷新</button>
         </div>
         <div className="archive-body" aria-busy={loading}>
           {(error || readError) && <p className="archive-error" role="alert">{error || readError}</p>}
           {loading && <p role="status">{loaded ? '正在更新记录…' : '正在读取 OSS…'}</p>}
-          {visible.length ? (
+          {section === 'history' && !openDay ? (historyGroups.length ? (
             <>
+              <div className="archive-folder-summary">
+                <div><strong>按日期整理</strong><span>{historyGroups.length} 个文件夹 · 共 {historyGroups.reduce((total, group) => total + group.count, 0)} 张合成图</span></div>
+                <small>点击文件夹查看当天下载过的素材</small>
+              </div>
+              <div className="archive-folder-grid">
+                {historyGroups.map((group) => (
+                  <button className="archive-folder-card" type="button" key={group.key} onClick={() => { setOpenDay(group.key) }} aria-label={`打开 ${group.label}，共 ${group.count} 张合成图`}>
+                    <span className="archive-folder-icon" aria-hidden="true" />
+                    <span className="archive-folder-meta"><strong>{group.label}</strong><small>{group.weekday} · {group.count} 张素材</small></span>
+                    <span className="archive-folder-arrow" aria-hidden="true">→</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (loaded || (!loading && !readError)) && !error && <p>下载合成图后，系统会按日期自动建立文件夹。</p>) : (
+            <>
+              {section === 'history' && activeGroup && (
+                <div className="archive-folder-heading">
+                  <button className="toolbar-button" type="button" onClick={() => { setOpenDay(null) }}>← 返回日期文件夹</button>
+                  <div><strong>{activeGroup.label}</strong><span>{activeGroup.weekday} · {activeGroup.count} 张素材</span></div>
+                </div>
+              )}
               <div className="archive-grid">
-                {visible.slice(0, limit).map((entry) => {
+                {visible.map((entry) => {
                   const url = `${endpoint}/${entry.id}/image`
                   const name = `${entry.template_name} · ${entry.product_name}`
                   return (
@@ -72,7 +101,7 @@ export function CompositionArchive({ onClose, onPreview }: {
                       </button>
                       <div className="archive-card-info">
                         <strong title={name}>{name}</strong>
-                        <time dateTime={entry.expires_at}>{dateFormat.format(new Date(entry.expires_at))} 到期</time>
+                        <time dateTime={entry.downloaded_at || entry.saved_at}>{savedTimeFormat.format(new Date(entry.downloaded_at || entry.saved_at))} 入库 · {dateFormat.format(new Date(entry.expires_at))} 到期</time>
                         {section === 'history' ? (
                           <div className="archive-card-actions">
                             <a className="toolbar-button" href={`${url}?download=true`} target="_blank" rel="noopener">下载 JPG</a>
@@ -86,9 +115,10 @@ export function CompositionArchive({ onClose, onPreview }: {
                   )
                 })}
               </div>
-              {limit < visible.length && <button className="toolbar-button archive-more" type="button" onClick={() => setLimit((value) => value + pageSize)}>加载更多</button>}
+              {page.data.next_cursor && <button className="toolbar-button archive-more" type="button" disabled={loading} onClick={() => void readArchiveQuery(pageKey, false, true)}>{loading ? '正在加载…' : '加载更多'}</button>}
+              {!visible.length && loaded && !error && !readError && <p>{section === 'history' ? '这个日期文件夹暂时没有素材。' : '从合成结果删除的图片会出现在这里。'}</p>}
             </>
-          ) : (loaded || (!loading && !readError)) && !error && <p>{section === 'history' ? '下载合成图后，记录会出现在这里。' : '从合成结果删除的图片会出现在这里。'}</p>}
+          )}
         </div>
       </section>
     </div>

@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Lock
+from .record_cache import RecordCache, read_records
 
 
 RECORD_ID = re.compile(r"[0-9a-f]{12}-[0-9]{9,}")
@@ -14,6 +14,23 @@ OWNER_ID = re.compile(r"[0-9a-f]{64}")
 RETENTION = timedelta(days=7)
 LOGGER = logging.getLogger(__name__)
 _locks = [Lock() for _ in range(64)]
+_catalogs = RecordCache(ttl=60, max_stale=300)
+
+
+def normalize_record(record):
+    record = dict(record)
+    record.setdefault("downloaded_at", record["saved_at"])
+    record.setdefault("updated_at", record["saved_at"])
+    record.setdefault("trashed_at", record["saved_at"] if record["section"] == "trash" else None)
+    return record
+
+
+def history_time(record):
+    return record.get("downloaded_at") or record["saved_at"]
+
+
+def history_day(record):
+    return datetime.fromisoformat(history_time(record)).astimezone(timezone(timedelta(hours=8))).date().isoformat()
 
 
 class CompositionArchive:
@@ -21,6 +38,9 @@ class CompositionArchive:
         self.bucket = bucket
         self.sdk = sdk
         self.prefix = prefix
+
+    def _cache_key(self, owner):
+        return f"{getattr(self.bucket, 'bucket_name', getattr(self.bucket, 'bucket', id(self.bucket)))}:{getattr(self.bucket, 'base_url', '')}:{self.prefix}:{owner}"
 
     def _key(self, owner: str, entry_id: str) -> str:
         return f"{self.prefix}{owner}/{entry_id}"
@@ -31,7 +51,7 @@ class CompositionArchive:
         except self.sdk.exceptions.NoSuchKey:
             return None
         try:
-            return json.loads(result.read())
+            return normalize_record(json.loads(result.read()))
         finally:
             close = getattr(result, "close", None)
             if close:
@@ -39,6 +59,8 @@ class CompositionArchive:
 
     def _write(self, key: str, record: dict) -> None:
         self.bucket.put_object(key + ".json", json.dumps(record, ensure_ascii=False))
+        owner = key[len(self.prefix):].split("/", 1)[0]
+        _catalogs.update(self._cache_key(owner), record["id"], record)
 
     def save(self, owner: str, entry_id: str, image: dict, path, section: str) -> dict:
         key = self._key(owner, entry_id)
@@ -51,7 +73,8 @@ class CompositionArchive:
                     return previous
                 if section == "trash":
                     return self._move_to_trash(key, previous, now)
-                record = {**previous, "section": "history"}
+                record = {**previous, "section": "history", "updated_at": now.isoformat(),
+                          "downloaded_at": previous.get("downloaded_at") or now.isoformat()}
                 self._write(key, record)
                 return record
             self.bucket.put_object_from_file(key + ".jpg", str(path))
@@ -62,6 +85,9 @@ class CompositionArchive:
                 "template_name": image["template_name"],
                 "section": section,
                 "saved_at": now.isoformat(),
+                "downloaded_at": now.isoformat() if section == "history" else None,
+                "trashed_at": now.isoformat() if section == "trash" else None,
+                "updated_at": now.isoformat(),
                 "expires_at": (now + RETENTION).isoformat(),
             }
             self._write(key, record)
@@ -69,7 +95,7 @@ class CompositionArchive:
 
     def _move_to_trash(self, key: str, record: dict, now: datetime) -> dict:
         if record["section"] != "trash":
-            record = {**record, "section": "trash", "saved_at": now.isoformat(),
+            record = {**record, "section": "trash", "trashed_at": now.isoformat(), "updated_at": now.isoformat(),
                       "expires_at": (now + RETENTION).isoformat()}
             self._write(key, record)
         return record
@@ -88,13 +114,13 @@ class CompositionArchive:
             return record
         return None
 
-    def list(self, owner: str) -> list[dict]:
+    def list(self, owner: str, *, refresh=False) -> list[dict]:
         prefix = f"{self.prefix}{owner}/"
-        entry_ids = [obj.key[len(prefix):-5] for obj in self.sdk.ObjectIteratorV2(self.bucket, prefix=prefix)
-                     if obj.key.endswith(".json") and RECORD_ID.fullmatch(obj.key[len(prefix):-5])]
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            records = [record for record in pool.map(lambda entry_id: self.get(owner, entry_id), entry_ids)
-                       if record is not None]
+        records, _ = _catalogs.get(self._cache_key(owner),
+                                  lambda old, versions: read_records(self.bucket, self.sdk, prefix, old, versions, RECORD_ID),
+                                  force=refresh)
+        now = datetime.now(timezone.utc)
+        records = [normalize_record(record) for record in records if datetime.fromisoformat(record["expires_at"]) > now]
         return sorted(records, key=lambda record: record["saved_at"], reverse=True)
 
     def restore(self, owner: str, entry_id: str) -> dict | None:
@@ -105,6 +131,8 @@ class CompositionArchive:
                 return None
             if record["section"] == "trash":
                 record["section"] = "history"
+                record["updated_at"] = datetime.now(timezone.utc).isoformat()
+                record["downloaded_at"] = record.get("downloaded_at") or record["updated_at"]
                 self._write(key, record)
             return record
 
@@ -141,6 +169,7 @@ class CompositionArchive:
                         if record and datetime.fromisoformat(record["expires_at"]) <= now:
                             self._delete(key + ".jpg")
                             self._delete(key + ".json")
+                            _catalogs.update(self._cache_key(owner), record["id"], None)
                 elif filename.endswith(".jpg") and modified is not None and now.timestamp() - modified >= RETENTION.total_seconds():
                     # Recover an upload interrupted before its metadata was written.
                     with _locks[hash(key) % len(_locks)]:

@@ -86,13 +86,18 @@ _budget = None
 _workers = None
 
 
-def submit_composition(function, *args, estimated_bytes=1024 * MIB, **kwargs):
+def submit_composition(function, *args, estimated_bytes=1024 * MIB, cancel_check=None, **kwargs):
     global _pool, _active, _reserved, _budget, _workers
     with _condition:
         if _budget is None:
             _budget, _workers = memory_budget(), worker_count()
         reservation = max(1, min(estimated_bytes, _budget))
-        _condition.wait_for(lambda: _active < _workers and (_active == 0 or _reserved + reservation <= _budget))
+        while not (_active < _workers and (_active == 0 or _reserved + reservation <= _budget)):
+            if cancel_check is not None:
+                cancel_check()
+            _condition.wait(timeout=.1)
+        if cancel_check is not None:
+            cancel_check()
         _active += 1
         _reserved += reservation
     def release(_future=None):

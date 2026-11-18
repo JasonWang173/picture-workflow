@@ -5,6 +5,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Literal, NamedTuple, Sequence
+from food_compositor.cancellation import check_cancelled, CompositionCancelled
 
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
@@ -52,6 +53,7 @@ def _has_transparency(image: Image.Image) -> bool:
 
 def _encode_jpeg(image: Image.Image, quality: int, subsampling: int = 1) -> bytes:
     """Encode a progressive JPEG with a good size/detail balance."""
+    check_cancelled()
     buffer = io.BytesIO()
     image.convert("RGB").save(
         buffer,
@@ -805,10 +807,13 @@ def _rembg_cutout(image: Image.Image) -> Image.Image | None:
         # smaller model and is a practical default for a reusable CLI tool.
         if _REMBG_SESSION is None:
             _REMBG_SESSION = new_session("u2netp")
+        check_cancelled()
         result = remove(image.convert("RGBA"), session=_REMBG_SESSION)
         if isinstance(result, Image.Image):
             return result.convert("RGBA")
         return Image.open(io.BytesIO(result)).convert("RGBA")
+    except CompositionCancelled:
+        raise
     except Exception as exc:  # model download or runtime can fail offline
         LOGGER.warning("rembg 抠图失败，改用 GrabCut: %s", exc)
         return None
@@ -847,7 +852,9 @@ def _grabcut_cutout(image: Image.Image) -> Image.Image:
 
 
 def extract_subject(image: Image.Image) -> Image.Image:
+    check_cancelled()
     result = _rembg_cutout(image)
+    check_cancelled()
     return result if result is not None else _grabcut_cutout(image)
 
 
@@ -2498,6 +2505,7 @@ def _prepare_template(identity, size, mode, preserve_logo_pill, outline_strength
     Identity includes the resolved path and file metadata, so replacing a file,
     changing a setting, or moving to the next uploaded template invalidates it.
     """
+    check_cancelled()
     template = _open_template(identity[0])
     output_size = _parse_size(size, template.size)
     page = None
@@ -2559,10 +2567,12 @@ def compose(
     ``product_path`` is omitted, the detected product panel is cleared and a
     blank template is written.  Other modes still require a product image.
     """
+    check_cancelled()
     if mode not in {"auto", "overlay", "cutout", "template_replace"}:
         raise ValueError("mode 必须是 auto、overlay、cutout 或 template_replace")
     source_size, output_size, template_page, mapped_slot, selected, layers = _prepare_template(
         _template_identity(template_path), size, mode, preserve_logo_pill, outline_strength, manual_slot)
+    check_cancelled()
     if mode == "template_replace":
         # Sharpen the resized template before applying a manual hard mask. If
         # sharpening runs afterwards, its convolution changes pixels just
@@ -2582,11 +2592,13 @@ def compose(
         # template typography and the inserted product benefit from it.
         if not isinstance(mapped_slot, (_GreenSlot, _TransparentSlot)) and not (selected == "cutout" and manual_slot is not None):
             result = _enhance_output_detail(result, source_size, output_size)
+    check_cancelled()
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower()
     if suffix in {".jpg", ".jpeg"}:
         _, encoded = _jpeg_under_limit(result, quality)
+        check_cancelled()
         destination.write_bytes(encoded)
     else:
         result.save(destination, format="PNG", optimize=True)

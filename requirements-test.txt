@@ -1,0 +1,9 @@
+# CI verifies the non-inference pipeline; rembg remains an optional runtime extra.
+Pillow==12.3.0
+numpy==2.4.6
+opencv-python-headless==5.0.0.93
+fastapi==0.143.0
+uvicorn==0.40.0
+python-multipart==0.0.32
+oss2==2.19.1
+httpx==0.28.1

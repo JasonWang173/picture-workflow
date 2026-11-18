@@ -17,7 +17,7 @@ function bytes(value: number) {
   return value >= 1024 * 1024 ? `${(value / (1024 * 1024)).toFixed(1)} MB` : `${Math.round(value / 1024)} KB`
 }
 
-export function ProcessingProgress({ submission, batch, templateOnly }: { submission: SubmissionProgress | null; batch: BatchProgress | null; templateOnly: boolean }) {
+export function ProcessingProgress({ submission, batch, templateOnly, cancelling = false, onCancel }: { submission: SubmissionProgress | null; batch: BatchProgress | null; templateOnly: boolean; cancelling?: boolean; onCancel?: () => void }) {
   const stage = progressStage(submission)
   const current = stage === 'uploading' ? 0 : stage === 'preparing' ? 1 : 2
   const percentage = stage === 'uploading' && submission?.total
@@ -25,12 +25,12 @@ export function ProcessingProgress({ submission, batch, templateOnly }: { submis
     : stage === 'composing' && batch?.total
       ? Math.min(100, Math.floor((batch.done / batch.total) * 100))
       : null
-  const title = stage === 'uploading' ? `正在上传图片${percentage === null ? '' : ` ${percentage}%`}`
+  const title = cancelling ? '正在取消任务…' : stage === 'uploading' ? `正在上传图片${percentage === null ? '' : ` ${percentage}%`}`
     : stage === 'preparing' ? '服务器准备任务'
       : batch?.status === 'done' ? '合成完成，正在读取结果'
         : batch?.status === 'queued' ? '任务已创建，等待开始合成'
           : `正在合成 ${batch?.done || 0} / ${batch?.total || 1} 张`
-  const hint = stage === 'uploading' ? '正在发送所选图片，请保持页面打开'
+  const hint = cancelling ? '正在停止处理并释放资源，已完成的图片会保留' : stage === 'uploading' ? '正在发送所选图片，请保持页面打开'
     : stage === 'preparing' ? '图片已上传，服务器正在保存图片并创建任务'
       : batch?.status === 'queued' ? '正在等待可用的处理资源'
         : templateOnly ? '按模板顺序生成空白模板' : '每张模板处理完全部商品后，再开始下一张模板'
@@ -49,6 +49,7 @@ export function ProcessingProgress({ submission, batch, templateOnly }: { submis
       {stage === 'uploading' && submission && <span className="upload-byte-count">已发送 {bytes(submission.loaded)}{submission.total === null ? '' : ` / ${bytes(submission.total)}`}</span>}
       {stage === 'composing' && batch?.templateIndex && <span>正在处理第 {batch.templateIndex} / {batch.templateCount} 个模板：{batch.templateName}</span>}
       <span>{hint}</span>
+      {onCancel && <button className="toolbar-button cancel-task-button" type="button" disabled={cancelling} onClick={onCancel}>{cancelling ? '正在取消…' : '取消任务'}</button>}
     </div>
   )
 }

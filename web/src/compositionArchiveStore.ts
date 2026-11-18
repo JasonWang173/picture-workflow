@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { invalidateArchiveQueries } from './archiveQueries'
 
 export type ArchiveEntry = {
   id: string
@@ -8,6 +9,9 @@ export type ArchiveEntry = {
   section: 'history' | 'trash'
   saved_at: string
   expires_at: string
+  downloaded_at?: string | null
+  trashed_at?: string | null
+  updated_at?: string
 }
 
 export const archiveEndpoint = '/api/composition-archive'
@@ -64,6 +68,7 @@ export function updateArchiveRecords(items: ArchiveEntry[]) {
     if (pending) updatesDuringRead.set(item.id, item)
   }
   publish({ items: currentEntries(merged.values()) })
+  invalidateArchiveQueries()
 }
 
 export function readCompositionArchive(force = false) {

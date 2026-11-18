@@ -24,7 +24,7 @@ class OssRestTest(unittest.TestCase):
         params = parse_qs(urlsplit(request.full_url).query)
         if request.method == 'GET' and 'list-type' in params:
             if 'continuation-token' not in params:
-                return Response(b'<ListBucketResult><Contents><Key>prefix%2Fone.json</Key></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>')
+                return Response(b'<ListBucketResult><Contents><Key>prefix%2Fone.json</Key></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>next+/=</NextContinuationToken></ListBucketResult>')
             return Response(b'<ListBucketResult><Contents><Key>prefix%2Ftwo.json</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>')
         return Response(b'content')
 
@@ -38,6 +38,11 @@ class OssRestTest(unittest.TestCase):
         message = f'GET\n\n\n{date}\n/test-bucket/'.encode()
         signature = base64.b64encode(hmac.new(b'test-secret', message, hashlib.sha1).digest()).decode()
         self.assertEqual(request.get_header('Authorization'), f'OSS test-id:{signature}')
+        page_two = self.requests[1]
+        self.assertEqual(parse_qs(urlsplit(page_two.full_url).query)['continuation-token'], ['next+/='])
+        message = f"GET\n\n\n{page_two.get_header('Date')}\n/test-bucket/?continuation-token=next+/=".encode()
+        expected = base64.b64encode(hmac.new(b'test-secret', message, hashlib.sha1).digest()).decode()
+        self.assertEqual(page_two.get_header('Authorization'), f'OSS test-id:{expected}')
 
     def test_put_and_delete(self):
         with patch('urllib.request.urlopen', side_effect=self.open_request):

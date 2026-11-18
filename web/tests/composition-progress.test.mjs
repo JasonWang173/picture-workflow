@@ -13,7 +13,7 @@ async function loadSource(filename, jsx = false) {
   if (jsx) output = output.replaceAll('"react/jsx-runtime"', JSON.stringify(pathToFileURL(require.resolve('react/jsx-runtime')).href))
   return import(`data:text/javascript;base64,${Buffer.from(output).toString('base64')}`)
 }
-const { submitComposition } = await loadSource('compositionRequest.ts')
+const { submitComposition, CompositionTask } = await loadSource('compositionRequest.ts')
 const { ProcessingProgress } = await loadSource('ProcessingProgress.tsx', true)
 
 class FakeRequest {
@@ -24,6 +24,7 @@ class FakeRequest {
   constructor() { FakeRequest.current = this }
   open(method, url) { this.method = method; this.url = url }
   send(body) { this.body = body }
+  abort() { this.aborted = true; this.onabort?.() }
 }
 globalThis.XMLHttpRequest = FakeRequest
 
@@ -85,4 +86,66 @@ test('visible progress uses real transfer bytes and completed image counts', () 
   const compose = renderToStaticMarkup(createElement(ProcessingProgress, { submission: null, batch: { done: 1, total: 4, status: 'processing' }, templateOnly: false }))
   assert.match(compose, /正在合成 1 \/ 4 张/)
   assert.match(compose, /aria-valuenow="25"/)
+})
+
+test('abort signal stops the upload and ignores a late task response', async () => {
+  const controller = new AbortController()
+  const stages = []
+  const promise = submitComposition(new FormData(), (progress) => stages.push(progress), controller.signal)
+  const request = FakeRequest.current
+  controller.abort()
+  await assert.rejects(promise, /取消/)
+  assert.equal(request.aborted, true)
+  request.onload()
+  request.upload.onload()
+  assert.equal(stages.length, 1)
+})
+
+test('cancelling during reservation never starts an upload and cancels the known batch', async (context) => {
+  let resolveReserve
+  const calls = []
+  context.mock.method(globalThis, 'fetch', (url) => {
+    calls.push(url)
+    if (url.endsWith('/reserve')) return new Promise((resolve) => { resolveReserve = resolve })
+    return Promise.resolve(Response.json({ status: 'cancelled' }))
+  })
+  const task = new CompositionTask(() => assert.fail('unexpected cancel error'))
+  FakeRequest.current = null
+  const starting = task.begin(new FormData(), () => {})
+  task.cancel()
+  resolveReserve(Response.json({ batch_id: '123456abcdef', total: 0, status_url: '/api/batches/123456abcdef/status' }))
+  await starting
+  assert.equal(FakeRequest.current, null)
+  assert.deepEqual(calls, ['/api/batches/reserve', '/api/batches/123456abcdef/cancel'])
+})
+
+test('cancellation in server preparation aborts XHR and reports an unconfirmed cancel for retry', async (context) => {
+  const errors = []
+  const calls = []
+  context.mock.method(globalThis, 'fetch', (url) => {
+    calls.push(url)
+    return Promise.resolve(url.endsWith('/reserve')
+      ? Response.json({ batch_id: '123456abcdef', total: 0, status_url: '/api/batches/123456abcdef/status' })
+      : new Response(null, { status: 503 }))
+  })
+  const task = new CompositionTask((error) => errors.push(error))
+  const starting = task.begin(new FormData(), () => {})
+  await new Promise((resolve) => setImmediate(resolve))
+  FakeRequest.current.upload.onload()
+  task.cancel()
+  await starting
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(FakeRequest.current.aborted, true)
+  assert.match(errors[0], /未确认/)
+  task.cancel()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(calls.filter((url) => url.endsWith('/cancel')).length, 2)
+})
+
+test('processing view exposes cancellation and prevents duplicate clicks while cancelling', () => {
+  const props = { submission: null, batch: { done: 1, total: 4 }, templateOnly: false, onCancel: () => {} }
+  assert.match(renderToStaticMarkup(createElement(ProcessingProgress, props)), />取消任务</)
+  const cancelling = renderToStaticMarkup(createElement(ProcessingProgress, { ...props, cancelling: true }))
+  assert.match(cancelling, /正在取消任务/)
+  assert.match(cancelling, /disabled=""/)
 })

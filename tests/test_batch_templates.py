@@ -27,10 +27,13 @@ def picture(color):
 
 class BatchCompositionTest(unittest.TestCase):
     def setUp(self):
+        server.app.middleware_stack = None  # each test starts a fresh request-admission window
         self.directory = tempfile.TemporaryDirectory()
         self.root_patch = patch.object(server, 'BATCH_ROOT', Path(self.directory.name))
         self.executor = ThreadPoolExecutor(max_workers=2)
-        def submit(function, *args, estimated_bytes=None, **kwargs):
+        def submit(function, *args, estimated_bytes=None, cancel_check=None, **kwargs):
+            if cancel_check is not None:
+                cancel_check()
             return self.executor.submit(function, *args, **kwargs)
         self.pool_patch = patch.object(server, 'submit_composition', side_effect=submit)
         self.worker_patch = patch.object(server, 'worker_count', return_value=2)
@@ -252,7 +255,7 @@ class TemplateLibraryErrorsTest(unittest.TestCase):
         class BrokenBucket:
             def get_object(self, key):
                 raise Failure('network error')
-        sdk = SimpleNamespace(exceptions=SimpleNamespace(OssError=Failure), ObjectIteratorV2=lambda bucket, prefix: [SimpleNamespace(key='broken.json')])
+        sdk = SimpleNamespace(exceptions=SimpleNamespace(OssError=Failure, NoSuchKey=oss_rest.NoSuchKey), ObjectIteratorV2=lambda bucket, prefix: [SimpleNamespace(key=prefix + '0000000000000001.json')])
         with patch.object(server, '_oss_bucket', return_value=BrokenBucket()), patch.object(server, '_oss_sdk', return_value=sdk):
             response = TestClient(server.app).get('/api/templates')
         self.assertEqual(response.status_code, 503)
