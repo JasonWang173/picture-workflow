@@ -42,6 +42,12 @@ from food_compositor.storage_guard import ensure_space, StorageFull, reserve_byt
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
 BATCH_ROOT = Path(os.environ.get("COMPOSITION_BATCH_ROOT", ROOT / "runtime" / "batches"))
+# Some hosts mount /tmp as a small RAM disk. Multipart spools and ZIPs must
+# use application storage, otherwise the disk guard can reject every upload
+# or a large request can exhaust RAM despite free space on the main disk.
+UPLOAD_TEMP_ROOT = Path(os.environ.get("COMPOSITION_TEMP_ROOT", BATCH_ROOT.parent / "upload-temp")).resolve()
+UPLOAD_TEMP_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+tempfile.tempdir = str(UPLOAD_TEMP_ROOT)
 # Optional machine-specific settings contain no credentials and are never committed.
 _local_oss_settings = ROOT / "runtime" / "local-oss.json"
 if _local_oss_settings.is_file():
@@ -402,7 +408,7 @@ def health() -> dict[str, str]:
 def readiness() -> JSONResponse:
     checks = {
         "frontend": (WEB_DIST / "index.html").is_file() and (WEB_DIST / "assets").is_dir(),
-        "disk": shutil.disk_usage(BATCH_ROOT).free >= reserve_bytes(),
+        "disk": all(shutil.disk_usage(path).free >= reserve_bytes() for path in (BATCH_ROOT, UPLOAD_TEMP_ROOT)),
     }
     return JSONResponse({"status": "ok" if all(checks.values()) else "degraded", "checks": checks},
                         status_code=200 if all(checks.values()) else 503)

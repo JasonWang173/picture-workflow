@@ -11,6 +11,19 @@ from food_compositor.request_limits import RequestLimits
 
 
 class RequestLimitTest(unittest.TestCase):
+    def test_multipart_and_zip_temporary_files_use_application_storage(self):
+        import server
+        from pathlib import Path
+        with tempfile.NamedTemporaryFile() as stream:
+            stream.write(b'x' * 1024)
+            stream.flush()
+            self.assertEqual(Path(stream.name).parent.resolve(), server.UPLOAD_TEMP_ROOT)
+        with tempfile.SpooledTemporaryFile(max_size=16) as stream:
+            stream.write(b'x' * 1024)
+            self.assertTrue(stream._rolled)
+            stream.seek(0)
+            self.assertEqual(stream.read(), b'x' * 1024)
+
     def test_disk_shortage_while_parsing_upload_returns_507_without_composition(self):
         app = FastAPI()
         calls = []
