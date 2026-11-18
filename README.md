@@ -138,7 +138,7 @@ OSS REST 连接的 ListObjectsV2 后续页会将 `continuation-token` 原始值�
 
 ### 任务资源与发布检查
 
-资源参数通过服务环境变量配置（本次未增加登录或访问口令）。默认每批最多 200 张商品图、50 张模板、2,000 张输出，总图片文件大小不超过 512 MB；单文件仍为 24 MB。输出最长边不超过 4096 像素、总像素不超过 800 万。可设置 `MAX_BATCH_PRODUCTS`、`MAX_BATCH_TEMPLATES`、`MAX_BATCH_OUTPUTS`、`MAX_BATCH_UPLOAD_MB` 调整批量限制。
+资源参数通过服务环境变量配置（本次未增加登录或访问口令）。默认每批最多 200 张商品图、50 张模板、2,000 张输出，总图片文件大小不超过 2,048 MB；单文件不超过 100 MB。输出最长边不超过 4096 像素、总像素不超过 800 万。可设置 `MAX_BATCH_PRODUCTS`、`MAX_BATCH_TEMPLATES`、`MAX_BATCH_OUTPUTS`、`MAX_BATCH_UPLOAD_MB`、`MAX_UPLOAD_MB` 调整批量限制。
 
 提交接口在解析 multipart 前检查整体请求大小（额外预留 4 MB 表单开销，同时检查分块请求）；默认同来源 IP 最多 2 个在途任务、全服务最多 4 个在途任务、同来源每分钟 10 次提交，任务完成或失败后释放名额。对应 `MAX_ACTIVE_TASKS_PER_CLIENT`、`MAX_ACTIVE_TASKS`、`MAX_TASKS_PER_MINUTE`。磁盘至少预留 1024 MB（`MIN_FREE_DISK_MB`），空间不足时返回明确提示。实际图像计算仍由原来的 CPU/内存进程池约束。反向代理应只信任自己的代理地址，避免任意客户端伪造来源 IP；多 Uvicorn 主进程需改为共享限额存储，本版本按单个服务进程部署。
 

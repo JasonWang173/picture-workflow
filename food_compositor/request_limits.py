@@ -18,7 +18,9 @@ class BodyTooLarge(MultiPartException):
 class RequestLimits:
     def __init__(self, app, storage):
         self.app, self.storage = app, storage
-        self.max_bytes = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "512")) * 1024 * 1024 + 4 * 1024 * 1024
+        self.max_batch_mb = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "2048"))
+        self.max_file_mb = int(os.environ.get("MAX_UPLOAD_MB", "100"))
+        self.max_bytes = self.max_batch_mb * 1024 * 1024 + 4 * 1024 * 1024
         self.per_client = int(os.environ.get("MAX_ACTIVE_TASKS_PER_CLIENT", "2"))
         self.max_active = int(os.environ.get("MAX_ACTIVE_TASKS", "4"))
         self.per_minute = int(os.environ.get("MAX_TASKS_PER_MINUTE", "10"))
@@ -40,8 +42,8 @@ class RequestLimits:
         except ValueError:
             return await JSONResponse({"detail": "上传长度无效"}, status_code=400)(scope, receive, send)
         if length > self.max_bytes:
-            return await JSONResponse({"detail": "上传总大小超过限制，请分批上传"}, status_code=413)(scope, receive, send)
-        if shutil.disk_usage(self.storage).free < self.disk_reserve + max(length, 24 * 1024 * 1024):
+            return await JSONResponse({"detail": f"上传总大小超过 {self.max_batch_mb} MB，请分批上传"}, status_code=413)(scope, receive, send)
+        if shutil.disk_usage(self.storage).free < self.disk_reserve + max(length, self.max_file_mb * 1024 * 1024):
             return await JSONResponse({"detail": "服务器磁盘空间不足，请稍后重试"}, status_code=507)(scope, receive, send)
         # Use the ASGI peer; forwarded headers must be resolved only by a trusted proxy.
         client = (scope.get("client") or ("unknown",))[0]
@@ -69,7 +71,7 @@ class RequestLimits:
             transferred += len(message.get("body", b""))
             if transferred > self.max_bytes:
                 too_large = True
-                raise BodyTooLarge("上传总大小超过限制，请分批上传")
+                raise BodyTooLarge(f"上传总大小超过 {self.max_batch_mb} MB，请分批上传")
             return message
         async def limited_send(message):
             if too_large and message["type"] == "http.response.start":
@@ -78,7 +80,7 @@ class RequestLimits:
         try:
             await self.app(scope, limited_receive, limited_send)
         except BodyTooLarge:
-            await JSONResponse({"detail": "上传总大小超过限制，请分批上传"}, status_code=413)(scope, receive, send)
+            await JSONResponse({"detail": f"上传总大小超过 {self.max_batch_mb} MB，请分批上传"}, status_code=413)(scope, receive, send)
         finally:
             if composing:
                 with self.lock:

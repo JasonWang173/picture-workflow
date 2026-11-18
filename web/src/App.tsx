@@ -141,7 +141,7 @@ function AssetDrop({
             <span className="upload-mark"><Icon name="upload" size={20} /></span>
             <div>
               <strong>{allowFolder ? '拖入图片，或选择图片 / 文件夹' : '拖入图片，或点击选择'}</strong>
-              <span>{allowFolder ? '可多次累加选择图片 / 文件夹 · 合成后下载 ZIP' : 'PNG / JPG / WEBP · 最大 24 MB'}</span>
+              <span>{allowFolder ? '可多次累加选择图片 / 文件夹 · 合成后下载 ZIP' : 'PNG / JPG / WEBP · 最大 100 MB'}</span>
               {(allowFolder || onPickFromLibrary) && <div className="drop-actions">
                 {allowFolder && <>
                   <button type="button" className="drop-choice" onClick={(event) => { event.stopPropagation(); choose() }}>选择图片</button>

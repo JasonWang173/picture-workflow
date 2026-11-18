@@ -68,8 +68,9 @@ DEMO_ASSETS = {
     "template": ROOT / "1.jpg",
     "product": ROOT / "商品1.png",
 }
-MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-MAX_BATCH_UPLOAD_BYTES = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "512")) * 1024 * 1024
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_BATCH_UPLOAD_BYTES = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "2048")) * 1024 * 1024
 MAX_BATCH_PRODUCTS = int(os.environ.get("MAX_BATCH_PRODUCTS", "200"))
 MAX_BATCH_TEMPLATES = int(os.environ.get("MAX_BATCH_TEMPLATES", "50"))
 MAX_BATCH_OUTPUTS = int(os.environ.get("MAX_BATCH_OUTPUTS", "2000"))
@@ -316,7 +317,7 @@ async def _write_upload(
                     batch_exceeded = total_limit is not None and current_total + written > total_limit
                     raise HTTPException(
                         status_code=413,
-                        detail=(f"批量上传总大小不能超过 {MAX_BATCH_UPLOAD_BYTES // 1024 // 1024} MB" if batch_exceeded else "单个图片不能超过 24 MB"),
+                        detail=(f"批量上传总大小不能超过 {MAX_BATCH_UPLOAD_BYTES // 1024 // 1024} MB" if batch_exceeded else f"单个图片不能超过 {MAX_UPLOAD_MB} MB"),
                     )
                 handle.write(chunk)
     except HTTPException:
