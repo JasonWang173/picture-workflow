@@ -24,7 +24,8 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from threading import Lock
 import time
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +37,7 @@ from food_compositor.execution import submit_composition, worker_count, estimate
 from food_compositor.record_cache import RecordCache, read_records
 from food_compositor.request_limits import RequestLimits
 from food_compositor.cancellation import CompositionCancelled, cancellation_scope
+from food_compositor.storage_guard import ensure_space, StorageFull, reserve_bytes
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
@@ -68,12 +70,12 @@ DEMO_ASSETS = {
     "template": ROOT / "1.jpg",
     "product": ROOT / "商品1.png",
 }
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-MAX_BATCH_UPLOAD_BYTES = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "2048")) * 1024 * 1024
-MAX_BATCH_PRODUCTS = int(os.environ.get("MAX_BATCH_PRODUCTS", "200"))
-MAX_BATCH_TEMPLATES = int(os.environ.get("MAX_BATCH_TEMPLATES", "50"))
-MAX_BATCH_OUTPUTS = int(os.environ.get("MAX_BATCH_OUTPUTS", "2000"))
+MAX_BATCH_UPLOAD_BYTES = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "8192")) * 1024 * 1024
+MAX_BATCH_PRODUCTS = int(os.environ.get("MAX_BATCH_PRODUCTS", "1000"))
+MAX_BATCH_TEMPLATES = int(os.environ.get("MAX_BATCH_TEMPLATES", "1000"))
+MAX_BATCH_OUTPUTS = int(os.environ.get("MAX_BATCH_OUTPUTS", "10000"))
 THUMBNAIL_MAX_EDGE = 360
 BATCH_ROOT.mkdir(parents=True, exist_ok=True)
 LOGGER = logging.getLogger(__name__)
@@ -319,6 +321,10 @@ async def _write_upload(
                         status_code=413,
                         detail=(f"批量上传总大小不能超过 {MAX_BATCH_UPLOAD_BYTES // 1024 // 1024} MB" if batch_exceeded else f"单个图片不能超过 {MAX_UPLOAD_MB} MB"),
                     )
+                try:
+                    ensure_space(destination.parent, len(chunk))
+                except StorageFull as exc:
+                    raise HTTPException(status_code=507, detail=str(exc)) from None
                 handle.write(chunk)
     except HTTPException:
         destination.unlink(missing_ok=True)
@@ -396,7 +402,7 @@ def health() -> dict[str, str]:
 def readiness() -> JSONResponse:
     checks = {
         "frontend": (WEB_DIST / "index.html").is_file() and (WEB_DIST / "assets").is_dir(),
-        "disk": shutil.disk_usage(BATCH_ROOT).free >= int(os.environ.get("MIN_FREE_DISK_MB", "1024")) * 1024 * 1024,
+        "disk": shutil.disk_usage(BATCH_ROOT).free >= reserve_bytes(),
     }
     return JSONResponse({"status": "ok" if all(checks.values()) else "degraded", "checks": checks},
                         status_code=200 if all(checks.values()) else 503)
@@ -661,7 +667,21 @@ def cancel_batch(batch_id: str, request: Request) -> dict:
     return {"status": status["status"]}
 
 
-@app.post("/api/compose-batch")
+class BatchUploadRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        async def with_batch_parser(request: Request):
+            # The framework's default 1,000-file cap counts products AND templates.
+            # Cache the parsed form so FastAPI reuses it, with normal cleanup.
+            await request.form(max_files=MAX_BATCH_PRODUCTS + MAX_BATCH_TEMPLATES + 1)
+            return await handler(request)
+        return with_batch_parser
+
+
+batch_router = APIRouter(route_class=BatchUploadRoute)
+
+
+@batch_router.post("/api/compose-batch")
 async def create_batch_composition(
     background_tasks: BackgroundTasks,
     request: Request,
@@ -819,6 +839,9 @@ async def create_batch_composition(
     return response
 
 
+app.include_router(batch_router)
+
+
 def _compose_one(
     item: dict,
     template_path: str,
@@ -836,6 +859,7 @@ def _compose_one(
     output_path = Path(output_dir) / f"{index:09d}_T{item['template_index']:04d}_P{item['product_index']:04d}_{item['stem']}.jpg"
     try:
         with cancellation_scope(Path(work_dir).parent / "cancel.requested"):
+            ensure_space(output_path.parent, 300_000)
             compose(
                 Path(work_dir) / str(item["work"]) if item["work"] is not None else None,
                 Path(template_path),
@@ -938,6 +962,7 @@ def _run_batch_composition(
                 entry = next(pending_entries, None)
                 if entry is None:
                     return
+                ensure_space(output_dir, 300_000 * workers)
                 product_path = work_dir / str(entry["work"]) if entry["work"] is not None else None
                 future = submit_composition(_compose_one, entry, str(template_path), batch_id, template_item.get("mode", mode), size,
                                             outline_strength, preserve_logo_pill, quality, str(work_dir), str(output_dir),
@@ -1024,10 +1049,13 @@ def _result_image(status: dict, image_id: str) -> dict:
 
 
 @app.get("/api/batches/{batch_id}/status")
-def get_batch_status(batch_id: str, request: Request) -> JSONResponse:
+def get_batch_status(batch_id: str, request: Request, summary: bool = False) -> JSONResponse:
     batch_dir = _batch_directory(batch_id)
     status = _owned_batch_status(batch_dir, request)
-    return JSONResponse({key: value for key, value in status.items() if key != "owner"},
+    hidden = {'owner'}
+    if summary and status.get('status') not in {'done', 'failed', 'cancelled'}:
+        hidden.update({'images', 'skipped'})
+    return JSONResponse({key: value for key, value in status.items() if key not in hidden},
                         headers={"Cache-Control": "private, no-store"})
 
 
@@ -1050,6 +1078,10 @@ def _prepare_batch_download(batch_id: str, request: Request, ids: str | None, ti
                     archive_path = Path(temporary.name)
             with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as zipped:
                 for _, path in selected:
+                    try:
+                        ensure_space(archive_path.parent, path.stat().st_size + 4096)
+                    except StorageFull as exc:
+                        raise HTTPException(status_code=507, detail=str(exc)) from None
                     zipped.write(path, arcname=path.name)
             owner = status.get("owner")
             if owner:
@@ -1079,7 +1111,13 @@ def download_batch(batch_id: str, request: Request, background_tasks: Background
 
 
 @app.post("/api/batches/{batch_id}/download")
-def prepare_batch_download(batch_id: str, request: Request, ids: Optional[str] = None) -> JSONResponse:
+def prepare_batch_download(batch_id: str, request: Request, ids: Optional[str] = None,
+                           selection: Annotated[Optional[dict], Body()] = None) -> JSONResponse:
+    if selection is not None:
+        values = selection.get('ids')
+        if not isinstance(values, list) or not 1 <= len(values) <= MAX_BATCH_OUTPUTS or any(not isinstance(value, str) or not re.fullmatch(r'[0-9]{9}', value) for value in values):
+            raise HTTPException(status_code=400, detail='请选择有效的合成图')
+        ids = ','.join(values)
     ticket = uuid.uuid4().hex
     _, records = _prepare_batch_download(batch_id, request, ids, ticket)
     return JSONResponse({"items": records, "url": f"/api/batches/{batch_id}/downloads/{ticket}"},

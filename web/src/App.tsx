@@ -141,7 +141,7 @@ function AssetDrop({
             <span className="upload-mark"><Icon name="upload" size={20} /></span>
             <div>
               <strong>{allowFolder ? '拖入图片，或选择图片 / 文件夹' : '拖入图片，或点击选择'}</strong>
-              <span>{allowFolder ? '可多次累加选择图片 / 文件夹 · 合成后下载 ZIP' : 'PNG / JPG / WEBP · 最大 100 MB'}</span>
+              <span>{allowFolder ? '可多次累加选择图片 / 文件夹 · 合成后下载 ZIP' : 'PNG / JPG / WEBP · 最大 200 MB'}</span>
               {(allowFolder || onPickFromLibrary) && <div className="drop-actions">
                 {allowFolder && <>
                   <button type="button" className="drop-choice" onClick={(event) => { event.stopPropagation(); choose() }}>选择图片</button>
@@ -482,6 +482,7 @@ function App() {
   const [resultAction, setResultAction] = useState('')
   const [resultNotice, setResultNotice] = useState('')
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
+  const [resultPage, setResultPage] = useState(0)
   const [batchSkipped, setBatchSkipped] = useState<BatchSkipped[]>([])
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null)
   const [submissionProgress, setSubmissionProgress] = useState<SubmissionProgress | null>(null)
@@ -586,6 +587,7 @@ function App() {
     setTaskCancelled(false)
     setResultUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return null })
     setBatchImages([])
+    setResultPage(0)
     setSingleResult(null)
     setResultBatchId(null)
     setResultNotice('')
@@ -819,7 +821,7 @@ function App() {
       for (;;) {
         let status: StatusPayload
         try {
-          const statusResponse = await fetch(payload.status_url, { signal: AbortSignal.timeout(15_000) })
+          const statusResponse = await fetch(`${payload.status_url}?summary=true`, { signal: AbortSignal.timeout(15_000) })
           if (!statusResponse.ok) throw new Error('批次状态读取失败')
           status = await statusResponse.json() as StatusPayload
         } catch {
@@ -876,12 +878,17 @@ function App() {
   }
 
   const hasBatch = batchImages.length > 0
+  const resultPageSize = 60
+  const resultPageCount = Math.max(1, Math.ceil(batchImages.length / resultPageSize))
+  const visibleResultPage = Math.min(resultPage, resultPageCount - 1)
+  const visibleBatchImages = batchImages.slice(visibleResultPage * resultPageSize, (visibleResultPage + 1) * resultPageSize)
+  const selectedBatchSet = new Set(selectedBatchIds)
   const displaySize = lastSize || size
   const [displayWidth, displayHeight] = displaySize.split('x').map(Number)
   const isLandscape = displayWidth > displayHeight
   const allBatchSelected = hasBatch && selectedBatchIds.length === batchImages.length
   const selectedDownloadUrl = batchDownloadUrl && selectedBatchIds.length
-    ? `${batchDownloadUrl}?ids=${encodeURIComponent(selectedBatchIds.join(','))}`
+    ? batchDownloadUrl
     : null
   const selectAllBatch = () => setSelectedBatchIds(batchImages.map((image) => image.id))
   const clearBatchSelection = () => setSelectedBatchIds([])
@@ -912,12 +919,12 @@ function App() {
     }
   }
 
-  const downloadResults = async (url: string, name: string) => {
+  const downloadResults = async (url: string, name: string, ids?: string[]) => {
     if (resultAction) return
     setResultAction('zip')
     setResultNotice('')
     try {
-      const response = await fetch(url, { method: 'POST' })
+      const response = await fetch(url, { method: 'POST', ...(ids ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) } : {}) })
       await checkArchiveResponse(response, '打包下载失败，请重试')
       const payload = await response.json() as { items: ArchiveEntry[]; url: string }
       updateArchiveRecords(payload.items)
@@ -1069,18 +1076,19 @@ function App() {
                 </div>
                 {batchSkipped.length > 0 && <div className="batch-skipped" role="alert"><strong>{batchSkipped.length} 张合成失败，其他图片已保留：</strong>{batchSkipped.map((item) => <div key={`${item.template_index}-${item.product_index}`}>模板 {item.template_index}「{item.template_name}」{lastMode === 'template_replace' ? '' : ` · 商品 ${item.product_index}「${item.product_name}」`}：{item.error}</div>)}</div>}
                 <div className={`batch-grid ${isLandscape ? 'is-landscape' : 'is-portrait'}`}>
-                  {batchImages.map((image, index) => {
-                    const selected = selectedBatchIds.includes(image.id)
+                  {visibleBatchImages.map((image, pageIndex) => {
+                    const index = visibleResultPage * resultPageSize + pageIndex
+                    const selected = selectedBatchSet.has(image.id)
                     return (
                       <Fragment key={image.id}>
-                      {(index === 0 || batchImages[index - 1].template_index !== image.template_index) && <div className="batch-group-title">模板 {image.template_index} · {image.template_name}</div>}
+                      {(pageIndex === 0 || batchImages[index - 1].template_index !== image.template_index) && <div className="batch-group-title">模板 {image.template_index} · {image.template_name}</div>}
                       <article className={`batch-card ${selected ? 'is-selected' : ''}`}>
                         <label className="batch-check" aria-label={`${selected ? '取消选择' : '选择'} ${image.name}`}>
                           <input type="checkbox" checked={selected} onChange={() => toggleBatchSelection(image.id)} />
                           <span><Icon name="check" size={12} /></span>
                         </label>
                         <button className="batch-image-button" type="button" onClick={() => setLightbox({ url: image.url, name: image.name })} aria-label={`放大查看 ${image.name}`}>
-                          <img src={image.url} alt={`${index + 1} ${image.name}`} />
+                          <img src={image.url} alt={`${index + 1} ${image.name}`} loading="lazy" decoding="async" />
                           <span className="preview-zoom-hint"><Icon name="zoom" size={13} /></span>
                         </button>
                         <div className="batch-card-meta">
@@ -1096,6 +1104,11 @@ function App() {
                     )
                   })}
                 </div>
+                {resultPageCount > 1 && <div className="batch-pagination">
+                  <button type="button" className="toolbar-button" disabled={visibleResultPage === 0} onClick={() => setResultPage(visibleResultPage - 1)}>上一页</button>
+                  <span>第 {visibleResultPage + 1} / {resultPageCount} 页 · 每页 {resultPageSize} 张 · 全选与下载包含全部页</span>
+                  <button type="button" className="toolbar-button" disabled={visibleResultPage + 1 >= resultPageCount} onClick={() => setResultPage(visibleResultPage + 1)}>下一页</button>
+                </div>}
               </div>
             ) : (
               <div className="empty-preview">
@@ -1118,7 +1131,7 @@ function App() {
             <div className="result-actions">
               <div><span className="result-caption">批量输出</span><strong>{displaySize.replace('x', ' × ')} px · {batchImages.length} 张 JPG · 单张 &lt;300KB</strong></div>
               <div className="batch-download-actions">
-                <button className="download-button" type="button" disabled={!selectedDownloadUrl || !!resultAction} onClick={() => { if (selectedDownloadUrl) void downloadResults(selectedDownloadUrl, 'food-composites-selected.zip') }}><Icon name="download" size={16} /> 下载选中</button>
+                <button className="download-button" type="button" disabled={!selectedDownloadUrl || !!resultAction} onClick={() => { if (selectedDownloadUrl) void downloadResults(selectedDownloadUrl, 'food-composites-selected.zip', selectedBatchIds) }}><Icon name="download" size={16} /> 下载选中</button>
                 <button className="download-button download-button-secondary" type="button" disabled={!batchDownloadUrl || !!resultAction} onClick={() => { if (batchDownloadUrl) void downloadResults(batchDownloadUrl, 'food-composites.zip') }}><Icon name="download" size={16} /> 下载全部</button>
               </div>
             </div>

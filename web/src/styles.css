@@ -377,3 +377,5 @@ select option { background: #1c1f1c; }
   .archive-folder-summary { align-items: start; flex-direction: column; gap: 3px; }
   .archive-folder-heading { align-items: start; flex-direction: column; }
 }
+.batch-pagination { display:flex; align-items:center; justify-content:center; gap:12px; padding:20px 0; flex-wrap:wrap; }
+.batch-pagination span { color:var(--muted, #9c9f96); font-size:12px; }

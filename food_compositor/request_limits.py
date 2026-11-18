@@ -2,29 +2,33 @@
 from __future__ import annotations
 
 import os
-import shutil
 import time
 from collections import OrderedDict, deque
 from threading import Lock
 
 from starlette.responses import JSONResponse
 from starlette.formparsers import MultiPartException
+from .storage_guard import ensure_space, StorageFull, reserve_bytes
 
 
 class BodyTooLarge(MultiPartException):
     pass
 
 
+class BodyStorageFull(MultiPartException):
+    pass
+
+
 class RequestLimits:
     def __init__(self, app, storage):
         self.app, self.storage = app, storage
-        self.max_batch_mb = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "2048"))
-        self.max_file_mb = int(os.environ.get("MAX_UPLOAD_MB", "100"))
+        self.max_batch_mb = int(os.environ.get("MAX_BATCH_UPLOAD_MB", "8192"))
+        self.max_file_mb = int(os.environ.get("MAX_UPLOAD_MB", "200"))
         self.max_bytes = self.max_batch_mb * 1024 * 1024 + 4 * 1024 * 1024
         self.per_client = int(os.environ.get("MAX_ACTIVE_TASKS_PER_CLIENT", "2"))
         self.max_active = int(os.environ.get("MAX_ACTIVE_TASKS", "4"))
         self.per_minute = int(os.environ.get("MAX_TASKS_PER_MINUTE", "10"))
-        self.disk_reserve = int(os.environ.get("MIN_FREE_DISK_MB", "1024")) * 1024 * 1024
+        self.disk_reserve = reserve_bytes()
         self.lock = Lock()
         self.active = {}
         self.recent = OrderedDict()
@@ -43,8 +47,11 @@ class RequestLimits:
             return await JSONResponse({"detail": "上传长度无效"}, status_code=400)(scope, receive, send)
         if length > self.max_bytes:
             return await JSONResponse({"detail": f"上传总大小超过 {self.max_batch_mb} MB，请分批上传"}, status_code=413)(scope, receive, send)
-        if shutil.disk_usage(self.storage).free < self.disk_reserve + max(length, self.max_file_mb * 1024 * 1024):
-            return await JSONResponse({"detail": "服务器磁盘空间不足，请稍后重试"}, status_code=507)(scope, receive, send)
+        try:
+            # Multipart parsing and the task's input copy temporarily coexist.
+            ensure_space(self.storage, 2 * max(length, self.max_file_mb * 1024 * 1024), include_temporary=True)
+        except StorageFull as exc:
+            return await JSONResponse({"detail": str(exc)}, status_code=507)(scope, receive, send)
         # Use the ASGI peer; forwarded headers must be resolved only by a trusted proxy.
         client = (scope.get("client") or ("unknown",))[0]
         if composing:
@@ -65,22 +72,32 @@ class RequestLimits:
                                           headers={"Retry-After": "10"})(scope, receive, send)
         transferred = 0
         too_large = False
+        disk_full = False
         async def limited_receive():
-            nonlocal transferred, too_large
+            nonlocal transferred, too_large, disk_full
             message = await receive()
             transferred += len(message.get("body", b""))
             if transferred > self.max_bytes:
                 too_large = True
                 raise BodyTooLarge(f"上传总大小超过 {self.max_batch_mb} MB，请分批上传")
+            try:
+                ensure_space(self.storage, len(message.get('body', b'')), include_temporary=True)
+            except StorageFull as exc:
+                disk_full = True
+                raise BodyStorageFull(str(exc)) from None
             return message
         async def limited_send(message):
             if too_large and message["type"] == "http.response.start":
                 message = {**message, "status": 413}
+            if disk_full and message["type"] == "http.response.start":
+                message = {**message, "status": 507}
             await send(message)
         try:
             await self.app(scope, limited_receive, limited_send)
         except BodyTooLarge:
             await JSONResponse({"detail": f"上传总大小超过 {self.max_batch_mb} MB，请分批上传"}, status_code=413)(scope, receive, send)
+        except BodyStorageFull as exc:
+            await JSONResponse({"detail": str(exc)}, status_code=507)(scope, receive, send)
         finally:
             if composing:
                 with self.lock:

@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.testclient import TestClient
@@ -10,6 +11,23 @@ from food_compositor.request_limits import RequestLimits
 
 
 class RequestLimitTest(unittest.TestCase):
+    def test_disk_shortage_while_parsing_upload_returns_507_without_composition(self):
+        app = FastAPI()
+        calls = []
+        @app.post('/api/compose')
+        async def compose(file: UploadFile = File()):
+            calls.append(True)
+            return {'ok': True}
+        with tempfile.TemporaryDirectory() as directory:
+            app.add_middleware(RequestLimits, storage=directory)
+            # Admission checks input storage and the multipart spool directory;
+            # disk space disappears before the parser writes the body.
+            free = [SimpleNamespace(free=20*1024**3), SimpleNamespace(free=20*1024**3), SimpleNamespace(free=0)]
+            with patch('food_compositor.storage_guard.shutil.disk_usage', side_effect=free):
+                response = TestClient(app).post('/api/compose', files={'file': ('test.png', b'data', 'image/png')})
+            self.assertEqual(response.status_code, 507)
+            self.assertEqual(calls, [])
+
     def test_oversized_chunked_body_is_rejected_before_composition(self):
         app = FastAPI()
         calls = []

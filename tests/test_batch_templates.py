@@ -159,6 +159,40 @@ class BatchCompositionTest(unittest.TestCase):
                                         data={'mode': 'auto', 'template_modes': value})
             self.assertEqual(response.status_code, 400)
 
+    def test_thousand_products_pass_parser_summary_and_json_selected_download(self):
+        data = picture((2, 3, 4))
+        files = [('templates', ('template.png', picture('red'), 'image/png'))]
+        files += [('products', (f'product-{i}.png', data, 'image/png')) for i in range(1000)]
+        response = self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'})
+        self.assertEqual(response.status_code, 200, response.text)
+        batch = response.json()
+        status = self.client.get(batch['status_url'], params={'summary': 'true'}).json()
+        self.assertEqual((status['status'], status['done'], len(status['images'])), ('done', 1000, 1000))
+        self.assertEqual([image['product_index'] for image in status['images']], list(range(1, 1001)))
+        directory = Path(self.directory.name) / batch['batch_id']
+        pending = {**server._read_batch_status(directory), 'status': 'processing'}
+        server._write_batch_status(directory, pending)
+        self.assertNotIn('images', self.client.get(batch['status_url']+'?summary=true').json())
+        self.assertEqual(len(self.client.get(batch['status_url']).json()['images']), 1000)
+        server._write_batch_status(directory, {**pending, 'status': 'done'})
+        prepared = self.client.post(status['download_url'], json={'ids': [item['id'] for item in status['images']]})
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        with zipfile.ZipFile(io.BytesIO(self.client.get(prepared.json()['url']).content)) as zipped:
+            self.assertEqual(len(zipped.namelist()), 1000)
+        self.assertEqual(len(self.archive_objects), 2000)
+
+    def test_low_disk_during_zip_preserves_original_results(self):
+        from food_compositor.storage_guard import StorageFull
+        files = [('templates', ('template.png', picture('red'), 'image/png')),
+                 ('products', ('product.png', picture('blue'), 'image/png'))]
+        batch = self.client.post('/api/compose-batch', files=files).json()
+        status = self.client.get(batch['status_url']).json()
+        with patch.object(server, 'ensure_space', side_effect=StorageFull('磁盘不足')):
+            response = self.client.post(status['download_url'], json={'ids': [status['images'][0]['id']]})
+        self.assertEqual(response.status_code, 507)
+        self.assertEqual(self.client.get(status['images'][0]['url']).status_code, 200)
+        self.assertEqual(list((Path(self.directory.name)/batch['batch_id']).glob('*.zip')), [])
+
     def test_template_replace_processes_each_template_without_products(self):
         files = [('templates', (f'template-{i}.png', picture(color), 'image/png'))
                  for i, color in enumerate([(200, 10, 10), (10, 200, 10), (10, 10, 200)], 1)]
