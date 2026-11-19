@@ -3,6 +3,7 @@ import { CompositionTask, type SubmissionProgress } from './compositionRequest'
 import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
 import { ProductSelection } from './productSelection'
 import { CompositionArchive } from './CompositionArchive'
+import { PhotoConverter } from './PhotoConverter'
 import { checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
@@ -479,6 +480,7 @@ function App() {
   const [singleResult, setSingleResult] = useState<BatchImage | null>(null)
   const [resultBatchId, setResultBatchId] = useState<string | null>(null)
   const [archiveOpen, setArchiveOpen] = useState(false)
+  const [converterOpen, setConverterOpen] = useState(false)
   const [resultAction, setResultAction] = useState('')
   const [resultNotice, setResultNotice] = useState('')
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
@@ -548,7 +550,7 @@ function App() {
   }
   useEffect(() => { void loadTemplates(); return () => window.clearTimeout(templateRetryRef.current) }, [])
   useEffect(() => {
-    if (!lightbox && !pickerOpen && !slotEditorOpen && !archiveOpen) return
+    if (!lightbox && !pickerOpen && !slotEditorOpen && !archiveOpen && !converterOpen) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
         if (lightbox) setLightbox(null)
@@ -564,7 +566,7 @@ function App() {
       document.body.style.overflow = previousOverflow
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [lightbox, pickerOpen, slotEditorOpen, archiveOpen])
+  }, [lightbox, pickerOpen, slotEditorOpen, archiveOpen, converterOpen])
   useEffect(() => {
     fetch('/api/demo-available')
       .then((response) => response.ok ? response.json() : { available: false })
@@ -973,6 +975,7 @@ function App() {
           <span>FRAME<span>/</span>FOOD</span>
         </a>
         <div className="topbar-right">
+          <button className="toolbar-button" type="button" onClick={() => setConverterOpen(true)}>照片格式转换</button>
           <button className="toolbar-button archive-entry" type="button" onClick={() => setArchiveOpen(true)}>合成空间站</button>
           <span className="engine-status"><i /> Python compositor</span>
           <span className="version">v0.1</span>
@@ -1166,6 +1169,7 @@ function App() {
           onClose={() => setSlotEditorOpen(false)}
         />
       )}
+      {converterOpen && <PhotoConverter onClose={() => setConverterOpen(false)} />}
       {archiveOpen && <CompositionArchive onClose={() => setArchiveOpen(false)} onPreview={setLightbox} />}
       {lightbox && (
         <div className={`lightbox ${pickerOpen || archiveOpen ? 'is-stacked' : ''}`} role="dialog" aria-modal="true" aria-label={lightbox.kind === 'template' ? '模板放大预览' : '合成图放大预览'} onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>

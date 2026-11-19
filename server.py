@@ -38,6 +38,7 @@ from food_compositor.record_cache import RecordCache, read_records
 from food_compositor.request_limits import RequestLimits
 from food_compositor.cancellation import CompositionCancelled, cancellation_scope
 from food_compositor.storage_guard import ensure_space, StorageFull, reserve_bytes
+from food_compositor.conversion_api import ConversionJobs
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
@@ -90,12 +91,16 @@ LOGGER = logging.getLogger(__name__)
 async def lifespan(app):
     _fail_interrupted_batches()
     cleanup = asyncio.create_task(_archive_cleanup_loop())
+    conversion_cleanup = asyncio.create_task(conversion_jobs.cleanup_loop())
     try:
         yield
     finally:
         cleanup.cancel()
+        conversion_cleanup.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup
+        with suppress(asyncio.CancelledError):
+            await conversion_cleanup
         await run_in_threadpool(shutdown_executor)
 
 
@@ -1277,6 +1282,11 @@ def get_batch_image(batch_id: str, filename: str, request: Request) -> Response:
             raise HTTPException(status_code=404, detail="图片不存在")
         path = _batch_result(batch_dir, image)
         return _archived_image_response(path.name, path.read_bytes(), download=False)
+
+
+conversion_jobs = ConversionJobs(os.environ.get('CONVERSION_JOB_ROOT', ROOT / 'runtime' / 'conversions'), _workspace_owner, _write_upload,
+                                 max_files=MAX_BATCH_PRODUCTS, max_file_mb=MAX_UPLOAD_MB, max_batch_bytes=MAX_BATCH_UPLOAD_BYTES)
+app.include_router(conversion_jobs.router)
 
 
 if WEB_DIST.is_dir():

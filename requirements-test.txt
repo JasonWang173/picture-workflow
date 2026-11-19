@@ -7,3 +7,5 @@ uvicorn==0.40.0
 python-multipart==0.0.32
 oss2==2.19.1
 httpx==0.28.1
+pillow-heif==1.8.1
+pillow-avif-plugin==1.6.0

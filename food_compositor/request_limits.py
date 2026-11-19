@@ -36,7 +36,7 @@ class RequestLimits:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        composing = scope["method"] == "POST" and scope["path"] in {"/api/compose", "/api/compose-batch"}
+        composing = scope["method"] == "POST" and scope["path"] in {"/api/compose", "/api/compose-batch", "/api/converter/upload", "/api/converter/start"}
         uploading = composing or (scope["method"] == "POST" and scope["path"] == "/api/templates")
         if not uploading:
             return await self.app(scope, receive, send)
