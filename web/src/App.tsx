@@ -1,4 +1,4 @@
-import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useRef, useState } from 'react'
+import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { CompositionTask, type SubmissionProgress } from './compositionRequest'
 import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
 import { ProductSelection } from './productSelection'
@@ -15,7 +15,7 @@ type LightboxImage = { url: string; name: string; kind?: 'result' | 'template' }
 type TemplateRecord = { id: string; name: string; url: string; thumb_url?: string; source?: string; created_at?: string; size?: number }
 type SlotRect = { x: number; y: number; w: number; h: number }
 
-type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh' | 'zoom' | 'library'
+type IconName = 'arrow' | 'download' | 'image' | 'spark' | 'upload' | 'close' | 'check' | 'refresh' | 'zoom' | 'library' | 'search'
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true }
@@ -30,6 +30,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     refresh: <><path d="M20 11a8 8 0 0 0-14.5-4L4 9" /><path d="M4 4v5h5" /><path d="M4 13a8 8 0 0 0 14.5 4L20 15" /><path d="M20 20v-5h-5" /></>,
     zoom: <><path d="M8 3H3v5" /><path d="M16 3h5v5" /><path d="M8 21H3v-5" /><path d="M21 16v5h-5" /></>,
     library: <><path d="M4 5h16" /><path d="M4 12h16" /><path d="M4 19h16" /><path d="M7 5v14" /><path d="M17 5v14" /></>,
+    search: <><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></>,
   }
   return <svg {...common}>{paths[name]}</svg>
 }
@@ -162,6 +163,48 @@ function AssetDrop({
   )
 }
 
+export function searchTemplates<T extends { name: string }>(templates: T[], query: string): T[] {
+  const normalize = (value: string) => value.normalize('NFKC').toLowerCase()
+  const keywords = normalize(query).trim().split(/\s+/u).filter(Boolean)
+  if (!keywords.length) return templates
+  return templates.filter(({ name }) => {
+    const searchableName = normalize(name)
+    return keywords.every((keyword) => searchableName.includes(keyword))
+  })
+}
+
+function useTemplateSearch(templates: TemplateRecord[]) {
+  const [query, setQuery] = useState('')
+  const resultsRef = useRef<HTMLDivElement>(null)
+  const results = useMemo(() => searchTemplates(templates, query), [templates, query])
+  const updateQuery = (value: string) => {
+    setQuery(value)
+    if (resultsRef.current) resultsRef.current.scrollTop = 0
+  }
+  return { query, updateQuery, results, resultsRef }
+}
+
+function TemplateSearch({ query, onChange, count }: { query: string; onChange: (value: string) => void; count: number }) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const clear = () => { onChange(''); inputRef.current?.focus() }
+  const handleKey = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Escape') return
+    if (event.nativeEvent.isComposing) { event.stopPropagation(); return }
+    if (query) { event.preventDefault(); event.stopPropagation(); clear() }
+  }
+  return (
+    <div className="template-search" role="search" aria-label="模板名称搜索">
+      <div className="template-search-field">
+        <Icon name="search" size={15} />
+        <input ref={inputRef} type="search" value={query} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKey}
+          aria-label="搜索模板名称" placeholder="搜索模板名称" autoComplete="off" />
+        {query && <button type="button" onClick={clear} aria-label="清空模板搜索"><Icon name="close" size={14} /></button>}
+      </div>
+      {!!query.trim() && <p className="template-search-count" role="status">找到 {count} 个模板</p>}
+    </div>
+  )
+}
+
 export function TemplateLibrary({
   templates,
   selectedIds,
@@ -186,6 +229,7 @@ export function TemplateLibrary({
   onRefresh?: () => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const search = useTemplateSearch(templates)
   const handleInput = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/'))
     if (files.length) onUpload(files)
@@ -202,9 +246,10 @@ export function TemplateLibrary({
         </>
       </div>
       {notice && <p className="library-notice"><Icon name="check" size={11} /> {notice}</p>}
-      {templates.length ? (
-        <div className="template-grid" role="region" aria-label="可上下滚动的模板列表" tabIndex={0}>
-          {templates.map((item) => (
+      {(templates.length > 0 || search.query) && <TemplateSearch query={search.query} onChange={search.updateQuery} count={search.results.length} />}
+      {search.results.length ? (
+        <div ref={search.resultsRef} className="template-grid" role="region" aria-label="可上下滚动的模板列表" tabIndex={0}>
+          {search.results.map((item) => (
             <article className={`template-card ${selectedIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
               <button className="template-card-preview" type="button" onClick={() => onPreview(item)} aria-label={`预览模板 ${item.name}`}>
                 <img src={item.thumb_url || item.url} alt={item.name} loading="lazy" />
@@ -216,6 +261,8 @@ export function TemplateLibrary({
             </article>
           ))}
         </div>
+      ) : search.query.trim() ? (
+        <p className="template-search-empty">没有匹配的模板，试试其他关键词。</p>
       ) : (
         <button className="template-library-empty" type="button" onClick={() => inputRef.current?.click()}>
           <Icon name="upload" size={16} /><span>上传常用模板，之后可直接选择使用</span>
@@ -250,6 +297,7 @@ export function TemplatePickerModal({
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [pendingIds, setPendingIds] = useState<string[]>([])
+  const search = useTemplateSearch(templates)
   const togglePick = (id: string) => setPendingIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
   const addSelected = async () => {
     const records = pendingIds.map((id) => templates.find((item) => item.id === id)).filter((item): item is TemplateRecord => Boolean(item))
@@ -275,10 +323,11 @@ export function TemplatePickerModal({
           </div>
         </div>
         {error ? <p className="picker-message is-error">{error}</p> : notice ? <p className="picker-message">{notice}</p> : null}
-        <div className="picker-stage">
-          {templates.length ? (
+        {(templates.length > 0 || search.query) && <TemplateSearch query={search.query} onChange={search.updateQuery} count={search.results.length} />}
+        <div ref={search.resultsRef} className="picker-stage">
+          {search.results.length ? (
             <div className="picker-grid">
-              {templates.map((item) => (
+              {search.results.map((item) => (
                 <article className={`template-card ${selectedIds.includes(item.id) || pendingIds.includes(item.id) ? 'is-selected' : ''}`} key={item.id}>
                   <button className="template-card-preview" type="button" onClick={() => onPreview(item)} aria-label={`预览模板 ${item.name}`}>
                     <img src={item.thumb_url || item.url} alt={item.name} loading="lazy" />
@@ -289,6 +338,8 @@ export function TemplatePickerModal({
                 </article>
               ))}
             </div>
+          ) : search.query.trim() ? (
+            <p className="template-search-empty">没有匹配的模板，试试其他关键词。</p>
           ) : (
             <button className="template-library-empty picker-empty" type="button" onClick={() => inputRef.current?.click()}>
               <Icon name="upload" size={16} /><span>模板库还是空的 · 点击上传常用模板</span>

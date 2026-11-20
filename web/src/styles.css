@@ -60,6 +60,18 @@ h1 em { color: #f5b597; font-style: normal; }
 .library-upload { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border: 1px solid #535b50; color: #c8c9c1; background: #20241f; font-size: 10px; white-space: nowrap; }
 .library-upload:hover:not(:disabled) { color: #f6c1a7; border-color: #b46040; }
 .library-upload:disabled { cursor: wait; opacity: .55; }
+.template-search { margin: 11px 0 0; }
+.template-search-field { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 8px 0 10px; border: 1px solid #495247; background: #111411; color: #9da69a; }
+.template-search-field:focus-within { border-color: var(--orange); }
+.template-search-field input { flex: 1; min-width: 0; padding: 8px 0; border: 0; outline: none; color: var(--cream); background: transparent; font-size: 12px; }
+.template-search-field input::placeholder { color: #9da69a; }
+.template-search-field input::-webkit-search-cancel-button { display: none; }
+.template-search-field button { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; color: inherit; background: transparent; }
+.template-search-field button:hover { color: var(--cream); }
+.template-search-count { margin: 6px 0 0; color: #a9afa5; font-size: 11px; }
+.template-search-empty { margin: 12px 0 0; padding: 14px 10px; border: 1px dashed #454c43; color: #a9afa5; text-align: center; font-size: 12px; }
+.picker-panel > .template-search { margin: 0; padding: 10px 19px; border-bottom: 1px solid #2c302d; }
+.picker-stage > .template-search-empty { margin: 0; }
 .template-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: start; gap: 7px; max-height: min(420px, 50vh); overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #68745f #111411; margin-top: 12px; padding: 2px 5px 2px 2px; }
 .template-grid:focus-visible { outline: 1px solid #e7835e; outline-offset: 3px; }
 .template-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid #353c34; background: #111411; transition: border-color .18s, box-shadow .18s; }
