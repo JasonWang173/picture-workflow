@@ -15,7 +15,7 @@ async function load(filename, jsx=false) {
   return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 }
 const { ConversionTask, conversionResponse, loadRecentConversion, saveRecentConversion, forgetRecentConversion }=await load('conversionRequest.ts')
-const { PhotoConverter, FrameChoice, conversionAccept }=await load('PhotoConverter.tsx',true)
+const { PhotoConverter, FrameChoice, conversionAccept, filesFromDrop }=await load('PhotoConverter.tsx',true)
 
 class FakeXHR {
   static current
@@ -114,6 +114,15 @@ test('converter has its own output controls and explains format limitations',()=
   assert.ok(html.includes('动图、多页图片可选择帧/页'))
   assert.ok(html.includes('不进入模板库或合成记录'))
   assert.ok(conversionAccept.includes('.heic')&&conversionAccept.includes('.gif'))
+})
+
+test('file drops accept both the file list and file items, without treating URLs as files', () => {
+  const photo = new File(['test'], 'photo.heic')
+  const fileItem = { kind: 'file', getAsFile: () => photo }
+  const textItem = { kind: 'string', getAsFile: () => { throw new Error('not a file') } }
+  assert.deepEqual(filesFromDrop({ files: [photo], items: [fileItem] }), [photo])
+  assert.deepEqual(filesFromDrop({ files: [], items: [textItem, fileItem] }), [photo])
+  assert.deepEqual(filesFromDrop({ files: [], items: [textItem] }), [])
 })
 
 test('recent conversion remembers the scoped task and selected frame after reopening', () => {

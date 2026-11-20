@@ -12,6 +12,12 @@ export const conversionAccept = 'image/*,.heic,.heif,.hif,.jfif,.avif,.tif,.tiff
 
 function sizeLabel(bytes: number) { return bytes >= 1024**2 ? `${(bytes/1024**2).toFixed(1)} MB` : `${Math.ceil(bytes/1024)} KB` }
 
+export function filesFromDrop(transfer: Pick<DataTransfer, 'files' | 'items'>): File[] {
+  if (transfer.files.length) return Array.from(transfer.files)
+  return Array.from(transfer.items, (item) => item.kind === 'file' ? item.getAsFile() : null)
+    .filter((file): file is File => file !== null)
+}
+
 export function FrameChoice({ job, source, value, onChange }: { job: string; source: Source; value: number; onChange: (frame: number) => void }) {
   const [draft, setDraft] = useState(value + 1)
   const [loaded, setLoaded] = useState(false)
@@ -66,6 +72,7 @@ export function PhotoConverter({ onClose }: { onClose: () => void }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const folderRef = useRef<HTMLInputElement>(null)
   const alive = useRef(true)
+  const locked = !!taskRef.current || busy || packing
 
   useEffect(() => {
     alive.current = true
@@ -76,13 +83,38 @@ export function PhotoConverter({ onClose }: { onClose: () => void }) {
   }, [])
 
   const addFiles = (incoming: File[]) => {
-    if (taskRef.current || busy || packing) return
+    if (locked || !incoming.length) return
     if (files.length + incoming.length > (capabilities?.max_files || 1000)) { setError('超出本批图片数量限制，请分批选择'); return }
     setFiles((previous) => [...previous, ...incoming])
     setError('')
+    setNotice(`已添加 ${incoming.length} 张照片`)
   }
   const choose = (event: ChangeEvent<HTMLInputElement>) => { addFiles(Array.from(event.target.files || [])); event.target.value = '' }
-  const drop = (event: DragEvent) => { event.preventDefault(); setDragging(false); addFiles(Array.from(event.dataTransfer.files)) }
+  const dragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const transfer = event.dataTransfer
+    const hasFiles = transfer.types.includes('Files') || Array.from(transfer.items).some((item) => item.kind === 'file')
+    transfer.dropEffect = locked || !hasFiles ? 'none' : 'copy'
+    setDragging(!locked && hasFiles)
+  }
+  const dragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget))) {
+      setDragging(false)
+    }
+  }
+  const drop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setDragging(false)
+    if (locked) return
+    const incoming = filesFromDrop(event.dataTransfer)
+    if (!incoming.length) {
+      setError('没有收到照片文件，请从文件夹中拖入照片。')
+      return
+    }
+    addFiles(incoming)
+  }
 
   const poll = async (id: string) => {
     let failures = 0
@@ -212,25 +244,24 @@ export function PhotoConverter({ onClose }: { onClose: () => void }) {
   }
 
   const total = files.reduce((sum, file) => sum + file.size, 0)
-  const locked = !!taskRef.current || busy || packing
   const canClose = !packing && !(busy && (phase === 'uploading' || phase === 'preparing'))
   const percentage = upload?.total ? Math.round(upload.loaded/upload.total*100) : state?.total ? Math.round(state.done/state.total*100) : null
   const titles: Record<string, string> = { uploading: '正在上传图片', preparing: '服务器准备任务', inspecting: '正在识别图片与帧数', queued: '等待转换', processing: '正在转换', cancelling: '正在取消转换', restoring: '正在恢复最近一次转换' }
   const pageCount = Math.max(1, Math.ceil(results.length/36))
 
-  return <div className="lightbox converter-overlay">
+  return <div className={`lightbox converter-overlay ${dragging ? 'is-dragging' : ''}`} onDragEnter={dragOver} onDragOver={dragOver} onDragLeave={dragLeave} onDrop={drop}>
     <section className="lightbox-panel converter-panel" role="dialog" aria-modal="true" aria-labelledby="converter-title">
       <header className="lightbox-bar"><div><h2 id="converter-title">照片格式转换器</h2><p>独立转换 · 不缩放、不裁剪、不主动旋转</p></div>
         <button className="lightbox-close" type="button" disabled={!canClose} onClick={onClose} aria-label="关闭格式转换器" title={canClose ? '关闭' : '请等待当前步骤完成'} autoFocus>×</button>
       </header>
       <div className="converter-body">
         <section className="converter-settings" aria-label="转换设置">
-          <div className={`converter-drop ${dragging ? 'is-dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); if (!locked) setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={drop}>
-            <strong>拖入照片，或批量选择图片 / 文件夹</strong>
+          <div className="converter-drop">
+            <strong>{dragging ? '松开即可添加照片' : '拖入照片，或批量选择图片 / 文件夹'}</strong>
             <span>支持 JPG、PNG、WebP、GIF、BMP、TIFF、AVIF{capabilities?.heif ? '、HEIC/HEIF' : ''} 等常用图片</span>
             <div className="converter-choice-buttons"><button type="button" className="toolbar-button" disabled={locked} onClick={() => inputRef.current?.click()}>选择图片</button>
               <button type="button" className="toolbar-button" disabled={locked} onClick={() => folderRef.current?.click()}>选择文件夹</button>
-              <button type="button" className="toolbar-button" disabled={locked || !files.length} onClick={() => setFiles([])}>清空列表</button></div>
+              <button type="button" className="toolbar-button" disabled={locked || !files.length} onClick={() => { setFiles([]); setNotice('') }}>清空列表</button></div>
             <input type="file" multiple accept={conversionAccept} hidden ref={inputRef} onChange={choose} />
             <input type="file" multiple accept={conversionAccept} hidden {...{ webkitdirectory: '', directory: '' }} ref={folderRef} onChange={choose} />
           </div>
