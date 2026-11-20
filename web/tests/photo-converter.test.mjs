@@ -14,7 +14,7 @@ async function load(filename, jsx=false) {
     .replaceAll('"react"',JSON.stringify(pathToFileURL(require.resolve('react')).href))
   return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 }
-const { ConversionTask, conversionResponse }=await load('conversionRequest.ts')
+const { ConversionTask, conversionResponse, loadRecentConversion, saveRecentConversion, forgetRecentConversion }=await load('conversionRequest.ts')
 const { PhotoConverter, FrameChoice, conversionAccept }=await load('PhotoConverter.tsx',true)
 
 class FakeXHR {
@@ -114,4 +114,32 @@ test('converter has its own output controls and explains format limitations',()=
   assert.ok(html.includes('动图、多页图片可选择帧/页'))
   assert.ok(html.includes('不进入模板库或合成记录'))
   assert.ok(conversionAccept.includes('.heic')&&conversionAccept.includes('.gif'))
+})
+
+test('recent conversion remembers the scoped task and selected frame after reopening', () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  const storage = new Map()
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+    },
+  })
+  try {
+    saveRecentConversion({ id, frames: { 1: 2, 2: -1 } })
+    const recent = loadRecentConversion()
+    assert.deepEqual(recent, { id, frames: { 1: 2 } })
+    assert.equal(new ConversionTask(recent.id).id, id)
+    const html = renderToStaticMarkup(createElement(PhotoConverter, { onClose() {} }))
+    assert.ok(html.includes('恢复最近一次转换'))
+    forgetRecentConversion('0000000000000000')
+    assert.equal(loadRecentConversion()?.id, id)
+    forgetRecentConversion(id)
+    assert.equal(loadRecentConversion(), null)
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous)
+    else delete globalThis.localStorage
+  }
 })

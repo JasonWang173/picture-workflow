@@ -85,11 +85,31 @@ class ConversionCoreTest(unittest.TestCase):
 
     def test_selected_tiff_page_keeps_its_own_dimensions(self):
         source = self.root/'pages.tiff'
-        Image.new('RGB', (30, 20), 'red').save(source, save_all=True, append_images=[Image.new('RGB', (45, 70), 'blue')])
-        core.convert_image(source, self.root/'second.png', 'png', frame=1)
+        page = Image.new('RGB', (45, 70), 'blue')
+        page.paste('red', (0, 0, 12, 15))
+        Image.new('RGB', (30, 20), 'red').save(source, save_all=True, append_images=[page], tiffinfo={274: 6})
+        inspection = core.inspect_image(source)
+        self.assertEqual((inspection['width'], inspection['height'], inspection['frames']), (30, 20, 2))
+        metadata = core.convert_image(source, self.root/'second.png', 'png', frame=1)
+        self.assertEqual((metadata['width'], metadata['height']), page.size)
         with Image.open(self.root/'second.png') as result:
-            self.assertEqual(result.size, (45, 70))
-            self.assertEqual(result.getpixel((3, 3)), (0, 0, 255))
+            self.assertEqual(result.size, page.size)
+            self.assertEqual(result.getexif()[274], 6)
+            self.assertEqual(result.tobytes(), page.tobytes())
+
+    def test_tiff_orientation_keeps_stored_pixels_and_display_metadata(self):
+        source = self.root/'photo.tiff'
+        pixels = Image.new('RGB', (85, 45), '#d60000')
+        pixels.paste('#0011ee', (0, 0, 27, 19))
+        for orientation in range(2, 9):
+            with self.subTest(orientation=orientation):
+                pixels.save(source, tiffinfo={274: orientation})
+                result_path = self.root/'export.png'
+                core.convert_image(source, result_path, 'png')
+                with Image.open(result_path) as result:
+                    self.assertEqual(result.size, pixels.size)
+                    self.assertEqual(result.getexif()[274], orientation)
+                    self.assertEqual(result.tobytes(), pixels.tobytes())
 
     def test_true_content_detection_and_multiple_raster_formats(self):
         for format in ('BMP', 'TIFF', 'WEBP', 'ICO', 'AVIF', 'JPEG2000'):
@@ -186,12 +206,34 @@ class ConversionAPITest(unittest.TestCase):
                 self.assertEqual(image.getchannel('A').getextrema(), (0, 0))
             self.assertEqual(self.other.get(second['download_url']).status_code, 404)
             self.assertEqual(self.client.get(first['download_url']).status_code, 200)
-            download = self.client.post(f'/api/converter/{job}/download').json()['url']
+            with patch.object(self.jobs, 'read', wraps=self.jobs.read) as read:
+                download = self.client.post(f'/api/converter/{job}/download').json()['url']
+                self.assertEqual(read.call_count, 1)
             self.assertEqual(self.other.get(download).status_code, 404)
             with zipfile.ZipFile(io.BytesIO(self.client.get(download).content)) as archive:
                 self.assertEqual(archive.namelist(), [first['name'], second['name']])
                 self.assertTrue(all(name.endswith('.png') for name in archive.namelist()))
             self.assertFalse((self.root/job/'inputs').exists())
+
+    def test_result_thumbnail_is_private_cached_and_keeps_the_full_download(self):
+        original = Image.new('RGBA', (960, 600), (20, 30, 40, 0))
+        original.paste((220, 60, 20, 255), (480, 0, 960, 600))
+        content = encoded(original)
+        job, _ = self.upload([('transparent.png', content)])
+        self.client.post('/api/converter/start', json={'id': job, 'frames': {}})
+        output = self.client.get(f'/api/converter/{job}').json()['images'][0]
+        url = output['url'] + '/thumb'
+        self.assertEqual(self.other.get(url).status_code, 404)
+        with patch('food_compositor.conversion_api.result_thumbnail', wraps=core.result_thumbnail) as renderer:
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200, response.text if response.status_code != 200 else '')
+            self.assertEqual(response.headers['content-type'], 'image/webp')
+            self.assertEqual(self.client.get(url).content, response.content)
+            self.assertEqual(renderer.call_count, 1)
+        with Image.open(io.BytesIO(response.content)) as thumb:
+            self.assertEqual(thumb.size, (480, 300))
+            self.assertEqual(thumb.getchannel('A').getextrema(), (0, 255))
+        self.assertEqual(self.client.get(output['download_url']).content, content)
 
     def test_selected_frame_is_required_validated_previewed_and_exported(self):
         frames = [Image.new('RGB', (40, 35), color) for color in ('red', 'blue')]
@@ -218,6 +260,23 @@ class ConversionAPITest(unittest.TestCase):
         self.assertEqual(self.client.post(f'/api/converter/{job}/cancel').json()['status'], 'cancelled')
         self.assertFalse((self.root/job/'inputs').exists())
         self.assertEqual(self.client.post('/api/converter/start', json={'id': job, 'frames': {}}).status_code, 409)
+
+    def test_status_retries_transient_file_access_during_update(self):
+        job = self.client.post('/api/converter/reserve').json()['id']
+        state_path = self.root/job/'state.json'
+        read = Path.read_text
+        attempts = []
+        def read_during_replace(path, *args, **kwargs):
+            if path == state_path:
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise PermissionError('state replacement in progress')
+            return read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read_during_replace):
+            response = self.client.get(f'/api/converter/{job}')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'reserved')
+        self.assertEqual(len(attempts), 2)
 
     def test_cancellation_keeps_completed_results_and_next_job_works(self):
         job, _ = self.upload([(f'{i}.png', encoded(Image.new('RGB', (40, 30), 'red'))) for i in range(3)])

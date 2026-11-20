@@ -21,7 +21,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .cancellation import CompositionCancelled, cancellation_scope
 from .execution import submit_composition, worker_count
-from .image_conversion import capabilities, convert_image, inspect_image, preview_frame, estimate_conversion_memory
+from .image_conversion import capabilities, convert_image, estimate_conversion_memory, inspect_image, preview_frame, result_thumbnail
 from .storage_guard import StorageFull, ensure_space
 
 LOG = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ class ConversionJobs:
         self.get_owner, self.save_upload = get_owner, save_upload
         self.max_files, self.max_file_mb, self.max_batch_bytes = max_files, max_file_mb, max_batch_bytes
         self.locks = [Lock() for _ in range(64)]
+        self.thumbnail_locks = [Lock() for _ in range(64)]
         self.router = self._routes()
 
     def lock(self, job):
@@ -68,7 +69,17 @@ class ConversionJobs:
         return path
 
     def read(self, job):
-        return json.loads((self.directory(job)/'state.json').read_text('utf-8'))
+        path = self.directory(job)/'state.json'
+        for attempt in range(6):
+            try:
+                return json.loads(path.read_text('utf-8'))
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail='转换任务不存在或已过期') from None
+            except PermissionError:
+                # Windows can briefly deny reads while a status update replaces the file.
+                if attempt == 5:
+                    raise
+                time.sleep(.02)
 
     def owned(self, job, request):
         state = self.read(job)
@@ -274,7 +285,7 @@ class ConversionJobs:
                 state = self.owned(job, request)
                 if state['status'] != 'reserved' or (directory/'cancel.requested').exists():
                     raise HTTPException(status_code=409, detail='转换任务已取消或已提交，请重新上传')
-                state.update(status='uploading', total=len(files))
+                state.update(status='uploading', total=len(files), output_format=output_format)
                 self.write(job, state)
             (directory/'inputs').mkdir()
             (directory/'outputs').mkdir()
@@ -386,21 +397,46 @@ class ConversionJobs:
                         shutil.rmtree(self.directory(job)/'inputs', ignore_errors=True)
             return Response(content, media_type='image/png', headers={'Cache-Control': 'private, max-age=3600'})
 
+        def output_path(directory, item):
+            path = directory/'outputs'/Path(item['name']).name
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail='转换图片已过期')
+            return path
+
         def result_file(job, image, request):
             state = self.owned(job, request)
             item = next((item for item in state['images'] if item['id'] == image), None)
             if not item:
                 raise HTTPException(status_code=404, detail='转换图片不存在')
-            path = self.directory(job)/'outputs'/Path(item['name']).name
-            if not path.is_file():
-                raise HTTPException(status_code=404, detail='转换图片已过期')
-            return path
+            return output_path(self.directory(job), item)
 
         @router.get('/{job}/images/{image}')
         def preview(job: str, image: str, request: Request):
             path = result_file(job, image, request)
             return FileResponse(path, media_type='image/png' if path.suffix == '.png' else 'image/jpeg',
                                 headers={'Cache-Control': 'private, no-store'})
+
+        @router.get('/{job}/images/{image}/thumb')
+        def thumbnail(job: str, image: str, request: Request):
+            source = result_file(job, image, request)
+            directory = source.parent.parent
+            target = directory/'thumbnails'/(source.stem+'.webp')
+            headers = {'Cache-Control': 'private, no-cache'}
+            lock = self.thumbnail_locks[hash((job, image)) % len(self.thumbnail_locks)]
+            with lock:
+                if not target.is_file():
+                    content = submit_composition(result_thumbnail, str(source),
+                                                 estimated_bytes=estimate_conversion_memory(source)).result()
+                    temporary = target.with_suffix('.tmp')
+                    try:
+                        ensure_space(directory, len(content))
+                        target.parent.mkdir(exist_ok=True)
+                        temporary.write_bytes(content)
+                        temporary.replace(target)
+                    except OSError:
+                        temporary.unlink(missing_ok=True)
+                        return Response(content, media_type='image/webp', headers=headers)
+            return FileResponse(target, media_type='image/webp', headers=headers)
 
         @router.get('/{job}/images/{image}/download')
         def download(job: str, image: str, request: Request):
@@ -415,11 +451,12 @@ class ConversionJobs:
                 if state['status'] not in FINISHED or not state['images']:
                     raise HTTPException(status_code=409, detail='请先完成转换再下载')
                 ticket = uuid.uuid4().hex
-                path = self.directory(job)/f'download-{ticket}.zip'
+                directory = self.directory(job)
+                path = directory/f'download-{ticket}.zip'
                 try:
                     with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_STORED) as archive:
                         for image in sorted(state['images'], key=lambda image: image['id']):
-                            source = result_file(job, image['id'], request)
+                            source = output_path(directory, image)
                             with source.open('rb') as incoming, archive.open(source.name, 'w', force_zip64=True) as outgoing:
                                 while chunk := incoming.read(1024**2):
                                     ensure_space(path.parent, len(chunk)+4096)

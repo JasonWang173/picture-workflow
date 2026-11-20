@@ -1,21 +1,50 @@
 export type UploadProgress = { loaded: number; total: number | null; preparing: boolean }
+export type RecentConversion = { id: string; frames: Record<string, number> }
+
+const recentKey = 'picture-workflow.recent-conversion.v1'
+const isJobId = (id: unknown): id is string => typeof id === 'string' && /^[a-f0-9]{16}$/.test(id)
+
+export function loadRecentConversion(): RecentConversion | null {
+  try {
+    const recent = JSON.parse(localStorage.getItem(recentKey) || 'null')
+    if (!isJobId(recent?.id)) return null
+    const entries = Object.entries(recent.frames || {}).filter((entry): entry is [string, number] => {
+      const [index, frame] = entry
+      return /^[1-9]\d{0,3}$/.test(index) && typeof frame === 'number' && Number.isSafeInteger(frame) && frame >= 0
+    })
+    return { id: recent.id, frames: Object.fromEntries(entries) }
+  } catch { return null }
+}
+
+export function saveRecentConversion(recent: RecentConversion) {
+  try { localStorage.setItem(recentKey, JSON.stringify(recent)) } catch { /* Storage may be disabled. */ }
+}
+
+export function forgetRecentConversion(id: string) {
+  try { if (loadRecentConversion()?.id === id) localStorage.removeItem(recentKey) } catch { /* Storage may be disabled. */ }
+}
+
+export class ConversionRequestError extends Error {
+  constructor(public readonly status: number, message: string) { super(message) }
+}
 
 export async function conversionResponse(response: Response) {
   const payload = await response.json().catch(() => null)
-  if (!response.ok) throw new Error(typeof payload?.detail === 'string' ? payload.detail : `转换请求失败（${response.status}）`)
+  if (!response.ok) throw new ConversionRequestError(response.status, typeof payload?.detail === 'string' ? payload.detail : `转换请求失败（${response.status}）`)
   return payload
 }
 
 export class ConversionTask {
-  id: string | null = null
+  constructor(public id: string | null = null) {}
   requestedCancel = false
   private uploadRequest: XMLHttpRequest | null = null
   private pendingCancel: Promise<void> | null = null
 
-  async upload(files: File[], outputFormat: 'jpeg' | 'png', onProgress: (value: UploadProgress) => void) {
+  async upload(files: File[], outputFormat: 'jpeg' | 'png', onProgress: (value: UploadProgress) => void, onReserved?: (id: string) => void) {
     const reserve = await conversionResponse(await fetch('/api/converter/reserve', { method: 'POST', signal: AbortSignal.timeout(15_000) }))
-    if (!/^[a-f0-9]{16}$/.test(reserve?.id)) throw new Error('服务器未返回有效转换任务')
+    if (!isJobId(reserve?.id)) throw new Error('服务器未返回有效转换任务')
     this.id = reserve.id
+    onReserved?.(reserve.id)
     if (this.requestedCancel) { await this.cancel(); return this.id! }
     const body = new FormData()
     body.set('job', this.id!)

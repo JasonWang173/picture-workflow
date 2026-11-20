@@ -8,12 +8,24 @@ from pathlib import Path
 from functools import lru_cache
 
 import numpy as np
-from PIL import Image, ImageCms, UnidentifiedImageError
+from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
+from PIL.TiffImagePlugin import IMAGEWIDTH, IMAGELENGTH
 
 from .cancellation import check_cancelled
 from .storage_guard import ensure_space
 
 MAX_PIXELS = 60_000_000
+RESULT_THUMB_EDGE = 480
+ORIENTATION = 274  # TIFF/EXIF tag for display orientation.
+UNDO_TIFF_ORIENTATION = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_90,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_270,
+}
 READ_FORMATS = {'JPEG', 'PNG', 'WEBP', 'AVIF', 'BMP', 'DIB', 'GIF', 'TIFF',
                 'ICO', 'JPEG2000', 'PPM', 'PCX', 'TGA', 'DDS', 'PSD', 'HEIF'}
 
@@ -53,12 +65,19 @@ def estimate_conversion_memory(path):
     return 256 * 1024**2 + pixels * 24
 
 
+def _stored_size(image):
+    if image.format == 'TIFF':
+        return image.tag_v2[IMAGEWIDTH], image.tag_v2[IMAGELENGTH]
+    return image.size
+
+
 def inspect_image(source):
     check_cancelled()
     with _open(source) as image:
-        if image.width * image.height > MAX_PIXELS:
+        width, height = _stored_size(image)
+        if width * height > MAX_PIXELS:
             raise ValueError('格式转换输入图片不能超过 6000 万像素')
-        result = {'input_format': image.format, 'width': image.width, 'height': image.height,
+        result = {'input_format': image.format, 'width': width, 'height': height,
                   'frames': getattr(image, 'n_frames', 1)}
     check_cancelled()
     return result
@@ -72,7 +91,8 @@ def _select_frame(image, frame):
     if type(frame) is not int or not 0 <= frame < frames:
         raise ValueError(f'帧/页位置无效，请选择第 1 至 {frames} 帧/页')
     image.seek(frame)
-    if image.width * image.height > MAX_PIXELS:
+    width, height = _stored_size(image)
+    if width * height > MAX_PIXELS:
         raise ValueError('所选帧/页不能超过 6000 万像素')
     return frame, frames
 
@@ -89,6 +109,15 @@ def preview_frame(source, frame):
     return buffer.getvalue()
 
 
+def result_thumbnail(source):
+    with _open(source) as image:
+        image.thumbnail((RESULT_THUMB_EDGE, RESULT_THUMB_EDGE), Image.Resampling.LANCZOS)
+        thumbnail = ImageOps.exif_transpose(image)
+        buffer = io.BytesIO()
+        thumbnail.save(buffer, format='WEBP', quality=82, method=2, icc_profile=image.info.get('icc_profile', b''))
+        return buffer.getvalue()
+
+
 def convert_image(source, destination, output_format, *, frame=None, quality=95, background='#ffffff'):
     output_format = output_format.lower()
     if output_format not in {'jpeg', 'png'}:
@@ -102,19 +131,25 @@ def convert_image(source, destination, output_format, *, frame=None, quality=95,
     notes = []
     try:
         with _open(source) as original:
-            if original.width * original.height > MAX_PIXELS:
+            width, height = _stored_size(original)
+            if width * height > MAX_PIXELS:
                 raise ValueError('格式转换输入图片不能超过 6000 万像素，请先缩小图片')
             input_format = original.format
             frame, frames = _select_frame(original, frame)
             if frames > 1:
                 notes.append(f'已转换所选第 {frame + 1} 帧/页（共 {frames} 帧/页）')
             check_cancelled()
+            # Pillow applies and removes the current TIFF page's orientation
+            # during load. Save its EXIF first and reverse the pixel transform.
+            reverse = UNDO_TIFF_ORIENTATION.get(original.tag_v2.get(ORIENTATION)) if input_format == 'TIFF' else None
+            exif = original.getexif().tobytes() if reverse is not None else None
             original.load()
-            # Preserve stored dimensions, pixels and orientation metadata. Never
-            # apply EXIF transpose, cover, contain, sharpening or size limits
-            # from the poster workflow.
-            image = original.copy()
-            exif = original.getexif().tobytes() if original.getexif() else None
+            if reverse is not None and ORIENTATION not in original.tag_v2:
+                image = original.transpose(reverse)
+            else:
+                image = original.copy()
+            if exif is None and original.getexif():
+                exif = original.getexif().tobytes()
             icc = image.info.get('icc_profile')
             alpha = image.convert('RGBA').getchannel('A') if ('A' in image.getbands() or 'transparency' in image.info) else None
             if image.mode in {'F'}:
