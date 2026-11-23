@@ -1,7 +1,7 @@
 import { useEffect, useSyncExternalStore } from 'react'
 import type { ArchiveEntry } from './compositionArchiveStore'
 
-export type ArchiveFolder = { day: string; count: number }
+export type ArchiveFolder = { day: string; count: number; folder?: string; batch?: string }
 type Result = { items?: ArchiveEntry[]; folders?: ArchiveFolder[]; trash_count?: number; next_cursor?: string | null; total?: number; expires_at?: string | null }
 type Snapshot = { data: Result; loaded: boolean; loading: boolean; error: string }
 type Query = { snapshot: Snapshot; at: number; revision: number; pending: Promise<void> | null; listeners: Set<() => void>; timer?: ReturnType<typeof setTimeout> }
@@ -39,19 +39,21 @@ export function readArchiveQuery(key: string | null, force = false, more = false
   if (cursor) params.set('cursor', cursor)
   query.pending = fetch(`/api/composition-archive?${params}`, { signal: AbortSignal.timeout(20_000) })
     .then(async (response) => {
+      if (revision !== query.revision) return
       if (!response.ok) {
+        if (response.status === 401) publish(query, empty)
         const payload = await response.json().catch(() => null)
         throw new Error(payload?.detail || '空间站读取失败，请重试')
       }
       const data = await response.json() as Result
       if (revision !== query.revision) return
       if (more) {
-        data.items = [...new Map([...(query.snapshot.data.items || []), ...(data.items || [])].map((item) => [item.id, item])).values()]
+        data.items = [...new Map([...(query.snapshot.data.items || []), ...(data.items || [])].map((item) => [item.archive_key || item.id, item])).values()]
       }
       query.at = Date.now()
       publish(query, { data, loaded: true })
     })
-    .catch((cause) => publish(query, { error: cause instanceof Error ? cause.message : '空间站读取失败，请重试' }))
+    .catch((cause) => { if (revision === query.revision) publish(query, { error: cause instanceof Error ? cause.message : '空间站读取失败，请重试' }) })
     .finally(() => {
       query.pending = null
       publish(query, { loading: false })
@@ -66,6 +68,11 @@ export function invalidateArchiveQueries() {
     query.revision += 1
     if (query.listeners.size) void readArchiveQuery(key, true)
   })
+}
+
+export function clearArchiveQueries() {
+  queries.forEach(query => publish(query, empty))
+  invalidateArchiveQueries()
 }
 
 export function getArchiveQuerySnapshot(key: string) {

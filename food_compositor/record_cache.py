@@ -34,7 +34,7 @@ class RecordCache:
                         saved = json.loads(disk.read_text(encoding="utf-8"))
                         if saved["key"] == key and time.time() - saved["at"] < self.max_stale:
                             age = max(self.ttl, time.time() - saved["at"])
-                            entry.update(records=saved["records"], versions=saved["versions"], at=time.monotonic() - age)
+                            entry.update(records={item["id"]: item for item in saved["records"]}, versions=saved["versions"], at=time.monotonic() - age)
                     except (OSError, ValueError, KeyError, TypeError):
                         pass
                 self.entries[key] = entry
@@ -42,24 +42,25 @@ class RecordCache:
             age = time.monotonic() - entry["at"]
             usable = entry["records"] is not None and age < self.max_stale
             if not force and usable and age < self.ttl:
-                return list(entry["records"]), False
+                return list(entry["records"].values()), False
             if entry["pending"] is None and (force or time.monotonic() >= entry["retry"]) and _refresh_slots.acquire(blocking=False):
                 event = threading.Event()
                 entry.update(pending=event, changes={})
-                threading.Thread(target=self._refresh, args=(key, entry, loader, event, disk), daemon=True).start()
+                old = list((entry["records"] or {}).values())
+                threading.Thread(target=self._refresh, args=(key, entry, loader, event, disk, old, entry["versions"].copy()), daemon=True).start()
             event = entry["pending"]
             if usable and not force:
-                return list(entry["records"]), True
+                return list(entry["records"].values()), True
         if event is not None:
             event.wait(timeout)
         with self.lock:
             if entry["records"] is not None and time.monotonic() - entry["at"] < self.max_stale:
-                return list(entry["records"]), bool(entry["pending"] or entry.get("error"))
+                return list(entry["records"].values()), bool(entry["pending"] or entry.get("error"))
             raise RuntimeError("云端目录读取超时或暂时不可用，请稍后重试")
 
-    def _refresh(self, key, entry, loader, event, disk):
+    def _refresh(self, key, entry, loader, event, disk, old, old_versions):
         try:
-            records, versions = loader(entry["records"] or [], entry["versions"].copy())
+            records, versions = loader(old, old_versions)
             with self.lock:
                 merged = {item["id"]: item for item in records}
                 for record_id, item in entry["changes"].items():
@@ -68,12 +69,12 @@ class RecordCache:
                     else:
                         merged[record_id] = item
                     versions.pop(record_id, None)
-                entry.update(records=list(merged.values()), versions=versions, at=time.monotonic(), error=False)
+                entry.update(records=merged, versions=versions, at=time.monotonic(), error=False)
                 if disk is not None:
                     try:
                         disk.parent.mkdir(parents=True, exist_ok=True)
                         temporary = disk.with_suffix(".tmp")
-                        temporary.write_text(json.dumps({"key": key, "at": time.time(), "records": entry["records"], "versions": versions}), encoding="utf-8")
+                        temporary.write_text(json.dumps({"key": key, "at": time.time(), "records": list(merged.values()), "versions": versions}), encoding="utf-8")
                         temporary.replace(disk)
                     except OSError:
                         LOGGER.warning("目录缓存未能写入磁盘")
@@ -100,28 +101,35 @@ class RecordCache:
             if entry["pending"] is not None:
                 entry["changes"][record_id] = item
             if entry["records"] is not None:
-                records = {record["id"]: record for record in entry["records"]}
+                records = entry["records"]
                 if item is None:
                     records.pop(record_id, None)
                 else:
                     records[record_id] = item
-                entry["records"] = list(records.values())
                 entry["versions"].pop(record_id, None)
 
     def peek(self, key, record_id):
         with self.lock:
             entry = self.entries.get(key)
             if entry and entry["records"] is not None and time.monotonic() - entry["at"] < self.max_stale:
-                return next((dict(record) for record in entry["records"] if record["id"] == record_id), None)
+                record = entry["records"].get(record_id)
+                return dict(record) if record else None
         return None
 
 
-def read_records(bucket, sdk, prefix, previous, versions, valid_id):
+def read_records(bucket, sdk, prefix, previous, versions, valid_id, *, valid_parent=None):
     """Only download changed JSON objects when OSS supplies their ETags."""
     old = {record["id"]: record for record in previous}
-    objects = [(obj.key, obj.key[len(prefix):-5], getattr(obj, "etag", None))
-               for obj in sdk.ObjectIteratorV2(bucket, prefix=prefix)
-               if obj.key.endswith(".json") and valid_id.fullmatch(obj.key[len(prefix):-5])]
+    objects = []
+    for obj in sdk.ObjectIteratorV2(bucket, prefix=prefix):
+        if not obj.key.endswith(".json"):
+            continue
+        relative = obj.key[len(prefix):-5]
+        parent, _, leaf = relative.rpartition("/")
+        if valid_parent is not None and not valid_parent.fullmatch(parent):
+            continue
+        if valid_id.fullmatch(leaf if valid_parent is not None else relative):
+            objects.append((obj.key, relative, getattr(obj, "etag", None)))
 
     def read(obj):
         key, record_id, etag = obj
@@ -135,9 +143,9 @@ def read_records(bucket, sdk, prefix, previous, versions, valid_id):
             record = json.loads(response.read())
         finally:
             response.close()
-        if not isinstance(record, dict) or record.get("id") != record_id:
+        if not isinstance(record, dict) or record.get("id") != record_id.rsplit("/", 1)[-1]:
             raise ValueError("云端记录格式不正确")
-        return record
+        return {**record, "id": record_id}
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         records = [record for record in pool.map(read, objects) if record is not None]

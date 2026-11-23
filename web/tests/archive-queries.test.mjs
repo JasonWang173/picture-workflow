@@ -11,7 +11,7 @@ const bundle = await build({
 })
 const source = bundle.output.find((item) => item.type === 'chunk').code
   .replaceAll('"react"', JSON.stringify(pathToFileURL(require.resolve('react')).href))
-const { readArchiveQuery, getArchiveQuerySnapshot, invalidateArchiveQueries } =
+const { readArchiveQuery, getArchiveQuerySnapshot, invalidateArchiveQueries, clearArchiveQueries } =
   await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
 
 test('pages append without duplicates, reuse cache and reject a pre-mutation refresh', async (context) => {
@@ -40,4 +40,27 @@ test('pages append without duplicates, reuse cache and reject a pre-mutation ref
   await retry
   assert.equal(getArchiveQuerySnapshot(key).data.items.length, 3)
   assert.ok(getArchiveQuerySnapshot(key).error)
+})
+
+test('changing sessions or losing access clears the cached team folder', async (context) => {
+  const key = 'view=page&scope=team&folder=sample'
+  let respond
+  context.mock.method(globalThis, 'fetch', () => new Promise(resolve => { respond = resolve }))
+  const first = readArchiveQuery(key)
+  respond(Response.json({ items: [{ id: 'shared' }] }))
+  await first
+  const refresh = readArchiveQuery(key, true)
+  clearArchiveQueries()
+  respond(Response.json({ items: [{ id: 'from-previous-session' }] }))
+  await refresh
+  assert.deepEqual(getArchiveQuerySnapshot(key).data, {})
+
+  const signedIn = readArchiveQuery(key)
+  respond(Response.json({ items: [{ id: 'shared' }] }))
+  await signedIn
+  const expired = readArchiveQuery(key, true)
+  respond(Response.json({ detail: '请重新登录' }, { status: 401 }))
+  await expired
+  assert.deepEqual(getArchiveQuerySnapshot(key).data, {})
+  assert.match(getArchiveQuerySnapshot(key).error, /重新登录/)
 })

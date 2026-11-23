@@ -15,11 +15,12 @@ import zipfile
 import logging
 import json
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from sqlite3 import Error as SQLiteError
 from typing import Annotated, Optional
 from urllib.parse import quote
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import CancelledError, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import asynccontextmanager, contextmanager, suppress
 from threading import Lock
 import time
@@ -32,6 +33,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from food_compositor import compose
+from food_compositor.account_api import check_origin, create_account_router, current_account
+from food_compositor.accounts import AccountStore, accounts_path
 from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION, history_time, history_day
 from food_compositor.execution import submit_composition, worker_count, estimate_memory, shutdown_executor
 from food_compositor.record_cache import RecordCache, read_records
@@ -39,6 +42,7 @@ from food_compositor.request_limits import RequestLimits
 from food_compositor.cancellation import CompositionCancelled, cancellation_scope
 from food_compositor.storage_guard import ensure_space, StorageFull, reserve_bytes
 from food_compositor.conversion_api import ConversionJobs
+from food_compositor.download_folders import NUMBERED_FOLDER, allocate_download_folder
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
@@ -65,6 +69,8 @@ if _local_oss_settings.is_file():
 OSS_PREFIX = os.environ.get("OSS_TEMPLATE_PREFIX", "picture-workflow/templates/")
 ARCHIVE_PREFIX = os.environ.get("OSS_COMPOSITION_PREFIX", "picture-workflow/compositions/").strip("/") + "/"
 WORKSPACE_COOKIE = "composition_workspace"
+account_store = AccountStore(accounts_path())
+BEIJING_TIME = timezone(timedelta(hours=8))
 _batch_locks = [Lock() for _ in range(64)]
 _OSS_BUCKET = None
 _TEMPLATE_ID_RE = re.compile(r"[0-9a-f]{16}")
@@ -132,6 +138,37 @@ def _repair_latin1_utf8(value: str | None) -> str | None:
         return value.encode("latin-1").decode("utf-8")
     except (UnicodeEncodeError, UnicodeDecodeError):
         return value
+
+
+def _uploaded_dish_name(filename: str | None) -> str:
+    name = (_repair_latin1_utf8(filename) or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return Path(name).stem.strip() or "美食"
+
+
+def _request_username(request: Request) -> str | None:
+    account = current_account(account_store, request)
+    return account["username"] if account else None
+
+
+def _output_orientation(path: Path) -> str:
+    from PIL import Image
+    with Image.open(path) as image:
+        width, height = image.size
+    if width == height:
+        return "方版"
+    return "竖版" if width < height else "横板"
+
+
+def _account_image_name(created_at: datetime, username: str, orientation: str, index: int) -> str:
+    day = created_at.astimezone(BEIJING_TIME).strftime("%Y%m%d")
+    return f"{day}-{username}-{orientation}-（{index}）.jpg"
+
+
+def _composition_filename(created_at: datetime, index: int, dish: str, sequence_width: int = 3) -> str:
+    date = created_at.astimezone(BEIJING_TIME).strftime("%Y%m%d")
+    # Leave room for the date and sequence within a 255-byte UTF-8 filename.
+    safe_dish = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]+', "_", dish).strip(" ._")[:56].rstrip(" ._")
+    return f"{date}-{index:0{sequence_width}d}-{safe_dish or '美食'}.jpg"
 
 
 def _parse_manual_slot(raw: str | None) -> tuple[float, float, float, float] | None:
@@ -588,6 +625,7 @@ def _compose_single(product_path, template_path, output_path, **settings):
 
 @app.post("/api/compose")
 async def create_composition(
+    request: Request,
     background_tasks: BackgroundTasks,
     template: Annotated[UploadFile, File(description="模板图")],
     product: Annotated[Optional[UploadFile], File(description="商品图；模板替换模式可不上传")] = None,
@@ -604,6 +642,8 @@ async def create_composition(
     manual_slot = _parse_manual_slot(slot)
     if manual_slot is not None and mode not in {"template_replace", "cutout"}:
         raise HTTPException(status_code=400, detail="手动框选仅在模板替换和主体抠图合成中可用")
+    created_at = datetime.now(timezone.utc)
+    username = await run_in_threadpool(_request_username, request)
     temp_dir = Path(tempfile.mkdtemp(prefix="food-compositor-"))
     background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
     try:
@@ -638,10 +678,12 @@ async def create_composition(
     except Exception:
         LOGGER.exception("单张合成失败")
         raise HTTPException(status_code=500, detail="合成失败，请稍后重试") from None
+    dish = "空白模板" if mode == "template_replace" else _uploaded_dish_name(product.filename if product else None)
     return FileResponse(
         output_path,
         media_type="image/jpeg",
-        filename="composition.jpg",
+        filename=(_account_image_name(created_at, username, _output_orientation(output_path), 1)
+                  if username else _composition_filename(created_at, 1, dish)),
         headers={"X-Composition-Mode": mode},
         background=background_tasks,
     )
@@ -654,7 +696,7 @@ def reserve_batch(request: Request) -> JSONResponse:
     owner = _workspace_owner(request, response)
     batch_dir = BATCH_ROOT / batch_id
     batch_dir.mkdir()
-    _write_batch_status(batch_dir, {"status": "uploading", "owner": owner, "total": 0, "done": 0,
+    _write_batch_status(batch_dir, {"status": "uploading", "owner": owner, "username": _request_username(request), "total": 0, "done": 0,
                                   "images": [], "skipped": [], "error": None,
                                   "download_url": f"/api/batches/{batch_id}/download",
                                   "created_at": datetime.now(timezone.utc).isoformat()})
@@ -739,11 +781,14 @@ async def create_batch_composition(
             raise HTTPException(status_code=400, detail="请为每张模板提供有效的合成方式，且批次方式须为智能判断")
         requested_modes = parsed_modes
 
+    created_at = datetime.now(timezone.utc)
     reserved = batch_id is not None
+    username = await run_in_threadpool(_request_username, request)
     if reserved:
         batch_dir = _batch_directory(batch_id)
         with _batch_locks[hash(batch_id) % len(_batch_locks)]:
             previous = _owned_batch_status(batch_dir, request)
+            username = previous.get("username", username)
             if not previous.get("owner") or previous["status"] != "uploading" or (batch_dir / "cancel.requested").exists():
                 raise HTTPException(status_code=409, detail="任务已取消或已提交，请重新创建任务")
             try:
@@ -781,12 +826,11 @@ async def create_batch_composition(
                 total_limit=MAX_BATCH_UPLOAD_BYTES,
                 cancel_marker=batch_dir / "cancel.requested",
             )
-            stem = Path(_repair_latin1_utf8(upload.filename) or f"product-{index:03d}").stem
-            safe_stem = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in stem).strip("_") or f"product-{index:03d}"
-            manifest_items.append({"index": index, "work": product_path.name, "stem": safe_stem, "name": stem})
+            dish = _uploaded_dish_name(upload.filename)
+            manifest_items.append({"index": index, "work": product_path.name, "name": dish})
         if mode == "template_replace":
             # This mode removes the existing product area; it does not use product uploads.
-            manifest_items.append({"index": 1, "work": None, "stem": "blank", "name": "空白模板"})
+            manifest_items.append({"index": 1, "work": None, "name": "空白模板"})
         (work_dir / "manifest.json").write_text(
             json.dumps({"templates": manifest_templates, "items": manifest_items}, ensure_ascii=False),
             encoding="utf-8",
@@ -797,13 +841,14 @@ async def create_batch_composition(
             _write_batch_status(batch_dir, {
             "status": "queued",
             "owner": owner,
+            "username": username,
             "total": len(manifest_items) * len(manifest_templates),
             "done": 0,
             "skipped": [],
             "error": None,
             "images": [],
             "download_url": f"/api/batches/{batch_id}/download",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": created_at.isoformat(),
             })
     except CompositionCancelled:
         status = _read_batch_status(batch_dir) or {}
@@ -856,7 +901,6 @@ app.include_router(batch_router)
 def _compose_one(
     item: dict,
     template_path: str,
-    batch_id: str,
     mode: str,
     size: str,
     outline_strength: float,
@@ -867,7 +911,8 @@ def _compose_one(
 ) -> dict:
     """Compose a single batch item; runs in a worker process."""
     index = int(item["index"])
-    output_path = Path(output_dir) / f"{index:09d}_T{item['template_index']:04d}_P{item['product_index']:04d}_{item['stem']}.jpg"
+    output_path = Path(output_dir) / item["output_name"]
+    metadata = {key: item[key] for key in ("template_index", "template_name", "product_index", "product_name")}
     try:
         with cancellation_scope(Path(work_dir).parent / "cancel.requested"):
             ensure_space(output_path.parent, 300_000)
@@ -886,8 +931,8 @@ def _compose_one(
         output_path.unlink(missing_ok=True)
         return {"index": index, "cancelled": True}
     except Exception as exc:
-        return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "error": str(exc)}
-    return {"index": index, "template_index": item["template_index"], "template_name": item["template_name"], "product_index": item["product_index"], "product_name": item.get("name", item["stem"]), "name": output_path.name, "url": f"/api/batches/{batch_id}/{quote(output_path.name)}"}
+        return {"index": index, **metadata, "error": str(exc)}
+    return {"index": index, **metadata, "name": output_path.name}
 
 
 def _run_batch_composition(
@@ -913,34 +958,62 @@ def _run_batch_composition(
     status["status"] = "processing"
     _write_batch_status(batch_dir, status)
     futures = {}
+    username = status.get("username")
+    orientation_counts: dict[str, int] = {}
+    awaiting_order: dict[int, dict] = {}
+    next_index = 1
     cancel_marker = batch_dir / "cancel.requested"
     def cancel_check():
         if cancel_marker.exists():
             raise CompositionCancelled('任务已取消')
-    def consume(future, entry):
-        if future.cancelled():
-            return
-        try:
-            result = future.result()
-        except CompositionCancelled:
-            return
-        except Exception as exc:
-            result = {**entry, "product_name": entry.get("name", entry["stem"]), "error": str(exc) or "处理进程异常"}
+    def publish_result(result):
         if result.get("cancelled"):
             return
         metadata = {key: result[key] for key in ("template_index", "template_name", "product_index", "product_name")}
+        if username and not result.get("error"):
+            original = output_dir / result["name"]
+            try:
+                orientation = _output_orientation(original)
+                number = orientation_counts.get(orientation, 0) + 1
+                name = _account_image_name(created_at, username, orientation, number)
+                original.rename(output_dir / name)
+                orientation_counts[orientation] = number
+                result["name"] = name
+            except OSError as exc:
+                result["error"] = f"成品命名失败：{exc}"
         if result.get("error"):
             LOGGER.warning("批次 %s 模板 %s 商品 %s 合成失败：%s", batch_id, result["template_index"], result["product_index"], result["error"])
             status["skipped"].append({"index": result["index"], **metadata, "error": result["error"]})
         else:
-            status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": result["name"], "url": result["url"]})
-        status["done"] = int(status.get("done", 0)) + 1
+            name = result["name"]
+            status["images"].append({"id": f"{result['index']:09d}", **metadata, "name": name, "url": f"/api/batches/{batch_id}/{quote(name)}"})
+
+    def consume(future, entry):
+        nonlocal next_index
+        try:
+            result = future.result()
+        except (CancelledError, CompositionCancelled):
+            result = {"cancelled": True}
+        except Exception as exc:
+            result = {**entry, "error": str(exc) or "处理进程异常"}
+        if not result.get("cancelled"):
+            status["done"] = int(status.get("done", 0)) + 1
+        if not username:
+            publish_result(result)
+            return
+        # Workers finish out of order. Assign numbers only when prior inputs have settled.
+        awaiting_order[entry["index"]] = result
+        while next_index in awaiting_order:
+            publish_result(awaiting_order.pop(next_index))
+            next_index += 1
     try:
         cancel_check()
         manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
         items = manifest["items"]
         template_items = manifest.get("templates") or [{"index": 1, "work": manifest.get("template"), "name": "模板"}]
         status["total"] = len(items) * len(template_items)
+        created_at = datetime.fromisoformat(status["created_at"]) if status.get("created_at") else datetime.now(timezone.utc)
+        sequence_width = max(3, len(str(status["total"])))
         status["template_count"] = len(template_items)
         workers = worker_count()
         status["workers"] = workers
@@ -963,9 +1036,17 @@ def _run_batch_composition(
             status["current_template_mode"] = template_item.get("mode", mode)
             _write_batch_status(batch_dir, status)
             template_path = work_dir / str(template_item["work"])
-            entries = [dict(item, index=(template_index - 1) * len(items) + int(item["index"]),
-                            template_index=template_index, template_name=template_item["name"],
-                            product_index=int(item["index"]), manual_slot=tuple(template_item["slot"]) if template_item.get("slot") is not None else None) for item in items]
+            slot = template_item.get("slot")
+            manual_slot = tuple(slot) if slot is not None else None
+            entries = []
+            for item in items:
+                product_index = int(item["index"])
+                index = (template_index - 1) * len(items) + product_index
+                dish = item.get("name") or item.get("stem") or "美食"
+                entries.append(dict(item, index=index, template_index=template_index, template_name=template_item["name"],
+                                    product_index=product_index, product_name=dish,
+                                    output_name=f"result-{index}.jpg" if username else _composition_filename(created_at, index, dish, sequence_width),
+                                    manual_slot=manual_slot))
             pending_entries = iter(entries)
             futures = {}
             def submit_next():
@@ -975,7 +1056,7 @@ def _run_batch_composition(
                     return
                 ensure_space(output_dir, 300_000 * workers)
                 product_path = work_dir / str(entry["work"]) if entry["work"] is not None else None
-                future = submit_composition(_compose_one, entry, str(template_path), batch_id, template_item.get("mode", mode), size,
+                future = submit_composition(_compose_one, entry, str(template_path), template_item.get("mode", mode), size,
                                             outline_strength, preserve_logo_pill, quality, str(work_dir), str(output_dir),
                                             estimated_bytes=estimate_memory(product_path, template_path, size), cancel_check=cancel_check)
                 futures[future] = entry
@@ -1070,7 +1151,17 @@ def get_batch_status(batch_id: str, request: Request, summary: bool = False) -> 
                         headers={"Cache-Control": "private, no-store"})
 
 
-def _prepare_batch_download(batch_id: str, request: Request, ids: str | None, ticket: str | None = None) -> tuple[Path, list[dict]]:
+def _download_folder(owner: str, batch_id: str, username: str | None) -> str:
+    day = datetime.now(timezone.utc).astimezone(BEIJING_TIME).date()
+    try:
+        return allocate_download_folder(BATCH_ROOT, owner, batch_id, day, username)
+    except SQLiteError as exc:
+        LOGGER.exception("下载批次编号保存失败")
+        raise HTTPException(status_code=503, detail="暂时无法生成下载批次编号，请稍后重试") from exc
+
+
+def _prepare_batch_download(batch_id: str, request: Request, ids: str | None,
+                            ticket: str | None = None) -> tuple[Path, list[dict], str]:
     batch_dir = _batch_directory(batch_id)
     archive_path = None
     records = []
@@ -1082,43 +1173,46 @@ def _prepare_batch_download(batch_id: str, request: Request, ids: str | None, ti
                         if wanted is None or image["id"] in wanted]
             if not selected:
                 raise HTTPException(status_code=404, detail="没有可下载的合成图")
+            archive_dir = batch_dir if ticket else Path(tempfile.gettempdir())
+            ensure_space(archive_dir, sum(path.stat().st_size + 4096 for _, path in selected))
+            owner = status.get("owner")
+            folder = _download_folder(owner or _workspace_owner(request) or "", batch_id, status.get("username"))
+            filename = f"{folder}.zip"
             if ticket:
-                archive_path = batch_dir / f"download-{ticket}.zip"
+                archive_path = batch_dir / f"download-{ticket}-{filename}"
             else:
                 with tempfile.NamedTemporaryFile(prefix="food-composites-", suffix=".zip", delete=False) as temporary:
                     archive_path = Path(temporary.name)
             with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as zipped:
                 for _, path in selected:
-                    try:
-                        ensure_space(archive_path.parent, path.stat().st_size + 4096)
-                    except StorageFull as exc:
-                        raise HTTPException(status_code=507, detail=str(exc)) from None
-                    zipped.write(path, arcname=path.name)
-            owner = status.get("owner")
+                    ensure_space(archive_path.parent, path.stat().st_size + 4096)
+                    zipped.write(path, arcname=f"{folder}/{path.name}")
             if owner:
                 with _composition_archive() as archive:
                     def save_item(item):
                         image, path = item
-                        return archive.save(owner, f"{batch_id}-{image['id']}", image, path, "history")
+                        return archive.save(owner, f"{batch_id}-{image['id']}", image, path, "history", download_folder=folder)
                     with ThreadPoolExecutor(max_workers=6) as pool:
                         records = list(pool.map(save_item, selected))
-    except Exception:
+    except Exception as exc:
         if archive_path is not None:
             archive_path.unlink(missing_ok=True)
+        if isinstance(exc, StorageFull):
+            raise HTTPException(status_code=507, detail=str(exc)) from None
         raise
-    return archive_path, records
+    return archive_path, records, filename
 
 
-def _batch_zip_response(archive_path: Path, background_tasks: BackgroundTasks) -> FileResponse:
+def _batch_zip_response(archive_path: Path, background_tasks: BackgroundTasks, filename: str) -> FileResponse:
     background_tasks.add_task(archive_path.unlink, missing_ok=True)
-    return FileResponse(archive_path, media_type="application/zip", filename="food-composites.zip",
+    return FileResponse(archive_path, media_type="application/zip", filename=filename,
                         headers={"Cache-Control": "private, no-store"}, background=background_tasks)
 
 
 @app.get("/api/batches/{batch_id}/download")
 def download_batch(batch_id: str, request: Request, background_tasks: BackgroundTasks, ids: Optional[str] = None) -> FileResponse:
-    archive_path, _ = _prepare_batch_download(batch_id, request, ids)
-    return _batch_zip_response(archive_path, background_tasks)
+    archive_path, _, filename = _prepare_batch_download(batch_id, request, ids)
+    return _batch_zip_response(archive_path, background_tasks, filename)
 
 
 @app.post("/api/batches/{batch_id}/download")
@@ -1130,8 +1224,8 @@ def prepare_batch_download(batch_id: str, request: Request, ids: Optional[str] =
             raise HTTPException(status_code=400, detail='请选择有效的合成图')
         ids = ','.join(values)
     ticket = uuid.uuid4().hex
-    _, records = _prepare_batch_download(batch_id, request, ids, ticket)
-    return JSONResponse({"items": records, "url": f"/api/batches/{batch_id}/downloads/{ticket}"},
+    _, records, filename = _prepare_batch_download(batch_id, request, ids, ticket)
+    return JSONResponse({"items": records, "filename": filename, "url": f"/api/batches/{batch_id}/downloads/{ticket}"},
                         headers={"Cache-Control": "private, no-store"})
 
 
@@ -1139,10 +1233,17 @@ def prepare_batch_download(batch_id: str, request: Request, ids: Optional[str] =
 def get_prepared_batch_download(batch_id: str, ticket: str, request: Request, background_tasks: BackgroundTasks) -> FileResponse:
     batch_dir = _batch_directory(batch_id)
     status = _owned_batch_status(batch_dir, request)
-    path = batch_dir / f"download-{ticket}.zip"
-    if not status.get("owner") or not re.fullmatch(r"[0-9a-f]{32}", ticket) or not path.is_file():
+    if not status.get("owner") or not re.fullmatch(r"[0-9a-f]{32}", ticket):
         raise HTTPException(status_code=404, detail="下载文件不存在，请重新下载")
-    return _batch_zip_response(path, background_tasks)
+    prefix = f"download-{ticket}-"
+    for path in batch_dir.glob(f"{prefix}*.zip"):
+        folder = path.stem[len(prefix):]
+        if NUMBERED_FOLDER.fullmatch(folder) and path.is_file():
+            return _batch_zip_response(path, background_tasks, f"{folder}.zip")
+    legacy = batch_dir / f"download-{ticket}.zip"
+    if legacy.is_file():
+        return _batch_zip_response(legacy, background_tasks, "food-composites.zip")
+    raise HTTPException(status_code=404, detail="下载文件不存在，请重新下载")
 
 
 @app.get("/api/batches/{batch_id}/images/{image_id}/download")
@@ -1156,8 +1257,9 @@ def download_batch_image(batch_id: str, image_id: str, request: Request) -> Resp
         content = path.read_bytes()
         owner = status.get("owner")
         if owner:
+            folder = _download_folder(owner, batch_id, status.get("username"))
             with _composition_archive() as archive:
-                record = archive.save(owner, f"{batch_id}-{image_id}", image, path, "history")
+                record = archive.save(owner, f"{batch_id}-{image_id}", image, path, "history", download_folder=folder)
     response = _archived_image_response(path.name, content, download=True)
     if record:
         response.headers["X-Composition-Record"] = quote(json.dumps(record, ensure_ascii=True), safe="")
@@ -1176,8 +1278,9 @@ def delete_batch_image(batch_id: str, image_id: str, request: Request) -> dict:
             raise HTTPException(status_code=409, detail="该批旧结果不支持移入回收站")
         image = _result_image(status, image_id)
         path = _batch_result(batch_dir, image)
+        folder = _download_folder(owner, batch_id, status.get("username"))
         with _composition_archive() as archive:
-            record = archive.save(owner, f"{batch_id}-{image_id}", image, path, "trash")
+            record = archive.save(owner, f"{batch_id}-{image_id}", image, path, "trash", download_folder=folder)
         status["images"] = [item for item in status["images"] if item["id"] != image_id]
         _write_batch_status(batch_dir, status)
         try:
@@ -1187,19 +1290,53 @@ def delete_batch_image(batch_id: str, image_id: str, request: Request) -> dict:
     return {"status": "trashed", "item": record}
 
 
+def _archive_folder_name(record: dict) -> str:
+    name = record.get("download_folder")
+    if isinstance(name, str) and NUMBERED_FOLDER.fullmatch(name):
+        return name
+    return history_day(record)
+
+
 @app.get("/api/composition-archive")
 def list_composition_archive(request: Request, response: Response, view: str = "all", section: str = "history",
-                             day: str | None = None, cursor: str | None = None, limit: int = 20, refresh: bool = False) -> dict:
-    if view not in {"all", "folders", "page"} or section not in {"history", "trash"} or not 1 <= limit <= 100:
+                             day: str | None = None, cursor: str | None = None, limit: int = 20, refresh: bool = False,
+                             folder: str | None = None, batch: str | None = None, scope: str = "auto") -> dict:
+    if view not in {"all", "folders", "batch_folders", "page"} or section not in {"history", "trash"} or not 1 <= limit <= 100:
         raise HTTPException(status_code=400, detail="目录查询参数不正确")
     if day is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         raise HTTPException(status_code=400, detail="日期格式不正确")
-    owner = _workspace_owner(request, response)
+    if folder is not None and (view != "page" or
+                               not (NUMBERED_FOLDER.fullmatch(folder) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", folder))):
+        raise HTTPException(status_code=400, detail="文件夹格式不正确")
+    if batch is not None and (not folder or not re.fullmatch(r"[0-9a-f]{12}", batch)):
+        raise HTTPException(status_code=400, detail="批次格式不正确")
+    if scope not in {"auto", "browser", "team"}:
+        raise HTTPException(status_code=400, detail="空间范围无效")
+    shared = scope != "browser" and current_account(account_store, request) is not None
+    if scope == "team" and not shared:
+        raise HTTPException(status_code=401, detail="请重新登录后查看共享记录")
+    owner = None if shared else _workspace_owner(request, response)
     response.headers["Cache-Control"] = "private, no-store"
     with _composition_archive() as archive:
         records = archive.list(owner, refresh=refresh)
     if view == "all":
         return {"items": records}  # compatibility for existing clients
+    if view == "batch_folders":
+        groups = {}
+        for record in records:
+            if record["section"] == section:
+                name = _archive_folder_name(record)
+                key = (name, record["id"][:12] if shared and NUMBERED_FOLDER.fullmatch(name) else "")
+                groups[key] = groups.get(key, 0) + 1
+
+        def folder_order(key):
+            stem, _, index = key[0].partition("（")
+            return -int(stem[:10].replace("-", "")), stem[10:], int(index[:-1]) if index else 0, key[1]
+
+        return {"folders": [{"folder": name, "day": name[:10], "count": groups[name, batch_id],
+                             **({"batch": batch_id} if batch_id else {})}
+                            for name, batch_id in sorted(groups, key=folder_order)],
+                "trash_count": sum(record["section"] == "trash" for record in records)}
     if view == "folders":
         days = {}
         for record in records:
@@ -1208,14 +1345,25 @@ def list_composition_archive(request: Request, response: Response, view: str = "
                 days[key] = days.get(key, 0) + 1
         return {"folders": [{"day": day, "count": days[day]} for day in sorted(days, reverse=True)],
                 "trash_count": sum(record["section"] == "trash" for record in records)}
-    records = [record for record in records if record["section"] == section and (day is None or history_day(record) == day)]
-    sort_key = lambda record: (history_time(record) if section == "history" else record.get("trashed_at") or record["saved_at"], record["id"])
+    records = [record for record in records if record["section"] == section
+               and (day is None or history_day(record) == day)
+               and (folder is None or _archive_folder_name(record) == folder)
+               and (batch is None or record["id"][:12] == batch)]
+    def sort_key(record):
+        reference = record.get("archive_key", record["id"])
+        if folder and folder[10:11] == "-":
+            # This batch folder follows the original input order, even after a restore.
+            return -int(record["id"].rsplit("-", 1)[1]), reference
+        stamp = history_time(record) if section == "history" else record.get("trashed_at") or record["saved_at"]
+        return stamp, reference
     records.sort(key=sort_key, reverse=True)
     total = len(records)
     if cursor:
         try:
             data = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
-            if data["section"] != section or data["day"] != day or not RECORD_ID.fullmatch(data["id"]):
+            if (data["section"] != section or data["day"] != day or data.get("folder") != folder
+                    or data.get("batch") != batch or not isinstance(data["id"], str)
+                    or not RECORD_ID.fullmatch(data["id"].rsplit("~", 1)[-1])):
                 raise ValueError()
             records = [record for record in records if sort_key(record) < (data["time"], data["id"])]
         except (ValueError, KeyError, TypeError, UnicodeError):
@@ -1224,15 +1372,27 @@ def list_composition_archive(request: Request, response: Response, view: str = "
     next_cursor = None
     if len(records) > limit:
         stamp, record_id = sort_key(page[-1])
-        next_cursor = base64.urlsafe_b64encode(json.dumps({"section": section, "day": day, "time": stamp, "id": record_id}).encode()).decode()
+        next_cursor = base64.urlsafe_b64encode(json.dumps({"section": section, "day": day, "folder": folder, "batch": batch, "time": stamp, "id": record_id}).encode()).decode()
     return {"items": page, "next_cursor": next_cursor, "total": total}
 
 
-def _archive_owner(request: Request, entry_id: str) -> str:
+def _archive_location(request: Request, reference: str, archive: CompositionArchive) -> tuple[str, str]:
+    if request.method != "GET":
+        check_origin(request)
+    source, separator, entry_id = reference.rpartition("~")
     owner = _workspace_owner(request)
-    if not owner or not RECORD_ID.fullmatch(entry_id):
+    if not RECORD_ID.fullmatch(entry_id):
         raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
-    return owner
+    if separator:
+        if OWNER_ID.fullmatch(source) and current_account(account_store, request):
+            return source, entry_id
+    elif current_account(account_store, request):
+        matches = [item for item in archive.list(None) if item["id"] == entry_id]
+        if len(matches) == 1:
+            return matches[0]["archive_key"].split("~")[0], entry_id
+    if not separator and owner:
+        return owner, entry_id
+    raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
 
 
 def _archived_image_response(name: str, content: bytes, *, download: bool) -> Response:
@@ -1244,8 +1404,8 @@ def _archived_image_response(name: str, content: bytes, *, download: bool) -> Re
 
 @app.get("/api/composition-archive/{entry_id}/image")
 def get_archived_image(entry_id: str, request: Request, download: bool = False) -> Response:
-    owner = _archive_owner(request, entry_id)
     with _composition_archive() as archive:
+        owner, entry_id = _archive_location(request, entry_id, archive)
         image = archive.read_image(owner, entry_id, download=download)
     if image is None:
         raise HTTPException(status_code=404, detail="合成图片不存在或已过期")
@@ -1254,8 +1414,8 @@ def get_archived_image(entry_id: str, request: Request, download: bool = False) 
 
 @app.post("/api/composition-archive/{entry_id}/restore")
 def restore_archived_image(entry_id: str, request: Request) -> dict:
-    owner = _archive_owner(request, entry_id)
     with _composition_archive() as archive:
+        owner, entry_id = _archive_location(request, entry_id, archive)
         record = archive.restore(owner, entry_id)
         if record is None:
             raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
@@ -1264,8 +1424,8 @@ def restore_archived_image(entry_id: str, request: Request) -> dict:
 
 @app.delete("/api/composition-archive/{entry_id}")
 def trash_archived_image(entry_id: str, request: Request) -> dict:
-    owner = _archive_owner(request, entry_id)
     with _composition_archive() as archive:
+        owner, entry_id = _archive_location(request, entry_id, archive)
         record = archive.trash(owner, entry_id)
         if record is None:
             raise HTTPException(status_code=404, detail="合成记录不存在或已过期")
@@ -1287,6 +1447,7 @@ def get_batch_image(batch_id: str, filename: str, request: Request) -> Response:
 conversion_jobs = ConversionJobs(os.environ.get('CONVERSION_JOB_ROOT', ROOT / 'runtime' / 'conversions'), _workspace_owner, _write_upload,
                                  max_files=MAX_BATCH_PRODUCTS, max_file_mb=MAX_UPLOAD_MB, max_batch_bytes=MAX_BATCH_UPLOAD_BYTES)
 app.include_router(conversion_jobs.router)
+app.include_router(create_account_router(account_store))
 
 
 if WEB_DIST.is_dir():

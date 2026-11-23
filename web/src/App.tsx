@@ -4,6 +4,8 @@ import { ProcessingProgress, type BatchProgress } from './ProcessingProgress'
 import { ProductSelection } from './productSelection'
 import { CompositionArchive } from './CompositionArchive'
 import { PhotoConverter } from './PhotoConverter'
+import { AccountControls, type Account } from './AccountControls'
+import { clearArchiveQueries } from './archiveQueries'
 import { checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
@@ -531,6 +533,8 @@ function App() {
   const [singleResult, setSingleResult] = useState<BatchImage | null>(null)
   const [resultBatchId, setResultBatchId] = useState<string | null>(null)
   const [archiveOpen, setArchiveOpen] = useState(false)
+  const [account, setAccount] = useState<Account | null>(null)
+  const [accountOpen, setAccountOpen] = useState(false)
   const [converterOpen, setConverterOpen] = useState(false)
   const [resultAction, setResultAction] = useState('')
   const [resultNotice, setResultNotice] = useState('')
@@ -550,6 +554,10 @@ function App() {
   const [lastSize, setLastSize] = useState<string | null>(null)
   const [demoAvailable, setDemoAvailable] = useState(false)
   const [lightbox, setLightbox] = useState<LightboxImage | null>(null)
+  useEffect(() => {
+    clearArchiveQueries()
+    setLightbox(image => image?.url.startsWith('/api/composition-archive/') ? null : image)
+  }, [account?.username])
   const [templates, setTemplates] = useState<TemplateRecord[]>([])
   const [libraryLoading, setLibraryLoading] = useState(true)
   const [libraryBusy, setLibraryBusy] = useState(false)
@@ -601,7 +609,7 @@ function App() {
   }
   useEffect(() => { void loadTemplates(); return () => window.clearTimeout(templateRetryRef.current) }, [])
   useEffect(() => {
-    if (!lightbox && !pickerOpen && !slotEditorOpen && !archiveOpen && !converterOpen) return
+    if (accountOpen || (!lightbox && !pickerOpen && !slotEditorOpen && !archiveOpen && !converterOpen)) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
         if (lightbox) setLightbox(null)
@@ -617,7 +625,7 @@ function App() {
       document.body.style.overflow = previousOverflow
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [lightbox, pickerOpen, slotEditorOpen, archiveOpen, converterOpen])
+  }, [lightbox, pickerOpen, slotEditorOpen, archiveOpen, converterOpen, accountOpen])
   useEffect(() => {
     fetch('/api/demo-available')
       .then((response) => response.ok ? response.json() : { available: false })
@@ -979,11 +987,11 @@ function App() {
     try {
       const response = await fetch(url, { method: 'POST', ...(ids ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) } : {}) })
       await checkArchiveResponse(response, '打包下载失败，请重试')
-      const payload = await response.json() as { items: ArchiveEntry[]; url: string }
+      const payload = await response.json() as { items: ArchiveEntry[]; url: string; filename?: string }
       updateArchiveRecords(payload.items)
       const link = document.createElement('a')
       link.href = payload.url
-      link.download = name
+      link.download = payload.filename || name
       link.click()
       setResultNotice('已存入合成记录')
     } catch (cause) {
@@ -1028,6 +1036,7 @@ function App() {
         <div className="topbar-right">
           <button className="toolbar-button" type="button" onClick={() => setConverterOpen(true)}>照片格式转换</button>
           <button className="toolbar-button archive-entry" type="button" onClick={() => setArchiveOpen(true)}>合成空间站</button>
+          <AccountControls account={account} setAccount={setAccount} open={accountOpen} setOpen={setAccountOpen} />
           <span className="engine-status"><i /> Python compositor</span>
           <span className="version">v0.1</span>
         </div>
@@ -1101,7 +1110,7 @@ function App() {
           <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading || productChecking} onClick={compose}>
             {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
           </button>
-          <p className="privacy-note"><span className="lock-dot" /> 下载或删除的合成图在 OSS 保存 7 天</p>
+          <p className="privacy-note"><span className="lock-dot" /> 下载或删除的合成图进入团队共享空间，保留 7 天</p>
         </fieldset>
           {loading && <button className="toolbar-button cancel-task-button control-cancel-button" type="button" disabled={cancelling} onClick={cancelComposition} aria-label="取消当前合成任务">{cancelling ? '正在取消任务…' : '取消任务'}</button>}
         </aside>
@@ -1115,7 +1124,7 @@ function App() {
             {loading ? (
               <ProcessingProgress submission={submissionProgress} batch={batchProgress} templateOnly={mode === 'template_replace'} cancelling={cancelling || batchProgress?.status === 'cancelling'} onCancel={cancelComposition} />
             ) : resultUrl ? (
-              <button className="result-preview-button" type="button" onClick={() => setLightbox({ url: resultUrl, name: '合成海报.jpg' })} aria-label="点击放大查看合成海报">
+              <button className="result-preview-button" type="button" onClick={() => setLightbox({ url: resultUrl, name: singleResult?.name || '合成海报.jpg' })} aria-label="点击放大查看合成海报">
                 <img className="result-image" src={resultUrl} alt="合成后的海报" />
                 <span className="preview-zoom-hint"><Icon name="zoom" size={14} /> 点击放大</span>
               </button>
@@ -1221,7 +1230,7 @@ function App() {
         />
       )}
       {converterOpen && <PhotoConverter onClose={() => setConverterOpen(false)} />}
-      {archiveOpen && <CompositionArchive onClose={() => setArchiveOpen(false)} onPreview={setLightbox} />}
+      {archiveOpen && <CompositionArchive key={account?.username || ''} shared={!!account} onSignIn={() => setAccountOpen(true)} onClose={() => setArchiveOpen(false)} onPreview={setLightbox} />}
       {lightbox && (
         <div className={`lightbox ${pickerOpen || archiveOpen ? 'is-stacked' : ''}`} role="dialog" aria-modal="true" aria-label={lightbox.kind === 'template' ? '模板放大预览' : '合成图放大预览'} onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
           <div className="lightbox-panel">

@@ -60,16 +60,26 @@ class CompositionArchive:
     def _write(self, key: str, record: dict) -> None:
         self.bucket.put_object(key + ".json", json.dumps(record, ensure_ascii=False))
         owner = key[len(self.prefix):].split("/", 1)[0]
-        _catalogs.update(self._cache_key(owner), record["id"], record)
+        self._update_catalogs(owner, record["id"], record)
 
-    def save(self, owner: str, entry_id: str, image: dict, path, section: str) -> dict:
+    def _update_catalogs(self, owner, entry_id, record):
+        _catalogs.update(self._cache_key(owner), entry_id, record)
+        relative = f"{owner}/{entry_id}"
+        _catalogs.update(self._cache_key(None), relative, {**record, "id": relative} if record else None)
+
+    def save(self, owner: str, entry_id: str, image: dict, path, section: str, *, download_folder: str | None = None) -> dict:
         key = self._key(owner, entry_id)
         with _locks[hash(key) % len(_locks)]:
             now = datetime.now(timezone.utc)
             previous = self._read(key)
             if previous and datetime.fromisoformat(previous["expires_at"]) > now:
+                folder_added = bool(download_folder and not previous.get("download_folder"))
+                if folder_added:
+                    previous["download_folder"] = download_folder
                 if previous["section"] == section:
                     # Retrying a download neither duplicates it nor extends retention.
+                    if folder_added:
+                        self._write(key, previous)
                     return previous
                 if section == "trash":
                     return self._move_to_trash(key, previous, now)
@@ -90,6 +100,8 @@ class CompositionArchive:
                 "updated_at": now.isoformat(),
                 "expires_at": (now + RETENTION).isoformat(),
             }
+            if download_folder:
+                record["download_folder"] = download_folder
             self._write(key, record)
             return record
 
@@ -114,13 +126,19 @@ class CompositionArchive:
             return record
         return None
 
-    def list(self, owner: str, *, refresh=False) -> list[dict]:
-        prefix = f"{self.prefix}{owner}/"
+    def list(self, owner: str | None, *, refresh=False) -> list[dict]:
+        prefix = self.prefix if owner is None else f"{self.prefix}{owner}/"
         records, _ = _catalogs.get(self._cache_key(owner),
-                                  lambda old, versions: read_records(self.bucket, self.sdk, prefix, old, versions, RECORD_ID),
+                                  lambda old, versions: read_records(self.bucket, self.sdk, prefix, old, versions, RECORD_ID,
+                                                                     valid_parent=OWNER_ID if owner is None else None),
                                   force=refresh)
         now = datetime.now(timezone.utc)
         records = [normalize_record(record) for record in records if datetime.fromisoformat(record["expires_at"]) > now]
+        if owner is None:
+            for record in records:
+                source, entry_id = record["id"].split("/")
+                record["id"] = entry_id
+                record["archive_key"] = f"{source}~{entry_id}"
         return sorted(records, key=lambda record: record["saved_at"], reverse=True)
 
     def restore(self, owner: str, entry_id: str) -> dict | None:
@@ -169,7 +187,7 @@ class CompositionArchive:
                         if record and datetime.fromisoformat(record["expires_at"]) <= now:
                             self._delete(key + ".jpg")
                             self._delete(key + ".json")
-                            _catalogs.update(self._cache_key(owner), record["id"], None)
+                            self._update_catalogs(owner, record["id"], None)
                 elif filename.endswith(".jpg") and modified is not None and now.timestamp() - modified >= RETENTION.total_seconds():
                     # Recover an upload interrupted before its metadata was written.
                     with _locks[hash(key) % len(_locks)]:

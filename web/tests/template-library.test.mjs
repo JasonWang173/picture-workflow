@@ -11,13 +11,14 @@ const result = await build({
   input: fileURLToPath(new URL('../src/App.tsx', import.meta.url)),
   write: false,
   platform: 'node',
-  external: ['react', 'react/jsx-runtime'],
+  external: ['react', 'react/jsx-runtime', 'react-dom'],
   output: { format: 'esm' },
 })
 let source = result.output.find((item) => item.type === 'chunk').code
 source = source
   .replaceAll('"react"', JSON.stringify(pathToFileURL(require.resolve('react')).href))
   .replaceAll('"react/jsx-runtime"', JSON.stringify(pathToFileURL(require.resolve('react/jsx-runtime')).href))
+  .replaceAll('"react-dom"', JSON.stringify(pathToFileURL(require.resolve('react-dom')).href))
 const { TemplateLibrary, TemplatePickerModal, searchTemplates } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
 
 const templates = [

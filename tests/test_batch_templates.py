@@ -6,9 +6,11 @@ import time
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import unquote
 
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
@@ -23,6 +25,10 @@ def picture(color):
     data = io.BytesIO()
     Image.new('RGB', (16, 16), color).save(data, 'PNG')
     return data.getvalue()
+
+
+def download_filename(response):
+    return unquote(response.headers['Content-Disposition'].split("''", 1)[1])
 
 
 class BatchCompositionTest(unittest.TestCase):
@@ -121,8 +127,207 @@ class BatchCompositionTest(unittest.TestCase):
             selected = status['images'][1]
             archive = self.client.get(status['download_url'], params={'ids': selected['id']})
             self.assertEqual(archive.status_code, 200)
+            folder = download_filename(archive).removesuffix('.zip')
             with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
-                self.assertEqual(zipped.namelist(), [selected['name']])
+                self.assertEqual(zipped.namelist(), [f"{folder}/{selected['name']}"])
+
+    def test_output_filename_uses_beijing_date_and_keeps_sequence_on_download(self):
+        files = [
+            ('templates', ('模板一.png', picture('red'), 'image/png')),
+            ('templates', ('模板二.png', picture('teal'), 'image/png')),
+            ('products', ('干锅鸡腿 #2.png', picture((0, 255, 0)), 'image/png')),
+            ('products', ('红烧肉.png', picture('blue'), 'image/png')),
+        ]
+        with patch.object(server, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 22, 15, 59, tzinfo=timezone.utc)
+            before_midnight = self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'}).json()
+            first = self.client.get(before_midnight['status_url']).json()['images'][0]
+            self.assertEqual(first['name'], '20261122-001-干锅鸡腿 #2.jpg')
+
+            clock.now.return_value = datetime(2026, 11, 22, 16, 1, tzinfo=timezone.utc)
+            after_midnight = self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'}).json()
+        status = self.client.get(after_midnight['status_url']).json()
+        expected = [
+            '20261123-001-干锅鸡腿 #2.jpg',
+            '20261123-002-红烧肉.jpg',
+            '20261123-003-干锅鸡腿 #2.jpg',
+            '20261123-004-红烧肉.jpg',
+        ]
+        self.assertEqual([image['name'] for image in status['images']], expected)
+        self.assertEqual(self.client.get(status['images'][0]['url']).status_code, 200)
+        image = status['images'][2]
+        batch_id = after_midnight['batch_id']
+        downloaded = self.client.get(f"/api/batches/{batch_id}/images/{image['id']}/download")
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(unquote(downloaded.headers['Content-Disposition'].split("''", 1)[1]), expected[2])
+        record = json.loads(unquote(downloaded.headers['X-Composition-Record']))
+        archived = self.client.get(f"/api/composition-archive/{record['id']}/image", params={'download': True})
+        self.assertEqual(unquote(archived.headers['Content-Disposition'].split("''", 1)[1]), expected[2])
+        archive = self.client.get(status['download_url'])
+        folder = download_filename(archive).removesuffix('.zip')
+        with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
+            self.assertEqual(zipped.namelist(), [f'{folder}/{name}' for name in expected])
+        self.assertEqual(self.client.get(before_midnight['status_url']).json()['images'][0]['name'], first['name'])
+
+    def test_single_composition_download_uses_dish_filename(self):
+        files = {
+            'template': ('模板.png', picture('red'), 'image/png'),
+            'product': ('香辣鱼:大份.png', picture('blue'), 'image/png'),
+        }
+        with patch.object(server, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 22, 17, 0, tzinfo=timezone.utc)
+            result = self.client.post('/api/compose', files=files, data={'mode': 'overlay'})
+        self.assertEqual(result.status_code, 200, result.text if not result.is_success else '')
+        self.assertEqual(unquote(result.headers['Content-Disposition'].split("''", 1)[1]), '20261123-001-香辣鱼_大份.jpg')
+
+    def test_account_names_follow_actual_dimensions_and_survive_account_switch(self):
+        client = TestClient(server.app, base_url='https://workbench.test')
+        self.addCleanup(client.close)
+        files = [('templates', (name + '.png', picture(color), 'image/png'))
+                 for name, color in [('a', 'red'), ('b', 'teal')]]
+        files += [('products', (name + '.png', picture(color), 'image/png'))
+                  for name, color in [('first', 'green'), ('missing', 'blue'), ('last', 'white')]]
+
+        def mixed_output(product, template, output, **kwargs):
+            with Image.open(product) as image:
+                color = image.getpixel((0, 0))
+            if color == (0, 0, 255):
+                raise ValueError('跳过测试商品')
+            if color == (0, 128, 0):
+                time.sleep(.04)
+            with Image.open(template) as image:
+                size = (1080, 1920) if image.getpixel((0, 0)) == (255, 0, 0) else (1280, 720)
+            Image.new('RGB', size, color).save(output)
+
+        with patch.object(server.account_store, 'path', Path(self.directory.name) / 'accounts.sqlite3'), \
+                patch.object(server, 'compose', side_effect=mixed_output), patch.object(server, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 22, 16, 1, tzinfo=timezone.utc)
+            password = 'fixture password for initials'
+            self.assertEqual(client.post('/api/auth/register', json={'username': 'ZS', 'password': password}).status_code, 201)
+            reserved = client.post('/api/batches/reserve').json()['batch_id']
+            self.assertEqual(client.post('/api/auth/register', json={'username': 'ww', 'password': password}).status_code, 201)
+            result = client.post('/api/compose-batch', files=files, data={'batch_id': reserved, 'size': '1080x1920'})
+            self.assertEqual(result.status_code, 200, result.text)
+            status = client.get(result.json()['status_url']).json()
+            expected = [f'20261123-zs-{orientation}-（{index}）.jpg'
+                        for orientation in ('竖版', '横板') for index in (1, 2)]
+            self.assertEqual([img['name'] for img in status['images']], expected)
+            self.assertEqual([img['product_index'] for img in status['images']], [1, 3, 1, 3])
+            single = client.get(f"/api/batches/{reserved}/images/{status['images'][0]['id']}/download")
+            self.assertEqual(download_filename(single), expected[0])
+            prepared = client.post(status['download_url']).json()
+            folder = '2026-11-23-zs（1）'
+            self.assertEqual(prepared['filename'], folder + '.zip')
+            self.assertTrue(all(item['download_folder'] == folder for item in prepared['items']))
+            with zipfile.ZipFile(io.BytesIO(client.get(prepared['url']).content)) as zipped:
+                self.assertEqual(zipped.namelist(), [folder + '/' + name for name in expected])
+            endpoint = '/api/composition-archive'
+            params = {'view': 'page', 'folder': folder, 'limit': 2}
+            first = client.get(endpoint, params=params).json()
+            second = client.get(endpoint, params={**params, 'cursor': first['next_cursor']}).json()
+            self.assertEqual([r['name'] for r in first['items'] + second['items']], expected)
+            ref = endpoint + '/' + first['items'][0]['archive_key']
+            moved = client.delete(ref).json()['item']
+            self.assertEqual((moved['name'], moved['download_folder']), (expected[0], folder))
+            self.assertEqual(client.post(ref + '/restore').json()['item']['name'], expected[0])
+            self.assertEqual(download_filename(client.get(ref + '/image?download=true')), expected[0])
+            for username, number in [('ww', 1), ('zs', 2)]:
+                client.post('/api/auth/login', json={'username': username, 'password': password}).raise_for_status()
+                new = client.post('/api/compose-batch', files=[files[0], files[2]]).json()
+                self.assertEqual(client.post(f"/api/batches/{new['batch_id']}/download").json()['filename'],
+                                 f'2026-11-23-{username}（{number}）.zip')
+            clock.now.return_value = datetime(2026, 11, 23, 16, 1, tzinfo=timezone.utc)
+            self.assertEqual(client.post(status['download_url']).json()['filename'], folder + '.zip')
+            next_day = client.post('/api/compose-batch', files=[files[0], files[2]]).json()
+            self.assertEqual(client.post(f"/api/batches/{next_day['batch_id']}/download").json()['filename'],
+                             '2026-11-24-zs（1）.zip')
+
+    def test_single_account_download_uses_rendered_canvas(self):
+        client = TestClient(server.app, base_url='https://workbench.test')
+        self.addCleanup(client.close)
+        files = {'template': ('poster.png', picture('red'), 'image/png'), 'product': ('dish.png', picture('green'), 'image/png')}
+        with patch.object(server.account_store, 'path', Path(self.directory.name) / 'accounts.sqlite3'), \
+                patch.object(server, 'compose', compose), patch.object(server, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 22, 16, 1, tzinfo=timezone.utc)
+            client.post('/api/auth/register', json={'username': 'zs', 'password': 'fixture password for initials'}).raise_for_status()
+            for width, height, orientation in [(1080, 1920, '竖版'), (1280, 720, '横板'), (96, 96, '方版')]:
+                response = client.post('/api/compose', files=files, data={'size': f'{width}x{height}', 'mode': 'overlay'})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(download_filename(response), f'20261123-zs-{orientation}-（1）.jpg')
+                with Image.open(io.BytesIO(response.content)) as image:
+                    self.assertEqual(image.size, (width, height))
+
+    def test_downloads_share_numbered_beijing_folders_with_the_archive(self):
+        files = [
+            ('templates', ('模板.png', picture('red'), 'image/png')),
+            ('products', ('栗子鸡.png', picture('blue'), 'image/png')),
+        ]
+        first, second, third = [self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'}).json()
+                                for _ in range(3)]
+        statuses = [self.client.get(batch['status_url']).json() for batch in (first, second, third)]
+        with patch.object(server, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 23, 15, 59, tzinfo=timezone.utc)
+            prepared = self.client.post(statuses[0]['download_url']).json()
+            self.assertEqual(prepared['filename'], '2026-11-23（1）.zip')
+            self.assertEqual(prepared['items'][0]['download_folder'], '2026-11-23（1）')
+            zipped_response = self.client.get(prepared['url'])
+            self.assertEqual(download_filename(zipped_response), prepared['filename'])
+            with zipfile.ZipFile(io.BytesIO(zipped_response.content)) as zip_file:
+                self.assertEqual(zip_file.namelist(), [f"2026-11-23（1）/{statuses[0]['images'][0]['name']}"])
+
+            image_id = statuses[1]['images'][0]['id']
+            second_image = self.client.get(f"/api/batches/{second['batch_id']}/images/{image_id}/download")
+            record = json.loads(unquote(second_image.headers['X-Composition-Record']))
+            self.assertEqual(record['download_folder'], '2026-11-23（2）')
+            self.assertEqual(self.client.post(statuses[1]['download_url']).json()['filename'], '2026-11-23（2）.zip')
+
+            clock.now.return_value = datetime(2026, 11, 23, 16, 1, tzinfo=timezone.utc)
+            self.assertEqual(self.client.post(statuses[0]['download_url']).json()['filename'], '2026-11-23（1）.zip')
+            self.assertEqual(self.client.post(statuses[2]['download_url']).json()['filename'], '2026-11-24（1）.zip')
+        groups = self.client.get('/api/composition-archive', params={'view': 'batch_folders'}).json()['folders']
+        self.assertEqual(groups, [
+            {'folder': '2026-11-24（1）', 'day': '2026-11-24', 'count': 1},
+            {'folder': '2026-11-23（1）', 'day': '2026-11-23', 'count': 1},
+            {'folder': '2026-11-23（2）', 'day': '2026-11-23', 'count': 1},
+        ])
+        page = self.client.get('/api/composition-archive', params={'view': 'page', 'folder': '2026-11-23（2）'}).json()
+        self.assertEqual([image['id'] for image in page['items']], [record['id']])
+
+    def test_trash_before_download_uses_the_same_folder_and_image_name_as_the_batch(self):
+        files = [
+            ('templates', ('模板.png', picture('red'), 'image/png')),
+            ('products', ('栗子鸡.png', picture('blue'), 'image/png')),
+            ('products', ('红烧肉.png', picture('green'), 'image/png')),
+        ]
+        endpoint = '/api/composition-archive'
+        with patch.object(server, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 23, 4, 0, tzinfo=timezone.utc)
+            batch = self.client.post('/api/compose-batch', files=files, data={'mode': 'overlay'}).json()
+            status = self.client.get(batch['status_url']).json()
+            first, second = status['images']
+            deletion = self.client.delete(f"/api/batches/{batch['batch_id']}/images/{first['id']}")
+            self.assertEqual(deletion.status_code, 200, deletion.text)
+            trashed = deletion.json()['item']
+            self.assertEqual((trashed['name'], trashed['download_folder']), ('20261123-001-栗子鸡.jpg', '2026-11-23（1）'))
+
+            zip_download = self.client.get(status['download_url'])
+        self.assertEqual(download_filename(zip_download), '2026-11-23（1）.zip')
+        with zipfile.ZipFile(io.BytesIO(zip_download.content)) as zipped:
+            self.assertEqual(zipped.namelist(), [f"2026-11-23（1）/{second['name']}"])
+        expected_group = [{'folder': '2026-11-23（1）', 'day': '2026-11-23', 'count': 1}]
+        for section in ('history', 'trash'):
+            folders = self.client.get(endpoint, params={'view': 'batch_folders', 'section': section}).json()
+            self.assertEqual(folders['folders'], expected_group)
+        trash_query = {'view': 'page', 'section': 'trash', 'folder': '2026-11-23（1）'}
+        self.assertEqual(self.client.get(endpoint, params=trash_query).json()['items'], [trashed])
+
+        restored = self.client.post(f"{endpoint}/{trashed['id']}/restore").json()['item']
+        self.assertEqual((restored['download_folder'], restored['name']), (trashed['download_folder'], trashed['name']))
+        self.assertEqual(self.client.get(endpoint, params=trash_query).json()['items'], [])
+        outgoing = self.client.get(f"{endpoint}/{trashed['id']}/image", params={'download': True})
+        self.assertEqual(download_filename(outgoing), trashed['name'])
+        moved = self.client.delete(f"{endpoint}/{trashed['id']}").json()['item']
+        self.assertEqual((moved['download_folder'], moved['name']), (trashed['download_folder'], trashed['name']))
 
     def test_three_templates_share_five_products_in_order(self):
         template_colors = [(200, 10, 10), (10, 200, 10), (10, 10, 200)]
@@ -148,8 +353,9 @@ class BatchCompositionTest(unittest.TestCase):
                 self.assertEqual(sum(event[0] == 'end' and event[1] == template_colors[index - 1]
                                      for event in self.events[:first_start]), 5)
         archive = self.client.get(status['download_url'])
+        folder = download_filename(archive).removesuffix('.zip')
         with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
-            self.assertEqual(zipped.namelist(), [image['name'] for image in status['images']])
+            self.assertEqual(zipped.namelist(), [f"{folder}/{image['name']}" for image in status['images']])
 
     def test_rejects_invalid_template_modes(self):
         files = [('templates', ('one.png', picture((255, 0, 0)), 'image/png')),
@@ -169,6 +375,7 @@ class BatchCompositionTest(unittest.TestCase):
         status = self.client.get(batch['status_url'], params={'summary': 'true'}).json()
         self.assertEqual((status['status'], status['done'], len(status['images'])), ('done', 1000, 1000))
         self.assertEqual([image['product_index'] for image in status['images']], list(range(1, 1001)))
+        self.assertEqual([image['name'] for image in status['images']], sorted(image['name'] for image in status['images']))
         directory = Path(self.directory.name) / batch['batch_id']
         pending = {**server._read_batch_status(directory), 'status': 'processing'}
         server._write_batch_status(directory, pending)
@@ -221,6 +428,60 @@ class BatchCompositionTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.client.get(response.json()['status_url']).json()['status'], 'done')
 
+    def test_registered_members_share_legacy_and_new_records_and_templates(self):
+        site = 'https://workbench.test'
+        alice, bob = TestClient(server.app, base_url=site), TestClient(server.app, base_url=site)
+        self.addCleanup(alice.close)
+        self.addCleanup(bob.close)
+        archive = '/api/composition-archive'
+        with patch.object(server.account_store, 'path', Path(self.directory.name) / 'accounts.sqlite3'):
+            def download_batch(client):
+                files = [('templates', ('poster.png', picture('red'), 'image/png')),
+                         ('products', ('dish.png', picture('green'), 'image/png'))]
+                result = client.post('/api/compose-batch', data={'mode': 'overlay'}, files=files).json()
+                status = client.get(result['status_url']).json()
+                return client.post(status['download_url']).json(), result['status_url']
+
+            legacy, _ = download_batch(self.client)
+            for member, name in [(alice, 'alice'), (bob, 'bob')]:
+                response = member.post('/api/auth/register', json={'username': name, 'password': 'shared archive test fixture'})
+                self.assertEqual(response.status_code, 201, response.text)
+                self.assertEqual(member.get(archive, params={'scope': 'team'}).json()['items'][0]['id'], legacy['items'][0]['id'])
+            new, active_batch = download_batch(alice)
+            self.assertNotEqual(new['filename'], legacy['filename'])
+            folders = bob.get(archive, params={'view': 'batch_folders', 'scope': 'team'}).json()['folders']
+            group = next(group for group in folders if group['folder'] == new['items'][0]['download_folder'])
+            page = bob.get(archive, params={'view': 'page', 'scope': 'team', 'folder': group['folder'], 'batch': group['batch']}).json()
+            self.assertEqual([item['id'] for item in page['items']], [new['items'][0]['id']])
+            ref = f"{archive}/{page['items'][0]['archive_key']}"
+            original = alice.get(ref + '/image')
+            self.assertEqual(original.status_code, 200)
+            self.assertEqual(bob.get(ref + '/image?download=true').content, original.content)
+            self.assertEqual(bob.delete(ref).status_code, 200)
+            trash = alice.get(archive, params={'view': 'page', 'section': 'trash'}).json()['items']
+            self.assertEqual([item['id'] for item in trash], [new['items'][0]['id']])
+            self.assertEqual(alice.post(ref + '/restore').status_code, 200)
+            self.assertEqual(bob.get(ref + '/image?download=true').status_code, 200)
+            self.assertEqual(bob.get(active_batch).status_code, 404)
+            self.assertEqual(self.client.get(archive, params={'scope': 'team'}).status_code, 401)
+            self.assertEqual(self.client.get(ref + '/image').status_code, 404)
+            template = alice.post('/api/templates', files={'template': ('shared.png', picture('red'), 'image/png')}).json()
+            self.assertIn(template['id'], [t['id'] for t in bob.get('/api/templates').json()['templates']])
+            self.assertEqual(bob.get(template['url']).content, picture('red'))
+
+            # Before team-wide numbering, two browsers could both download batch (1).
+            legacy_meta = next(key for key in self.archive_objects if key.endswith(legacy['items'][0]['id'] + '.json'))
+            old = json.loads(self.archive_objects[legacy_meta])
+            old['download_folder'] = group['folder']
+            self.archive_objects[legacy_meta] = json.dumps(old).encode()
+            duplicates = bob.get(archive, params={'view': 'batch_folders', 'refresh': True}).json()['folders']
+            self.assertEqual([row['folder'] for row in duplicates], [group['folder']] * 2)
+            for row in duplicates:
+                contents = bob.get(archive, params={'view': 'page', 'folder': row['folder'], 'batch': row['batch']}).json()
+                self.assertEqual([item['id'][:12] for item in contents['items']], [row['batch']])
+            bob.post('/api/auth/logout', json={})
+            self.assertEqual(bob.delete(ref).status_code, 404)
+
     def test_archive_tracks_selected_downloads_and_recovers_deleted_results(self):
         files = [('templates', ('one.png', picture('red'), 'image/png')),
                  ('products', ('first.png', picture('green'), 'image/png')),
@@ -237,12 +498,12 @@ class BatchCompositionTest(unittest.TestCase):
         download = prepared.json()
         self.assertEqual([item['id'] for item in download['items']], [f"{batch['batch_id']}-{first['id']}"])
         self.assertEqual(TestClient(server.app).get(download['url']).status_code, 404)
+        folder = download['filename'].removesuffix('.zip')
         with zipfile.ZipFile(io.BytesIO(self.client.get(download['url']).content)) as zipped:
-            self.assertEqual(zipped.namelist(), [first['name']])
+            self.assertEqual(zipped.namelist(), [f"{folder}/{first['name']}"])
         self.assertEqual(len(self.client.get(endpoint).json()['items']), 1)
         individual = self.client.get(f"{path}/{first['id']}/download")
         self.assertEqual(individual.status_code, 200)
-        from urllib.parse import unquote
         self.assertEqual(json.loads(unquote(individual.headers["X-Composition-Record"])), download["items"][0])
         self.assertEqual(len(self.client.get(endpoint).json()['items']), 1)
 

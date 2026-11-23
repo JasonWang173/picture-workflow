@@ -3,6 +3,7 @@ import { invalidateArchiveQueries } from './archiveQueries'
 
 export type ArchiveEntry = {
   id: string
+  archive_key?: string
   name: string
   template_name: string
   product_name: string
