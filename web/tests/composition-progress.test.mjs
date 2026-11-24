@@ -15,6 +15,37 @@ async function loadSource(filename, jsx = false) {
 }
 const { submitComposition, CompositionTask } = await loadSource('compositionRequest.ts')
 const { ProcessingProgress } = await loadSource('ProcessingProgress.tsx', true)
+const { composeBlocker, firstOutputFilename } = await loadSource('compositionGuidance.ts')
+
+test('the composition button explains missing assets and temporary blockers independently of login', () => {
+  const ready = { templateOnly: false, templateCount: 1, invalidTemplate: false, productCount: 1,
+    usableProductCount: 1, checkingProducts: false, composing: false, libraryBusy: false, resultAction: '' }
+  const empty = { ...ready, templateCount: 0, productCount: 0, usableProductCount: 0 }
+  assert.equal(composeBlocker(ready), '')
+  assert.match(composeBlocker(empty), /商品图和 1 张模板图/)
+  assert.match(composeBlocker({ ...empty, templateCount: 1 }), /1 张商品图/)
+  assert.match(composeBlocker({ ...ready, templateCount: 0 }), /1 张模板图/)
+  assert.equal(composeBlocker({ ...empty, templateOnly: true, templateCount: 1 }), '')
+  assert.doesNotMatch(composeBlocker({ ...empty, templateOnly: true }), /商品图/)
+  assert.match(composeBlocker({ ...empty, checkingProducts: true }), /重复/)
+  assert.match(composeBlocker({ ...ready, invalidTemplate: true }), /模板图/)
+  assert.match(composeBlocker({ ...ready, usableProductCount: 0 }), /WebP/)
+  assert.match(composeBlocker({ ...ready, libraryBusy: true }), /模板库/)
+  assert.match(composeBlocker({ ...ready, resultAction: 'zip' }), /打包/)
+  assert.match(composeBlocker({ ...ready, composing: true }), /当前任务/)
+})
+
+test('first filename example follows the server naming rules for guest and account batches', () => {
+  const sample = (user, size, total, name) => firstOutputFilename('2026-11-24', user, size, total, name)
+  assert.equal(sample(null, '1080x1920', 1, '香辣鱼:大份.png'), '20261124-001-香辣鱼_大份.jpg')
+  assert.equal(sample(null, '1080x1920', 1000, '家常菜/干锅鸡腿 #2.webp'), '20261124-0001-干锅鸡腿 #2.jpg')
+  assert.equal(sample(null, '1280x720', 3, null), '20261124-001-空白模板.jpg')
+  assert.equal(sample(null, '1280x720', 1, '???.jpeg'), '20261124-001-美食.jpg')
+  assert.equal(sample(null, '1280x720', 1, '🍚'.repeat(60) + '.png'), '20261124-001-' + '🍚'.repeat(56) + '.jpg')
+  for (const [size, orientation] of [['1080x1920', '竖版'], ['1280x720', '横板'], ['96x96', '方版']]) {
+    assert.equal(sample('zs', size, 1000, '菜.png'), `20261124-zs-${orientation}-（1）.jpg`)
+  }
+})
 
 class FakeRequest {
   static current

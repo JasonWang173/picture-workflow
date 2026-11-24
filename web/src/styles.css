@@ -160,6 +160,12 @@ select option { background: #1c1f1c; }
 .compose-button { width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 23px; padding: 14px 16px; border: 1px solid var(--orange); color: #17110d; background: var(--orange); font-size: 12px; font-weight: 800; transition: background .18s, transform .18s; }
 .compose-button:hover:not(:disabled) { background: #ff865a; transform: translateY(-1px); }
 .compose-button:disabled { cursor: not-allowed; border-color: #383d37; color: #676d65; background: #282c27; }
+.compose-guidance { margin-top: 20px; color: #c1c5bb; font-size: 12px; line-height: 1.6; }
+.compose-guidance p { margin: 0; }
+.compose-guidance .compose-identity { color: var(--cream); font-weight: 700; }
+.compose-guidance .filename-example { margin-top: 3px; color: #a9aea3; overflow-wrap: anywhere; }
+.filename-example code { font-family: 'DM Mono', monospace; color: var(--cream); }
+.compose-guidance + .compose-button, .compose-login + .compose-button { margin-top: 9px; }
 .button-loader { width: 13px; height: 13px; border: 2px solid rgba(15,16,14,.3); border-top-color: #15120f; border-radius: 50%; animation: spin .75s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .privacy-note { display: flex; align-items: center; gap: 6px; margin: 13px 0 0; color: #656b62; font-family: 'DM Mono', monospace; font-size: 9px; }
@@ -203,12 +209,18 @@ select option { background: #1c1f1c; }
 .account-body { padding: 22px; overflow-y: auto; }
 .account-form, .account-profile { display: grid; gap: 14px; }
 .account-form label { display: grid; gap: 6px; color: #d5d8ce; font-size: 13px; }
+.registration-password { display: grid; gap: 6px; }
+.registration-password-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+.registration-password-row .toolbar-button { min-width: 48px; font-size: 12px; }
 .account-form input { width: 100%; padding: 10px 12px; color: var(--cream); border: 1px solid #4c5549; background: #111411; font: inherit; }
 .account-form input:focus-visible { outline: 1px solid var(--orange); outline-offset: 1px; }
+.account-form label.remember-device { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.account-form .remember-device input { width: auto; margin: 0; accent-color: var(--orange); }
 .account-form .compose-button { width: 100%; }
 .account-profile span { color: var(--muted); font-size: 12px; }
 .account-profile .toolbar-button { justify-self: start; }
 .account-error { margin: 0 0 12px; color: #f4b29b; font-size: 12px; }
+.account-notice { margin: 0 0 10px; color: #c1c5bb; font-size: 12px; line-height: 1.6; }
 .batch-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; max-height: 535px; overflow-y: auto; padding: 15px 4px 3px 0; }
 .batch-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid #30352f; background: #151815; transition: border-color .18s, box-shadow .18s; }
 .batch-card.is-selected { border-color: #d76f4b; box-shadow: 0 0 0 1px rgba(215,111,75,.32); }

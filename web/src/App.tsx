@@ -5,6 +5,8 @@ import { ProductSelection } from './productSelection'
 import { CompositionArchive } from './CompositionArchive'
 import { PhotoConverter } from './PhotoConverter'
 import { AccountControls, type Account } from './AccountControls'
+import { composeBlocker, firstOutputFilename } from './compositionGuidance'
+import { dayIdentity } from './compositionArchiveFolders'
 import { clearArchiveQueries } from './archiveQueries'
 import { checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
 
@@ -43,6 +45,10 @@ function makeAsset(file: File): Asset {
 
 function releaseAsset(asset: Asset | null) {
   if (asset) URL.revokeObjectURL(asset.url)
+}
+
+function isCompositionImage(asset: Asset) {
+  return /[^.].*\.(?:jpe?g|png|webp)$/is.test(asset.file.name)
 }
 
 function AssetDrop({
@@ -520,6 +526,24 @@ function SlotEditorModal({
   )
 }
 
+function beijingDay() {
+  return dayIdentity(new Date().toISOString()).key
+}
+
+function FilenameExample({ username, size, total, productName }: {
+  username: string | null; size: string; total: number; productName: string | null
+}) {
+  const [day, setDay] = useState(beijingDay)
+  useEffect(() => {
+    const refresh = () => setDay(beijingDay())
+    const nextMidnight = Date.parse(day + 'T00:00:00+08:00') + 86_400_000
+    const timer = window.setTimeout(refresh, Math.max(0, nextMidnight - Date.now()))
+    document.addEventListener('visibilitychange', refresh)
+    return () => { window.clearTimeout(timer); document.removeEventListener('visibilitychange', refresh) }
+  }, [day])
+  return <p className="filename-example">首张文件名示例 <code>{firstOutputFilename(day, username, size, total, productName)}</code></p>
+}
+
 function App() {
   const [products, setProducts] = useState<Asset[]>([])
   const [productChecking, setProductChecking] = useState(false)
@@ -533,7 +557,7 @@ function App() {
   const [singleResult, setSingleResult] = useState<BatchImage | null>(null)
   const [resultBatchId, setResultBatchId] = useState<string | null>(null)
   const [archiveOpen, setArchiveOpen] = useState(false)
-  const [account, setAccount] = useState<Account | null>(null)
+  const [account, setAccount] = useState<Account | null>()
   const [accountOpen, setAccountOpen] = useState(false)
   const [converterOpen, setConverterOpen] = useState(false)
   const [resultAction, setResultAction] = useState('')
@@ -844,10 +868,19 @@ function App() {
     activeTaskRef.current.cancel()
   }
 
+  const templateOnly = mode === 'template_replace'
+  const usableProducts = useMemo(() => products.filter(isCompositionImage), [products])
+  const invalidTemplate = templateAssets.some(asset => !isCompositionImage(asset))
+  const outputCount = templateAssets.length * (templateOnly ? 1 : usableProducts.length)
+  const blockedReason = composeBlocker({
+    templateOnly, templateCount: templateAssets.length, invalidTemplate, productCount: products.length,
+    usableProductCount: usableProducts.length, checkingProducts: productChecking, composing: loading, libraryBusy, resultAction,
+  })
+  let composeLabel = outputCount > 1 ? `批量合成 ${outputCount} 张` : '合成海报'
+  if (templateOnly) composeLabel = outputCount ? `生成 ${outputCount} 张空白模板` : '生成空白模板'
   const compose = async () => {
-    const needsProduct = mode !== 'template_replace'
-    const isBatch = templateAssets.length > 1 || (needsProduct && products.length > 1)
-    if (loading || resultAction || productChecking || !template || (needsProduct && !products.length)) return
+    if (blockedReason) return
+    const isBatch = outputCount > 1
     resetResult()
     setLoading(true)
     setCancelling(false)
@@ -855,7 +888,7 @@ function App() {
     setSubmissionProgress({ stage: 'uploading', loaded: 0, total: null })
     try {
       const body = new FormData()
-      if (needsProduct) products.forEach((asset) => body.append('products', asset.file))
+      if (!templateOnly) usableProducts.forEach((asset) => body.append('products', asset.file))
       templateAssets.forEach((asset) => body.append('templates', asset.file))
       if (mode === 'auto') body.append('template_modes', JSON.stringify(templateAssets.map((asset) => asset.templateMode || 'auto')))
       body.append('mode', mode)
@@ -1036,7 +1069,7 @@ function App() {
         <div className="topbar-right">
           <button className="toolbar-button" type="button" onClick={() => setConverterOpen(true)}>照片格式转换</button>
           <button className="toolbar-button archive-entry" type="button" onClick={() => setArchiveOpen(true)}>合成空间站</button>
-          <AccountControls account={account} setAccount={setAccount} open={accountOpen} setOpen={setAccountOpen} />
+          <AccountControls account={account ?? null} setAccount={setAccount} open={accountOpen} setOpen={setAccountOpen} />
           <span className="engine-status"><i /> Python compositor</span>
           <span className="version">v0.1</span>
         </div>
@@ -1107,10 +1140,19 @@ function App() {
             <span className="switch-ui" aria-hidden="true"><i /></span>
           </label>
           {error && <div className="error-message" role="alert">{error}</div>}
-          <button className="compose-button" type="button" disabled={!template || (mode !== 'template_replace' && !products.length) || loading || productChecking} onClick={compose}>
-            {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{mode === 'template_replace' ? `生成 ${templateAssets.length} 张空白模板` : products.length * templateAssets.length > 1 ? `批量合成 ${products.length * templateAssets.length} 张` : '合成海报'} <Icon name="arrow" size={18} /></>}
+          <div className="compose-guidance" id="compose-guidance" role="status" aria-atomic="true">
+            {blockedReason ? <p>{blockedReason}</p> : <>
+              <p className="compose-identity">{account ? `以 ${account.username} 合成` : account === null ? '访客合成' : '账号状态待确认，可继续合成'}</p>
+              {!templateOnly && products.length > usableProducts.length && <p>将跳过 {products.length - usableProducts.length} 张不支持格式的商品图。</p>}
+              {account !== undefined && <FilenameExample username={account?.username ?? null} size={size} total={outputCount}
+                productName={templateOnly ? null : usableProducts[0].file.name} />}
+            </>}
+          </div>
+          {!blockedReason && account === null && <button className="text-button compose-login" type="button" onClick={() => setAccountOpen(true)}>使用账号合成</button>}
+          <button className="compose-button" type="button" disabled={!!blockedReason} aria-describedby="compose-guidance" onClick={compose}>
+            {loading ? <><span className="button-loader" /> {submissionProgress?.stage === 'uploading' ? '正在上传' : submissionProgress?.stage === 'preparing' ? '准备任务中' : '正在合成'}</> : <>{composeLabel} <Icon name="arrow" size={18} /></>}
           </button>
-          <p className="privacy-note"><span className="lock-dot" /> 下载或删除的合成图进入团队共享空间，保留 7 天</p>
+          <p className="privacy-note"><span className="lock-dot" /> 下载或移入回收站的成品在合成空间站保留 7 天</p>
         </fieldset>
           {loading && <button className="toolbar-button cancel-task-button control-cancel-button" type="button" disabled={cancelling} onClick={cancelComposition} aria-label="取消当前合成任务">{cancelling ? '正在取消任务…' : '取消任务'}</button>}
         </aside>
@@ -1176,8 +1218,8 @@ function App() {
             ) : (
               <div className="empty-preview">
                 <div className="empty-frame"><span className="empty-corner corner-tl" /><span className="empty-corner corner-tr" /><span className="empty-corner corner-bl" /><span className="empty-corner corner-br" /><Icon name="image" size={30} /></div>
-                <strong>{taskCancelled ? '任务已取消' : mode === 'template_replace' ? '等待模板图' : '等待两张图片'}</strong>
-                <span>{taskCancelled ? '可以修改所选图片，然后重新合成' : mode === 'template_replace' ? '无需上传商品图，处理后生成空白模板' : '上传后，预览将在这里展开'}</span>
+                <strong>{taskCancelled ? '任务已取消' : blockedReason || '素材已就绪'}</strong>
+                <span>{taskCancelled ? '可以修改所选图片，然后重新合成' : '开始处理后，可在这里查看进度和成品'}</span>
               </div>
             )}
           </div>
