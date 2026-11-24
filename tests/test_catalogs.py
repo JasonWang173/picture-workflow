@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import tempfile
@@ -87,6 +88,54 @@ class CatalogCacheTest(unittest.TestCase):
 
 
 class ArchiveDatesAndPagesTest(unittest.TestCase):
+    def test_history_orders_existing_batches_and_pages_by_beijing_day_and_entry_time(self):
+        storage = FakeStorage()
+        client = TestClient(server.app)
+        self.addCleanup(client.close)
+        token = '2' * 64
+        client.cookies.set(server.WORKSPACE_COOKIE, token)
+        owner = hashlib.sha256(token.encode()).hexdigest()
+        endpoint = '/api/composition-archive'
+        expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        folder = '2026-11-24-zs（10）'
+        other = '2026-11-24-zs（2）'
+        morning = '2026-11-24-aa（1）'
+        yesterday = '2026-11-23-zs（1）'
+
+        def put(index, group, saved, downloaded=None, section='history'):
+            entry_id = f'aaaaaaaaaaaa-{index:09d}'
+            record = {'id': entry_id, 'section': section, 'saved_at': saved, 'expires_at': expires}
+            if group:
+                record['download_folder'] = group
+            if downloaded:
+                record['downloaded_at'] = downloaded
+            storage.put(f'{server.ARCHIVE_PREFIX}{owner}/{entry_id}.json', json.dumps(record))
+
+        put(1, folder, '2026-11-24T09:30:00+08:00')
+        put(2, folder, '2026-11-24T00:00:01+00:00', '2026-11-24T11:00:00+08:00')
+        put(3, folder, '2026-11-24T03:00:00+00:00')  # Same instant as image 2.
+        put(4, folder, '2026-11-24T02:00:00+00:00')
+        put(5, other, '2026-11-24T11:00:00+08:00')
+        put(6, morning, '2026-11-24T01:00:00+00:00')
+        put(7, None, '2026-11-23T16:00:00+00:00')  # Midnight in a legacy Beijing day folder.
+        put(8, yesterday, '2026-11-24T05:00:00+00:00')  # Later addition to an older batch.
+        put(9, morning, '2026-11-24T15:00:00+08:00', section='trash')
+        with patch.object(server, '_oss_bucket', return_value=storage.bucket), patch.object(server, '_oss_sdk', return_value=storage.sdk):
+            groups = client.get(endpoint, params={'view': 'batch_folders'}).json()['folders']
+            self.assertEqual([g['folder'] for g in groups], [folder, other, morning, '2026-11-24', yesterday])
+            self.assertEqual(groups[0]['latest_at'], '2026-11-24T03:00:00.000000+00:00')
+            self.assertEqual(groups[0]['count'], 4)
+            params = {'view': 'page', 'folder': folder, 'order': 'recent', 'limit': 1}
+            first = client.get(endpoint, params=params).json()
+            self.assertEqual(first['total'], 4)
+            self.assertEqual(first['items'][0]['id'][-1], '3')
+            cursor = first['next_cursor']
+            self.assertEqual(client.delete(endpoint + '/' + first['items'][0]['id']).status_code, 200)
+            self.assertEqual(client.get(endpoint, params={'view': 'page', 'folder': folder, 'cursor': cursor}).status_code, 400)
+            remaining = client.get(endpoint, params={**params, 'cursor': cursor, 'limit': 3}).json()
+            self.assertEqual([entry['id'][-1] for entry in remaining['items']], ['2', '4', '1'])
+            self.assertIsNone(remaining['next_cursor'])
+
     def test_delete_and_restore_preserve_original_day_and_expiry(self):
         storage = FakeStorage()
         archive = CompositionArchive(storage.bucket, storage.sdk, 'archive/')
@@ -114,7 +163,6 @@ class ArchiveDatesAndPagesTest(unittest.TestCase):
         client = TestClient(server.app)
         token = '1' * 64
         client.cookies.set(server.WORKSPACE_COOKIE, token)
-        import hashlib
         owner = hashlib.sha256(token.encode()).hexdigest()
         today = datetime.now(timezone.utc)
         day = today.astimezone(timezone(timedelta(hours=8))).date().isoformat()

@@ -35,7 +35,7 @@ from starlette.concurrency import run_in_threadpool
 from food_compositor import compose
 from food_compositor.account_api import check_origin, create_account_router, current_account
 from food_compositor.accounts import AccountStore, accounts_path
-from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION, history_time, history_day
+from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION, history_time, history_day, history_timestamp
 from food_compositor.execution import submit_composition, worker_count, estimate_memory, shutdown_executor
 from food_compositor.record_cache import RecordCache, read_records
 from food_compositor.request_limits import RequestLimits
@@ -1300,7 +1300,8 @@ def _archive_folder_name(record: dict) -> str:
 @app.get("/api/composition-archive")
 def list_composition_archive(request: Request, response: Response, view: str = "all", section: str = "history",
                              day: str | None = None, cursor: str | None = None, limit: int = 20, refresh: bool = False,
-                             folder: str | None = None, batch: str | None = None, scope: str = "auto") -> dict:
+                             folder: str | None = None, batch: str | None = None, scope: str = "auto",
+                             order: str | None = None) -> dict:
     if view not in {"all", "folders", "batch_folders", "page"} or section not in {"history", "trash"} or not 1 <= limit <= 100:
         raise HTTPException(status_code=400, detail="目录查询参数不正确")
     if day is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
@@ -1312,6 +1313,8 @@ def list_composition_archive(request: Request, response: Response, view: str = "
         raise HTTPException(status_code=400, detail="批次格式不正确")
     if scope not in {"auto", "browser", "team"}:
         raise HTTPException(status_code=400, detail="空间范围无效")
+    if order is not None and (order != "recent" or view != "page" or section != "history"):
+        raise HTTPException(status_code=400, detail="记录排序方式无效")
     shared = scope != "browser" and current_account(account_store, request) is not None
     if scope == "team" and not shared:
         raise HTTPException(status_code=401, detail="请重新登录后查看共享记录")
@@ -1324,18 +1327,26 @@ def list_composition_archive(request: Request, response: Response, view: str = "
     if view == "batch_folders":
         groups = {}
         for record in records:
-            if record["section"] == section:
-                name = _archive_folder_name(record)
-                key = (name, record["id"][:12] if shared and NUMBERED_FOLDER.fullmatch(name) else "")
-                groups[key] = groups.get(key, 0) + 1
+            if record["section"] != section:
+                continue
+            name = _archive_folder_name(record)
+            batch_id = record["id"][:12] if shared and NUMBERED_FOLDER.fullmatch(name) else ""
+            key = (name, batch_id)
+            if key not in groups:
+                groups[key] = {"folder": name, "day": name[:10], "count": 0, **({"batch": batch_id} if batch_id else {})}
+            group = groups[key]
+            group["count"] += 1
+            if section == "history":
+                group["latest_at"] = max(group.get("latest_at", ""), history_timestamp(record))
 
-        def folder_order(key):
-            stem, _, index = key[0].partition("（")
-            return -int(stem[:10].replace("-", "")), stem[10:], int(index[:-1]) if index else 0, key[1]
+        def folder_order(group):
+            stem, _, index = group["folder"].partition("（")
+            sequence = int(index[:-1]) if index else 0
+            if section == "history":
+                return group["day"], group["latest_at"], sequence, stem, group.get("batch", "")
+            return -int(group["day"].replace("-", "")), stem[10:], sequence, group.get("batch", "")
 
-        return {"folders": [{"folder": name, "day": name[:10], "count": groups[name, batch_id],
-                             **({"batch": batch_id} if batch_id else {})}
-                            for name, batch_id in sorted(groups, key=folder_order)],
+        return {"folders": sorted(groups.values(), key=folder_order, reverse=section == "history"),
                 "trash_count": sum(record["section"] == "trash" for record in records)}
     if view == "folders":
         days = {}
@@ -1351,6 +1362,8 @@ def list_composition_archive(request: Request, response: Response, view: str = "
                and (batch is None or record["id"][:12] == batch)]
     def sort_key(record):
         reference = record.get("archive_key", record["id"])
+        if order == "recent":
+            return history_timestamp(record), reference
         if folder and folder[10:11] == "-":
             # This batch folder follows the original input order, even after a restore.
             return -int(record["id"].rsplit("-", 1)[1]), reference
@@ -1362,7 +1375,7 @@ def list_composition_archive(request: Request, response: Response, view: str = "
         try:
             data = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
             if (data["section"] != section or data["day"] != day or data.get("folder") != folder
-                    or data.get("batch") != batch or not isinstance(data["id"], str)
+                    or data.get("batch") != batch or data.get("order") != order or not isinstance(data["id"], str)
                     or not RECORD_ID.fullmatch(data["id"].rsplit("~", 1)[-1])):
                 raise ValueError()
             records = [record for record in records if sort_key(record) < (data["time"], data["id"])]
@@ -1372,7 +1385,8 @@ def list_composition_archive(request: Request, response: Response, view: str = "
     next_cursor = None
     if len(records) > limit:
         stamp, record_id = sort_key(page[-1])
-        next_cursor = base64.urlsafe_b64encode(json.dumps({"section": section, "day": day, "folder": folder, "batch": batch, "time": stamp, "id": record_id}).encode()).decode()
+        next_cursor = base64.urlsafe_b64encode(json.dumps({"section": section, "day": day, "folder": folder, "batch": batch,
+                                                          "order": order, "time": stamp, "id": record_id}).encode()).decode()
     return {"items": page, "next_cursor": next_cursor, "total": total}
 
 

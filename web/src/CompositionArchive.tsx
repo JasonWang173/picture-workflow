@@ -10,6 +10,10 @@ const dateFormat = new Intl.DateTimeFormat('zh-CN', {
   month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
 })
 const savedTimeFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })
+const historyTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric',
+  hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit',
+})
 
 export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
   onClose: () => void
@@ -24,13 +28,14 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
   const scope = shared ? 'team' : 'browser'
   const foldersQuery = `view=batch_folders&section=${section}&scope=${scope}`
   const folders = useArchiveQuery(foldersQuery)
-  const pageKey = openFolder ? `view=page&section=${section}&scope=${scope}&folder=${encodeURIComponent(openFolder.name)}${openFolder.batch ? '&batch=' + openFolder.batch : ''}` : null
+  const pageKey = openFolder ? `view=page&section=${section}&scope=${scope}&folder=${encodeURIComponent(openFolder.name)}${openFolder.batch ? '&batch=' + openFolder.batch : ''}${section === 'history' ? '&order=recent' : ''}` : null
   const page = useArchiveQuery(pageKey)
   const groups = (folders.data.folders || []).map((group) => ({
     name: group.folder || group.day,
     batch: group.batch,
     weekday: dayIdentity(`${group.day}T12:00:00+08:00`).weekday,
     count: group.count,
+    latestAt: group.latest_at,
   }))
   const visible = (page.data.items || []).filter((item) => Date.parse(item.expires_at) > Date.now())
   const loading = pageKey ? page.loading : folders.loading
@@ -79,13 +84,16 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
           {!openFolder ? (groups.length ? (
             <>
               <div className="archive-folder-summary">
-                <div><strong>按批次整理</strong><span>{groups.length} 个文件夹 · 共 {groups.reduce((total, group) => total + group.count, 0)} 张合成图</span></div>
+                <div><strong>{section === 'history' ? '日期从新到旧 · 同日按最近入库排序' : '按批次整理'}</strong><span>{groups.length} 个文件夹 · 共 {groups.reduce((total, group) => total + group.count, 0)} 张合成图</span></div>
               </div>
               <div className="archive-folder-grid">
                 {groups.map((group) => (
                   <button className="archive-folder-card" type="button" key={group.batch || group.name} onClick={() => { setOpenFolder(group) }} aria-label={`打开 ${group.name}，共 ${group.count} 张合成图`}>
                     <span className="archive-folder-icon" aria-hidden="true" />
-                    <span className="archive-folder-meta"><strong>{group.name}</strong><small>{group.weekday} · {group.count} 张素材</small></span>
+                    <span className="archive-folder-meta">
+                      <strong>{group.name}</strong><small>{group.weekday} · {group.count} 张素材</small>
+                      {group.latestAt && <small>最近入库 <time dateTime={group.latestAt}>{historyTimeFormat.format(new Date(group.latestAt))}</time></small>}
+                    </span>
                     <span className="archive-folder-arrow" aria-hidden="true">→</span>
                   </button>
                 ))}
@@ -97,7 +105,7 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
             <>
               <div className="archive-folder-heading">
                 <button className="toolbar-button" type="button" onClick={() => { setOpenFolder(null) }}>← 返回批次文件夹</button>
-                <div><strong>{openFolder.name}</strong><span>{page.data.total || 0} 张素材</span></div>
+                <div><strong>{openFolder.name}</strong><span>{page.data.total || 0} 张素材{section === 'history' && ' · 最近入库在前（北京时间）'}</span></div>
               </div>
               <div className="archive-grid">
                 {visible.map((entry) => {
@@ -112,7 +120,7 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
                       <div className="archive-card-info">
                         <strong title={name}>{name}</strong>
                         <span className="archive-card-template" title={entry.template_name}>模板 {entry.template_name}</span>
-                        <time dateTime={entry.downloaded_at || entry.saved_at}>{savedTimeFormat.format(new Date(entry.downloaded_at || entry.saved_at))} 入库 · {dateFormat.format(new Date(entry.expires_at))} 到期</time>
+                        <time dateTime={entry.downloaded_at || entry.saved_at}>{(section === 'history' ? historyTimeFormat : savedTimeFormat).format(new Date(entry.downloaded_at || entry.saved_at))} 入库 · {dateFormat.format(new Date(entry.expires_at))} 到期</time>
                         {section === 'history' ? (
                           <div className="archive-card-actions">
                             <a className="toolbar-button" href={`${url}?download=true`} target="_blank" rel="noopener">下载 JPG</a>

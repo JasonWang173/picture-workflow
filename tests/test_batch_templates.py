@@ -285,10 +285,10 @@ class BatchCompositionTest(unittest.TestCase):
             self.assertEqual(self.client.post(statuses[0]['download_url']).json()['filename'], '2026-11-23（1）.zip')
             self.assertEqual(self.client.post(statuses[2]['download_url']).json()['filename'], '2026-11-24（1）.zip')
         groups = self.client.get('/api/composition-archive', params={'view': 'batch_folders'}).json()['folders']
-        self.assertEqual(groups, [
-            {'folder': '2026-11-24（1）', 'day': '2026-11-24', 'count': 1},
-            {'folder': '2026-11-23（1）', 'day': '2026-11-23', 'count': 1},
-            {'folder': '2026-11-23（2）', 'day': '2026-11-23', 'count': 1},
+        self.assertEqual([(g['folder'], g['day'], g['count']) for g in groups], [
+            ('2026-11-24（1）', '2026-11-24', 1),
+            ('2026-11-23（2）', '2026-11-23', 1),
+            ('2026-11-23（1）', '2026-11-23', 1),
         ])
         page = self.client.get('/api/composition-archive', params={'view': 'page', 'folder': '2026-11-23（2）'}).json()
         self.assertEqual([image['id'] for image in page['items']], [record['id']])
@@ -314,10 +314,10 @@ class BatchCompositionTest(unittest.TestCase):
         self.assertEqual(download_filename(zip_download), '2026-11-23（1）.zip')
         with zipfile.ZipFile(io.BytesIO(zip_download.content)) as zipped:
             self.assertEqual(zipped.namelist(), [f"2026-11-23（1）/{second['name']}"])
-        expected_group = [{'folder': '2026-11-23（1）', 'day': '2026-11-23', 'count': 1}]
         for section in ('history', 'trash'):
             folders = self.client.get(endpoint, params={'view': 'batch_folders', 'section': section}).json()
-            self.assertEqual(folders['folders'], expected_group)
+            group, = folders['folders']
+            self.assertEqual((group['folder'], group['day'], group['count']), ('2026-11-23（1）', '2026-11-23', 1))
         trash_query = {'view': 'page', 'section': 'trash', 'folder': '2026-11-23（1）'}
         self.assertEqual(self.client.get(endpoint, params=trash_query).json()['items'], [trashed])
 

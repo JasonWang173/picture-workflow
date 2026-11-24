@@ -29,6 +29,11 @@ def history_time(record):
     return record.get("downloaded_at") or record["saved_at"]
 
 
+def history_timestamp(record):
+    """Comparable UTC timestamp for directory ordering and pagination cursors."""
+    return datetime.fromisoformat(history_time(record)).astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 def history_day(record):
     return datetime.fromisoformat(history_time(record)).astimezone(timezone(timedelta(hours=8))).date().isoformat()
 
