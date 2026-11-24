@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { archiveEndpoint as endpoint, checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
-import { dayIdentity } from './compositionArchiveFolders'
-import { readArchiveQuery, useArchiveQuery } from './archiveQueries'
+import { historyTimeFormat } from './compositionArchiveFolders'
+import { readArchiveQuery, useArchiveQuery, type ArchiveFolder } from './archiveQueries'
+import { ArchiveDirectory } from './ArchiveDirectory'
 
 type Section = 'history' | 'trash'
 
@@ -10,10 +11,6 @@ const dateFormat = new Intl.DateTimeFormat('zh-CN', {
   month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
 })
 const savedTimeFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })
-const historyTimeFormat = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric',
-  hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit',
-})
 
 export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
   onClose: () => void
@@ -22,21 +19,15 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
   onPreview: (image: { url: string; name: string }) => void
 }) {
   const [section, setSection] = useState<Section>('history')
-  const [openFolder, setOpenFolder] = useState<{name: string; batch?: string} | null>(null)
+  const [openFolder, setOpenFolder] = useState<ArchiveFolder | null>(null)
+  const [portfolio, setPortfolio] = useState<string | null>(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const scope = shared ? 'team' : 'browser'
   const foldersQuery = `view=batch_folders&section=${section}&scope=${scope}`
   const folders = useArchiveQuery(foldersQuery)
-  const pageKey = openFolder ? `view=page&section=${section}&scope=${scope}&folder=${encodeURIComponent(openFolder.name)}${openFolder.batch ? '&batch=' + openFolder.batch : ''}${section === 'history' ? '&order=recent' : ''}` : null
+  const pageKey = openFolder ? `view=page&section=${section}&scope=${scope}&folder=${encodeURIComponent(openFolder.folder || openFolder.day)}${openFolder.batch ? '&batch=' + openFolder.batch : ''}${section === 'history' ? '&order=recent' : ''}` : null
   const page = useArchiveQuery(pageKey)
-  const groups = (folders.data.folders || []).map((group) => ({
-    name: group.folder || group.day,
-    batch: group.batch,
-    weekday: dayIdentity(`${group.day}T12:00:00+08:00`).weekday,
-    count: group.count,
-    latestAt: group.latest_at,
-  }))
   const visible = (page.data.items || []).filter((item) => Date.parse(item.expires_at) > Date.now())
   const loading = pageKey ? page.loading : folders.loading
   const loaded = pageKey ? page.loaded : folders.loaded
@@ -70,7 +61,7 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
         <div className="archive-toolbar">
           <div role="group" aria-label="记录分类">
             {(['history', 'trash'] as const).map((tab) => (
-              <button className="toolbar-button" aria-pressed={section === tab} key={tab} type="button" onClick={() => { setSection(tab); setOpenFolder(null) }}>
+              <button className="toolbar-button" aria-pressed={section === tab} key={tab} type="button" onClick={() => { setSection(tab); setOpenFolder(null); setPortfolio(null) }}>
                 {tab === 'history' ? '合成记录' : '回收站'}
               </button>
             ))}
@@ -81,31 +72,14 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
           {!shared && <button className="toolbar-button" type="button" onClick={onSignIn}>登录或注册，查看全部共享记录</button>}
           {(error || readError) && <p className="archive-error" role="alert">{error || readError}</p>}
           {loading && <p role="status">{loaded ? '正在更新记录…' : '正在读取 OSS…'}</p>}
-          {!openFolder ? (groups.length ? (
-            <>
-              <div className="archive-folder-summary">
-                <div><strong>{section === 'history' ? '日期从新到旧 · 同日按最近入库排序' : '按批次整理'}</strong><span>{groups.length} 个文件夹 · 共 {groups.reduce((total, group) => total + group.count, 0)} 张合成图</span></div>
-              </div>
-              <div className="archive-folder-grid">
-                {groups.map((group) => (
-                  <button className="archive-folder-card" type="button" key={group.batch || group.name} onClick={() => { setOpenFolder(group) }} aria-label={`打开 ${group.name}，共 ${group.count} 张合成图`}>
-                    <span className="archive-folder-icon" aria-hidden="true" />
-                    <span className="archive-folder-meta">
-                      <strong>{group.name}</strong><small>{group.weekday} · {group.count} 张素材</small>
-                      {group.latestAt && <small>最近入库 <time dateTime={group.latestAt}>{historyTimeFormat.format(new Date(group.latestAt))}</time></small>}
-                    </span>
-                    <span className="archive-folder-arrow" aria-hidden="true">→</span>
-                  </button>
-                ))}
-              </div>
-            </>
-          ) : (loaded || (!loading && !readError)) && !error && (
-            <p>{section === 'history' ? '下载合成图后，这里会按批次建立日期文件夹。' : '从合成结果删除的图片会按批次出现在这里。'}</p>
-          )) : (
+          {!openFolder ? (
+            <ArchiveDirectory key={section} folders={folders.data.folders || []} section={section} portfolio={portfolio}
+              onSelect={setPortfolio} onOpen={setOpenFolder} showEmpty={loaded && !readError && !error} />
+          ) : (
             <>
               <div className="archive-folder-heading">
-                <button className="toolbar-button" type="button" onClick={() => { setOpenFolder(null) }}>← 返回批次文件夹</button>
-                <div><strong>{openFolder.name}</strong><span>{page.data.total || 0} 张素材{section === 'history' && ' · 最近入库在前（北京时间）'}</span></div>
+                <button className="toolbar-button" type="button" onClick={() => { setOpenFolder(null) }}>← {portfolio ? `返回 ${portfolio} 作品集` : '返回批次文件夹'}</button>
+                <div><strong>{openFolder.folder || openFolder.day}</strong><span>{page.data.total || 0} 张素材{section === 'history' && ' · 最近入库在前（北京时间）'}</span></div>
               </div>
               <div className="archive-grid">
                 {visible.map((entry) => {

@@ -1330,10 +1330,13 @@ def list_composition_archive(request: Request, response: Response, view: str = "
             if record["section"] != section:
                 continue
             name = _archive_folder_name(record)
-            batch_id = record["id"][:12] if shared and NUMBERED_FOLDER.fullmatch(name) else ""
+            numbered = NUMBERED_FOLDER.fullmatch(name)
+            batch_id = record["id"][:12] if shared and numbered else ""
             key = (name, batch_id)
             if key not in groups:
                 groups[key] = {"folder": name, "day": name[:10], "count": 0, **({"batch": batch_id} if batch_id else {})}
+                if section == "history" and numbered and numbered["username"]:
+                    groups[key]["username"] = numbered["username"]
             group = groups[key]
             group["count"] += 1
             if section == "history":

@@ -372,6 +372,15 @@ select option { background: #1c1f1c; }
 .archive-toolbar [aria-pressed="true"] { color: #f3ad8a; border-color: #b67254; background: #30221a; }
 .archive-body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; }
 .archive-body > p { margin-bottom: 12px; }
+.archive-account-search { display: grid; gap: 6px; margin-bottom: 16px; }
+.archive-account-search label, .archive-portfolio-day h4 { color: #bfc5b9; font-size: 12px; }
+.archive-account-search input { width: min(100%, 340px); padding: 8px 10px; color: var(--cream); background: #111411; border: 1px solid #495247; }
+.archive-account-search input:focus-visible { outline: 1px solid var(--orange); }
+.archive-account-results { display: flex; flex-wrap: wrap; gap: 8px; }
+.archive-account-results span { color: #aeb6a8; }
+.archive-folder-heading h3 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.archive-portfolio-day + .archive-portfolio-day { margin-top: 18px; }
+.archive-portfolio-day h4 { margin: 0 0 8px; font-variant-numeric: tabular-nums; }
 .archive-body .archive-error { color: #f0a68b; }
 .archive-folder-summary { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 0 0 14px; }
 .archive-folder-summary > div { display: grid; gap: 3px; }

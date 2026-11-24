@@ -1,7 +1,7 @@
 import { useEffect, useSyncExternalStore } from 'react'
 import type { ArchiveEntry } from './compositionArchiveStore'
 
-export type ArchiveFolder = { day: string; count: number; folder?: string; batch?: string; latest_at?: string }
+export type ArchiveFolder = { day: string; count: number; folder?: string; batch?: string; latest_at?: string; username?: string }
 type Result = { items?: ArchiveEntry[]; folders?: ArchiveFolder[]; trash_count?: number; next_cursor?: string | null; total?: number; expires_at?: string | null }
 type Snapshot = { data: Result; loaded: boolean; loading: boolean; error: string }
 type Query = { snapshot: Snapshot; at: number; revision: number; pending: Promise<void> | null; listeners: Set<() => void>; timer?: ReturnType<typeof setTimeout> }

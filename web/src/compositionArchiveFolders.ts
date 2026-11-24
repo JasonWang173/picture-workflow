@@ -8,6 +8,10 @@ export type ArchiveDayGroup = {
 }
 
 const archiveTimeZone = 'Asia/Shanghai'
+export const historyTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: archiveTimeZone, month: 'numeric', day: 'numeric',
+  hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit',
+})
 const dayParts = new Intl.DateTimeFormat('zh-CN-u-ca-gregory', {
   timeZone: archiveTimeZone,
   year: 'numeric',

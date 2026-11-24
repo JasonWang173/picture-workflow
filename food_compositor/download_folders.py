@@ -7,7 +7,7 @@ from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
-NUMBERED_FOLDER = re.compile(r"\d{4}-\d{2}-\d{2}(?:-[a-z0-9][a-z0-9._-]{0,31})?（[1-9]\d{0,8}）")
+NUMBERED_FOLDER = re.compile(r"\d{4}-\d{2}-\d{2}(?:-(?P<username>[a-z0-9][a-z0-9._-]{0,31}))?（[1-9]\d{0,8}）")
 
 
 def allocate_download_folder(root: Path, owner: str, batch_id: str, day: date, username: str | None = None) -> str:

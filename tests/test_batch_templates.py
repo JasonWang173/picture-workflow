@@ -451,6 +451,8 @@ class BatchCompositionTest(unittest.TestCase):
             self.assertNotEqual(new['filename'], legacy['filename'])
             folders = bob.get(archive, params={'view': 'batch_folders', 'scope': 'team'}).json()['folders']
             group = next(group for group in folders if group['folder'] == new['items'][0]['download_folder'])
+            self.assertEqual(group['username'], 'alice')
+            self.assertNotIn('username', next(g for g in folders if g['folder'] == legacy['items'][0]['download_folder']))
             page = bob.get(archive, params={'view': 'page', 'scope': 'team', 'folder': group['folder'], 'batch': group['batch']}).json()
             self.assertEqual([item['id'] for item in page['items']], [new['items'][0]['id']])
             ref = f"{archive}/{page['items'][0]['archive_key']}"

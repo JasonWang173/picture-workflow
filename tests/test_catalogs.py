@@ -123,6 +123,7 @@ class ArchiveDatesAndPagesTest(unittest.TestCase):
         with patch.object(server, '_oss_bucket', return_value=storage.bucket), patch.object(server, '_oss_sdk', return_value=storage.sdk):
             groups = client.get(endpoint, params={'view': 'batch_folders'}).json()['folders']
             self.assertEqual([g['folder'] for g in groups], [folder, other, morning, '2026-11-24', yesterday])
+            self.assertEqual([g.get('username') for g in groups], ['zs', 'zs', 'aa', None, 'zs'])
             self.assertEqual(groups[0]['latest_at'], '2026-11-24T03:00:00.000000+00:00')
             self.assertEqual(groups[0]['count'], 4)
             params = {'view': 'page', 'folder': folder, 'order': 'recent', 'limit': 1}
