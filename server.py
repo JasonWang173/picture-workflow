@@ -37,7 +37,7 @@ from food_compositor.account_api import check_origin, create_account_router, cur
 from food_compositor.accounts import AccountStore, accounts_path
 from food_compositor.composition_archive import CompositionArchive, OWNER_ID, RECORD_ID, RETENTION, history_time, history_day, history_timestamp
 from food_compositor.execution import submit_composition, worker_count, estimate_memory, shutdown_executor
-from food_compositor.record_cache import RecordCache, read_records
+from food_compositor.record_cache import CatalogPending, RecordCache, read_records
 from food_compositor.request_limits import RequestLimits
 from food_compositor.cancellation import CompositionCancelled, cancellation_scope
 from food_compositor.storage_guard import ensure_space, StorageFull, reserve_bytes
@@ -242,10 +242,15 @@ def _workspace_owner(request: Request, response: Response | None = None) -> str 
 def _composition_archive():
     sdk = _oss_sdk()
     try:
-        yield CompositionArchive(_oss_bucket(), sdk, ARCHIVE_PREFIX)
+        bucket = _oss_bucket()
+        cache_dir = BATCH_ROOT.parent / "archive-catalogs" if bucket is _OSS_BUCKET else None
+        yield CompositionArchive(bucket, sdk, ARCHIVE_PREFIX, cache_dir=cache_dir)
     except sdk.exceptions.OssError as exc:
         LOGGER.warning("合成记录 OSS 操作失败", exc_info=True)
         raise HTTPException(status_code=503, detail="合成记录暂时无法连接 OSS，请稍后重试") from exc
+    except CatalogPending as exc:
+        raise HTTPException(status_code=503, detail="合成记录目录正在同步，稍后自动更新",
+                            headers={"Retry-After": "5"}) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail="合成记录读取超时，请稍后重试") from exc
 
@@ -280,6 +285,7 @@ def _purge_composition_storage() -> None:
         return
     try:
         with _composition_archive() as archive:
+            archive.warm()
             archive.purge_expired()
     except HTTPException as exc:
         LOGGER.warning("合成空间站未能清理 OSS：%s", exc.detail)
@@ -1334,11 +1340,13 @@ def list_composition_archive(request: Request, response: Response, view: str = "
             batch_id = record["id"][:12] if shared and numbered else ""
             key = (name, batch_id)
             if key not in groups:
-                groups[key] = {"folder": name, "day": name[:10], "count": 0, **({"batch": batch_id} if batch_id else {})}
+                groups[key] = {"folder": name, "day": name[:10], "count": 0, "expiry_offsets_ms": [],
+                               **({"batch": batch_id} if batch_id else {})}
                 if section == "history" and numbered and numbered["username"]:
                     groups[key]["username"] = numbered["username"]
             group = groups[key]
             group["count"] += 1
+            group["expiry_offsets_ms"].append(int(datetime.fromisoformat(record["expires_at"]).timestamp() * 1000))
             if section == "history":
                 group["latest_at"] = max(group.get("latest_at", ""), history_timestamp(record))
 
@@ -1349,7 +1357,13 @@ def list_composition_archive(request: Request, response: Response, view: str = "
                 return group["day"], group["latest_at"], sequence, stem, group.get("batch", "")
             return -int(group["day"].replace("-", "")), stem[10:], sequence, group.get("batch", "")
 
+        # One epoch timestamp per folder, followed by short deltas for the rest of the batch.
+        for group in groups.values():
+            times = sorted(group["expiry_offsets_ms"])
+            group["expiry_offsets_ms"] = [times[0], *(later - earlier for earlier, later in zip(times, times[1:]))]
+        first_expiry = min((group["expiry_offsets_ms"][0] for group in groups.values()), default=None)
         return {"folders": sorted(groups.values(), key=folder_order, reverse=section == "history"),
+                "expires_at": datetime.fromtimestamp(first_expiry / 1000, timezone.utc) if first_expiry is not None else None,
                 "trash_count": sum(record["section"] == "trash" for record in records)}
     if view == "folders":
         days = {}

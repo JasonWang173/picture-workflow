@@ -1,12 +1,14 @@
 """OSS-backed storage for the composition history and recycle bin."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from .record_cache import RecordCache, read_records
+from .archive_snapshot import ArchiveSnapshot
+from .record_cache import CatalogPending, RecordCache, read_records
 
 
 RECORD_ID = re.compile(r"[0-9a-f]{12}-[0-9]{9,}")
@@ -14,7 +16,7 @@ OWNER_ID = re.compile(r"[0-9a-f]{64}")
 RETENTION = timedelta(days=7)
 LOGGER = logging.getLogger(__name__)
 _locks = [Lock() for _ in range(64)]
-_catalogs = RecordCache(ttl=60, max_stale=300)
+_catalogs = RecordCache(ttl=60, max_stale=RETENTION.total_seconds())
 
 
 def normalize_record(record):
@@ -39,13 +41,18 @@ def history_day(record):
 
 
 class CompositionArchive:
-    def __init__(self, bucket, sdk, prefix: str):
+    def __init__(self, bucket, sdk, prefix: str, *, cache_dir=None):
         self.bucket = bucket
         self.sdk = sdk
         self.prefix = prefix
+        self.snapshot = None
+        if cache_dir is not None:
+            namespace = hashlib.sha256(self._cache_key(None).encode()).hexdigest()
+            self.snapshot = ArchiveSnapshot(cache_dir / f"{namespace}.sqlite3")
 
     def _cache_key(self, owner):
-        return f"{getattr(self.bucket, 'bucket_name', getattr(self.bucket, 'bucket', id(self.bucket)))}:{getattr(self.bucket, 'base_url', '')}:{self.prefix}:{owner}"
+        endpoint = getattr(self.bucket, "base_url", None) or getattr(self.bucket, "endpoint", "")
+        return f"{getattr(self.bucket, 'bucket_name', getattr(self.bucket, 'bucket', id(self.bucket)))}:{endpoint}:{self.prefix}:{owner}"
 
     def _key(self, owner: str, entry_id: str) -> str:
         return f"{self.prefix}{owner}/{entry_id}"
@@ -70,7 +77,8 @@ class CompositionArchive:
     def _update_catalogs(self, owner, entry_id, record):
         _catalogs.update(self._cache_key(owner), entry_id, record)
         relative = f"{owner}/{entry_id}"
-        _catalogs.update(self._cache_key(None), relative, {**record, "id": relative} if record else None)
+        _catalogs.update(self._cache_key(None), relative, {**record, "id": relative} if record else None,
+                         snapshot=self.snapshot)
 
     def save(self, owner: str, entry_id: str, image: dict, path, section: str, *, download_folder: str | None = None) -> dict:
         key = self._key(owner, entry_id)
@@ -131,20 +139,41 @@ class CompositionArchive:
             return record
         return None
 
-    def list(self, owner: str | None, *, refresh=False) -> list[dict]:
+    def _catalog(self, owner, *, refresh=False, timeout=2):
         prefix = self.prefix if owner is None else f"{self.prefix}{owner}/"
-        records, _ = _catalogs.get(self._cache_key(owner),
-                                  lambda old, versions: read_records(self.bucket, self.sdk, prefix, old, versions, RECORD_ID,
-                                                                     valid_parent=OWNER_ID if owner is None else None),
-                                  force=refresh)
+        return _catalogs.get(self._cache_key(owner),
+                             lambda old, versions: read_records(self.bucket, self.sdk, prefix, old, versions, RECORD_ID,
+                                                                valid_parent=OWNER_ID if owner is None else None),
+                             force=refresh, snapshot=self.snapshot, timeout=timeout)
+
+    def warm(self):
+        if self.snapshot is not None:
+            try:
+                self._catalog(None, timeout=0)
+            except CatalogPending:
+                pass  # The single background reader continues without blocking startup.
+            except RuntimeError:
+                LOGGER.warning("空间站目录暂时无法预热")
+
+    def list(self, owner: str | None, *, refresh=False) -> list[dict]:
+        shared_catalog = owner is None or self.snapshot is not None
+        records, _ = self._catalog(None if shared_catalog else owner, refresh=refresh)
         now = datetime.now(timezone.utc)
-        records = [normalize_record(record) for record in records if datetime.fromisoformat(record["expires_at"]) > now]
-        if owner is None:
-            for record in records:
-                source, entry_id = record["id"].split("/")
+        visible = []
+        for raw in records:
+            if datetime.fromisoformat(raw["expires_at"]) <= now:
+                continue
+            if shared_catalog:
+                source, entry_id = raw["id"].split("/")
+                if owner is not None and source != owner:
+                    continue
+            record = normalize_record(raw)
+            if shared_catalog:
                 record["id"] = entry_id
-                record["archive_key"] = f"{source}~{entry_id}"
-        return sorted(records, key=lambda record: record["saved_at"], reverse=True)
+                if owner is None:
+                    record["archive_key"] = f"{source}~{entry_id}"
+            visible.append(record)
+        return sorted(visible, key=lambda record: record["saved_at"], reverse=True)
 
     def restore(self, owner: str, entry_id: str) -> dict | None:
         key = self._key(owner, entry_id)
@@ -187,6 +216,10 @@ class CompositionArchive:
             modified = getattr(obj, "last_modified", None)
             try:
                 if filename.endswith(".json"):
+                    etag = getattr(obj, "etag", None)
+                    cached = _catalogs.peek(self._cache_key(None), relative[:-5], etag=etag) if etag else None
+                    if cached and datetime.fromisoformat(cached["expires_at"]) > now:
+                        continue
                     with _locks[hash(key) % len(_locks)]:
                         record = self._read(key)
                         if record and datetime.fromisoformat(record["expires_at"]) <= now:

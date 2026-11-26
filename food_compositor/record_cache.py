@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
@@ -13,13 +14,17 @@ LOGGER = logging.getLogger(__name__)
 _refresh_slots = threading.BoundedSemaphore(2)
 
 
+class CatalogPending(RuntimeError):
+    """Another request can collect the in-flight initial listing."""
+
+
 class RecordCache:
     def __init__(self, ttl=60, max_stale=3600, capacity=128):
         self.ttl, self.max_stale, self.capacity = ttl, max_stale, capacity
         self.lock = threading.Lock()
         self.entries = OrderedDict()
 
-    def get(self, key, loader, *, force=False, disk: Path | None = None, timeout=12):
+    def get(self, key, loader, *, force=False, disk: Path | None = None, snapshot=None, timeout=12):
         with self.lock:
             entry = self.entries.get(key)
             if entry is None:
@@ -29,6 +34,15 @@ class RecordCache:
                         raise RuntimeError("目录任务繁忙，请稍后重试")
                     del self.entries[removable]
                 entry = {"records": None, "versions": {}, "at": 0, "retry": 0, "pending": None, "changes": {}}
+                if snapshot is not None:
+                    try:
+                        saved = snapshot.load()
+                        if saved:
+                            stamp, records, versions = saved
+                            entry.update(records={item["id"]: item for item in records}, versions=versions,
+                                         at=time.monotonic() - max(0, time.time() - stamp))
+                    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+                        LOGGER.warning("空间站本地目录无法读取，将从 OSS 重建", exc_info=True)
                 if disk is not None:
                     try:
                         saved = json.loads(disk.read_text(encoding="utf-8"))
@@ -47,7 +61,7 @@ class RecordCache:
                 event = threading.Event()
                 entry.update(pending=event, changes={})
                 old = list((entry["records"] or {}).values())
-                threading.Thread(target=self._refresh, args=(key, entry, loader, event, disk, old, entry["versions"].copy()), daemon=True).start()
+                threading.Thread(target=self._refresh, args=(key, entry, loader, event, disk, snapshot, old, entry["versions"].copy()), daemon=True).start()
             event = entry["pending"]
             if usable and not force:
                 return list(entry["records"].values()), True
@@ -56,9 +70,11 @@ class RecordCache:
         with self.lock:
             if entry["records"] is not None and time.monotonic() - entry["at"] < self.max_stale:
                 return list(entry["records"].values()), bool(entry["pending"] or entry.get("error"))
+            if entry["pending"] is not None or (event is None and time.monotonic() >= entry["retry"]):
+                raise CatalogPending("目录正在同步")
             raise RuntimeError("云端目录读取超时或暂时不可用，请稍后重试")
 
-    def _refresh(self, key, entry, loader, event, disk, old, old_versions):
+    def _refresh(self, key, entry, loader, event, disk, snapshot, old, old_versions):
         try:
             records, versions = loader(old, old_versions)
             with self.lock:
@@ -69,6 +85,14 @@ class RecordCache:
                     else:
                         merged[record_id] = item
                     versions.pop(record_id, None)
+                if snapshot is not None:
+                    try:
+                        snapshot.save(merged, versions, changed=merged != entry["records"] or versions != entry["versions"]
+                                      or entry.get("disk_error", False))
+                        entry["disk_error"] = False
+                    except (OSError, sqlite3.Error):
+                        entry["disk_error"] = True
+                        LOGGER.warning("空间站本地目录保存失败", exc_info=True)
                 entry.update(records=merged, versions=versions, at=time.monotonic(), error=False)
                 if disk is not None:
                     try:
@@ -93,9 +117,16 @@ class RecordCache:
             event.set()
             _refresh_slots.release()
 
-    def update(self, key, record_id, item):
+    def update(self, key, record_id, item, *, snapshot=None):
         with self.lock:
             entry = self.entries.get(key)
+            if snapshot is not None:
+                try:
+                    snapshot.update(record_id, item)
+                except (OSError, sqlite3.Error):
+                    if entry is not None:
+                        entry["disk_error"] = True
+                    LOGGER.warning("空间站本地目录更新失败", exc_info=True)
             if entry is None:
                 return
             if entry["pending"] is not None:
@@ -108,10 +139,12 @@ class RecordCache:
                     records[record_id] = item
                 entry["versions"].pop(record_id, None)
 
-    def peek(self, key, record_id):
+    def peek(self, key, record_id, *, etag=None):
         with self.lock:
             entry = self.entries.get(key)
             if entry and entry["records"] is not None and time.monotonic() - entry["at"] < self.max_stale:
+                if etag is not None and entry["versions"].get(record_id) != etag:
+                    return None
                 record = entry["records"].get(record_id)
                 return dict(record) if record else None
         return None

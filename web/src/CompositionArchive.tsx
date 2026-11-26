@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { archiveEndpoint as endpoint, checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
 import { historyTimeFormat } from './compositionArchiveFolders'
-import { readArchiveQuery, useArchiveQuery, type ArchiveFolder } from './archiveQueries'
+import { folderQueryKey, readArchiveQuery, useArchiveQuery, type ArchiveFolder } from './archiveQueries'
 import { ArchiveDirectory } from './ArchiveDirectory'
 
 type Section = 'history' | 'trash'
@@ -12,9 +12,9 @@ const dateFormat = new Intl.DateTimeFormat('zh-CN', {
 })
 const savedTimeFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })
 
-export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
+export function CompositionArchive({ onClose, onPreview, username, onSignIn }: {
   onClose: () => void
-  shared: boolean
+  username?: string
   onSignIn: () => void
   onPreview: (image: { url: string; name: string }) => void
 }) {
@@ -23,15 +23,17 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
   const [portfolio, setPortfolio] = useState<string | null>(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const shared = !!username
   const scope = shared ? 'team' : 'browser'
-  const foldersQuery = `view=batch_folders&section=${section}&scope=${scope}`
+  const foldersQuery = folderQueryKey(section, username)
   const folders = useArchiveQuery(foldersQuery)
-  const pageKey = openFolder ? `view=page&section=${section}&scope=${scope}&folder=${encodeURIComponent(openFolder.folder || openFolder.day)}${openFolder.batch ? '&batch=' + openFolder.batch : ''}${section === 'history' ? '&order=recent' : ''}` : null
+  const pageKey = openFolder ? `view=page&section=${section}&scope=${scope}${username ? '&viewer=' + encodeURIComponent(username) : ''}&folder=${encodeURIComponent(openFolder.folder || openFolder.day)}${openFolder.batch ? '&batch=' + openFolder.batch : ''}${section === 'history' ? '&order=recent' : ''}` : null
   const page = useArchiveQuery(pageKey)
   const visible = (page.data.items || []).filter((item) => Date.parse(item.expires_at) > Date.now())
   const loading = pageKey ? page.loading : folders.loading
   const loaded = pageKey ? page.loaded : folders.loaded
   const readError = pageKey ? page.error : folders.error
+  const syncing = pageKey ? page.syncing : folders.syncing
 
   const move = async (entry: ArchiveEntry, destination: Section) => {
     setBusy(entry.id)
@@ -66,15 +68,23 @@ export function CompositionArchive({ onClose, onPreview, shared, onSignIn }: {
               </button>
             ))}
           </div>
-          <button className="toolbar-button" type="button" onClick={() => { setError(''); void readArchiveQuery(foldersQuery, true); void readArchiveQuery(pageKey, true) }} disabled={loading || !!busy}>刷新</button>
+          <button className="toolbar-button" type="button" onClick={async () => {
+            setError('')
+            await readArchiveQuery(foldersQuery, 'refresh')
+            await readArchiveQuery(pageKey, true)
+          }} disabled={loading || folders.loading || !!busy}>刷新</button>
         </div>
         <div className="archive-body" aria-busy={loading}>
           {!shared && <button className="toolbar-button" type="button" onClick={onSignIn}>登录或注册，查看全部共享记录</button>}
-          {(error || readError) && <p className="archive-error" role="alert">{error || readError}</p>}
-          {loading && <p role="status">{loaded ? '正在更新记录…' : '正在读取 OSS…'}</p>}
+          {error && <p className="archive-error" role="alert">{error}</p>}
+          {readError && (loaded && !pageKey
+            ? <p role="status">正在显示上次的目录，暂时无法同步最新记录。</p>
+            : <p className="archive-error" role="alert">{readError}</p>)}
+          {syncing ? <p role="status">{loaded ? '正在同步最新目录…' : '正在同步合成目录，完成后会自动显示。'}</p>
+            : loading && <p role="status">{loaded ? '正在更新目录…' : '正在打开目录…'}</p>}
           {!openFolder ? (
             <ArchiveDirectory key={section} folders={folders.data.folders || []} section={section} portfolio={portfolio}
-              onSelect={setPortfolio} onOpen={setOpenFolder} showEmpty={loaded && !readError && !error} />
+              onSelect={setPortfolio} onOpen={setOpenFolder} showEmpty={loaded && !error} />
           ) : (
             <>
               <div className="archive-folder-heading">

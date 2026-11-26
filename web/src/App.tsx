@@ -7,7 +7,7 @@ import { PhotoConverter } from './PhotoConverter'
 import { AccountControls, type Account } from './AccountControls'
 import { composeBlocker, firstOutputFilename } from './compositionGuidance'
 import { dayIdentity } from './compositionArchiveFolders'
-import { clearArchiveQueries } from './archiveQueries'
+import { clearArchiveQueries, warmArchiveHistory } from './archiveQueries'
 import { checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
 
 type Mode = 'auto' | 'overlay' | 'cutout' | 'template_replace'
@@ -578,8 +578,13 @@ function App() {
   const [lastSize, setLastSize] = useState<string | null>(null)
   const [demoAvailable, setDemoAvailable] = useState(false)
   const [lightbox, setLightbox] = useState<LightboxImage | null>(null)
+  const previousArchiveUser = useRef<string | undefined>(undefined)
   useEffect(() => {
-    clearArchiveQueries()
+    if (previousArchiveUser.current !== account?.username) {
+      clearArchiveQueries(!!previousArchiveUser.current)
+      if (account?.username) void warmArchiveHistory(account.username)
+    }
+    previousArchiveUser.current = account?.username
     setLightbox(image => image?.url.startsWith('/api/composition-archive/') ? null : image)
   }, [account?.username])
   const [templates, setTemplates] = useState<TemplateRecord[]>([])
@@ -1272,7 +1277,7 @@ function App() {
         />
       )}
       {converterOpen && <PhotoConverter onClose={() => setConverterOpen(false)} />}
-      {archiveOpen && <CompositionArchive key={account?.username || ''} shared={!!account} onSignIn={() => setAccountOpen(true)} onClose={() => setArchiveOpen(false)} onPreview={setLightbox} />}
+      {archiveOpen && <CompositionArchive key={account?.username || ''} username={account?.username} onSignIn={() => setAccountOpen(true)} onClose={() => setArchiveOpen(false)} onPreview={setLightbox} />}
       {lightbox && (
         <div className={`lightbox ${pickerOpen || archiveOpen ? 'is-stacked' : ''}`} role="dialog" aria-modal="true" aria-label={lightbox.kind === 'template' ? '模板放大预览' : '合成图放大预览'} onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}>
           <div className="lightbox-panel">
