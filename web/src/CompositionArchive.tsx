@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { archiveEndpoint as endpoint, checkArchiveResponse, updateArchiveRecords, type ArchiveEntry } from './compositionArchiveStore'
-import { historyTimeFormat } from './compositionArchiveFolders'
+import { archiveBatchLabel, historyTimeFormat } from './compositionArchiveFolders'
 import { folderQueryKey, readArchiveQuery, useArchiveQuery, type ArchiveFolder } from './archiveQueries'
 import { ArchiveDirectory } from './ArchiveDirectory'
 
@@ -21,6 +21,7 @@ export function CompositionArchive({ onClose, onPreview, username, onSignIn }: {
   const [section, setSection] = useState<Section>('history')
   const [openFolder, setOpenFolder] = useState<ArchiveFolder | null>(null)
   const [portfolio, setPortfolio] = useState<string | null>(null)
+  const [openDay, setOpenDay] = useState<string | null>(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const shared = !!username
@@ -34,6 +35,23 @@ export function CompositionArchive({ onClose, onPreview, username, onSignIn }: {
   const loaded = pageKey ? page.loaded : folders.loaded
   const readError = pageKey ? page.error : folders.error
   const syncing = pageKey ? page.syncing : folders.syncing
+
+  const selectAccount = (value: string | null) => {
+    setPortfolio(value)
+    setOpenDay(null)
+    setOpenFolder(null)
+    setError('')
+  }
+  const selectDay = (value: string | null) => {
+    setOpenDay(value)
+    setOpenFolder(null)
+    setError('')
+  }
+  const goUp = () => {
+    if (openFolder) setOpenFolder(null)
+    else if (openDay) selectDay(null)
+    else selectAccount(null)
+  }
 
   const move = async (entry: ArchiveEntry, destination: Section) => {
     setBusy(entry.id)
@@ -63,7 +81,7 @@ export function CompositionArchive({ onClose, onPreview, username, onSignIn }: {
         <div className="archive-toolbar">
           <div role="group" aria-label="记录分类">
             {(['history', 'trash'] as const).map((tab) => (
-              <button className="toolbar-button" aria-pressed={section === tab} key={tab} type="button" onClick={() => { setSection(tab); setOpenFolder(null); setPortfolio(null) }}>
+              <button className="toolbar-button" aria-pressed={section === tab} key={tab} type="button" onClick={() => { setSection(tab); selectAccount(null) }}>
                 {tab === 'history' ? '合成记录' : '回收站'}
               </button>
             ))}
@@ -76,6 +94,19 @@ export function CompositionArchive({ onClose, onPreview, username, onSignIn }: {
         </div>
         <div className="archive-body" aria-busy={loading}>
           {!shared && <button className="toolbar-button" type="button" onClick={onSignIn}>登录或注册，查看全部共享记录</button>}
+          <div className="archive-navigation">
+            {portfolio !== null && <button className="toolbar-button" type="button" onClick={goUp}>← 返回上一级</button>}
+            <nav aria-label="空间站文件夹路径">
+              <ol className="archive-breadcrumbs">
+                <li>{portfolio === null ? <span aria-current="page">全部账号</span> : <button type="button" onClick={() => selectAccount(null)}>全部账号</button>}</li>
+                {portfolio !== null && <li>{openDay === null ? <span aria-current="page">{portfolio || '未标记账号'}</span>
+                  : <button type="button" onClick={() => selectDay(null)}>{portfolio || '未标记账号'}</button>}</li>}
+                {openDay && <li>{openFolder ? <button type="button" onClick={() => setOpenFolder(null)}>{openDay}</button>
+                  : <span aria-current="page">{openDay}</span>}</li>}
+                {openFolder && <li><span aria-current="page">{archiveBatchLabel(openFolder)}</span></li>}
+              </ol>
+            </nav>
+          </div>
           {error && <p className="archive-error" role="alert">{error}</p>}
           {readError && (loaded && !pageKey
             ? <p role="status">正在显示上次的目录，暂时无法同步最新记录。</p>
@@ -83,12 +114,11 @@ export function CompositionArchive({ onClose, onPreview, username, onSignIn }: {
           {syncing ? <p role="status">{loaded ? '正在同步最新目录…' : '正在同步合成目录，完成后会自动显示。'}</p>
             : loading && <p role="status">{loaded ? '正在更新目录…' : '正在打开目录…'}</p>}
           {!openFolder ? (
-            <ArchiveDirectory key={section} folders={folders.data.folders || []} section={section} portfolio={portfolio}
-              onSelect={setPortfolio} onOpen={setOpenFolder} showEmpty={loaded && !error} />
+            <ArchiveDirectory key={section} folders={folders.data.folders || []} portfolio={portfolio} day={openDay}
+              onSelect={selectAccount} onDay={selectDay} onOpen={setOpenFolder} showEmpty={loaded && !error && !readError} />
           ) : (
             <>
               <div className="archive-folder-heading">
-                <button className="toolbar-button" type="button" onClick={() => { setOpenFolder(null) }}>← {portfolio ? `返回 ${portfolio} 作品集` : '返回批次文件夹'}</button>
                 <div><strong>{openFolder.folder || openFolder.day}</strong><span>{page.data.total || 0} 张素材{section === 'history' && ' · 最近入库在前（北京时间）'}</span></div>
               </div>
               <div className="archive-grid">
